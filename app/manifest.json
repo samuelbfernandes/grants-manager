@@ -1,0 +1,11 @@
+{
+  "name": "Grants Manager",
+  "short_name": "Grants",
+  "display": "standalone",
+  "start_url": "/",
+  "background_color": "#f7f8fa",
+  "theme_color": "#2f6fed",
+  "icons": [
+    { "src": "/app/icon.png", "sizes": "1254x1254", "type": "image/png" }
+  ]
+}

@@ -1,0 +1,9 @@
+# This repo is CODE ONLY. Never commit anyone's grant data.
+data/
+receipts/
+backups/
+workday_imports/
+__pycache__/
+*.db
+*.xlsx
+*.pdf
