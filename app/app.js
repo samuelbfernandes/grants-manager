@@ -30,7 +30,11 @@ async function api(path, method = "GET", body = null) {
   if (!res.ok) throw new Error(data.error || "Request failed");
   return data;
 }
-async function reload() { S = await api("/api/state"); render(); }
+async function reload() {
+  S = await api("/api/state");
+  render();
+  if (typeof refreshNotifBadge === "function" && !READONLY) refreshNotifBadge();
+}
 function toast(msg) {
   const t = $("#toast");
   t.textContent = msg;
@@ -827,9 +831,9 @@ function wdPushModal(p) {
     </table>
     ${notPdf ? `<p style="color:#b97a08;font-size:13px;margin:8px 0 0">⚠️ This receipt is not a PDF — Workday only accepts PDF attachments. Consider re-saving it as PDF before sending.</p>` : ""}
     <div class="form-row" style="margin-top:12px">
-      <label class="field"><span>To — financial team</span><input id="wd-mail-to" type="email" value="${esc(cfg.financial_email || "")}" placeholder="finance@uada.edu"></label>
-      <label class="field"><span>Cc — you</span><input id="wd-mail-cc" type="email" value="${esc(cfg.cc_email || "")}" placeholder="you@uark.edu"></label>
+      <label class="field"><span>Send to me</span><input id="wd-mail-to" type="email" value="${esc(cfg.owner_email || "")}" placeholder="you@uark.edu"></label>
     </div>
+    <p class="sub" style="margin:-6px 0 0;font-size:12.5px">Comes to you first — check it, then forward to your accountant.</p>
     <div class="actions">
       <button class="btn secondary" id="m-copy-all" style="margin-right:auto">⧉ Copy as text</button>
       <button class="btn secondary" id="m-cancel">Keep offline</button>
@@ -847,7 +851,7 @@ function wdPushModal(p) {
       btn.disabled = true; btn.textContent = "Sending…";
       try {
         await api("/api/workday/send_email", "POST", {
-          to, cc: $("#wd-mail-cc", el).value.trim(), subject, body: bodyText,
+          to, subject, body: bodyText,
           receipt_path: p.receipt_path, expense_ids: p.expense_ids,
         });
         close();
@@ -1065,8 +1069,14 @@ async function settingsModal() {
     <p class="sub" style="margin-bottom:8px">Set once, auto-filled everywhere — the login popup only ever asks for email and password, and the send box comes pre-addressed.</p>
     <div class="form-row">
       <label class="field"><span>Email (Workday login)</span><input id="wd-user" value="${esc(r.username || "")}" placeholder="you@uark.edu"></label>
-      <label class="field"><span>Financial team email (To)</span><input id="wd-fin-email" type="email" value="${esc(pc.financial_email || "")}" placeholder="finance@uada.edu"></label>
-      <label class="field"><span>Your email (Cc)</span><input id="wd-cc-email" type="email" value="${esc(pc.cc_email || "")}" placeholder="you@uark.edu"></label>
+      <label class="field"><span>Your email (reports come to you)</span><input id="wd-owner-email" type="email" value="${esc(pc.owner_email || "")}" placeholder="you@uark.edu"></label>
+    </div>
+    <p class="sub" style="margin:-4px 0 0;font-size:12.5px">Expense reports and entry sheets are sent to <em>you</em> to check, then you forward them to your accountant — the app never emails them directly.</p>
+
+    <h2 style="font-size:14px;margin-top:16px">Monthly expense report</h2>
+    <p class="sub" style="margin-bottom:8px">At the start of each month the app offers to email you last month's expenses, formatted for your accountant. You can also send one any time.</p>
+    <div class="toolbar" style="margin-bottom:4px">
+      <button class="btn secondary small" id="btn-send-report">📧 Send a report now…</button>
     </div>
 
     <h2 style="font-size:14px;margin-top:14px">Direct connection (RaaS)</h2>
@@ -1114,6 +1124,7 @@ async function settingsModal() {
         close();
       } catch (e) { toast("Restore failed: " + e.message); }
     };
+    $("#btn-send-report", el).onclick = () => { close(); reportModal(); };
     $$("[data-restore-batch]", el).forEach((b) => b.onclick = async () => {
       if (!confirm("Restore this?")) return;
       try {
@@ -1126,8 +1137,7 @@ async function settingsModal() {
     });
     $("#wd-save-all", el).onclick = async () => {
       await api("/api/workday/push_config", "POST", {
-        financial_email: $("#wd-fin-email", el).value,
-        cc_email: $("#wd-cc-email", el).value,
+        owner_email: $("#wd-owner-email", el).value,
       });
       await api("/api/workday/raas_config", "POST", {
         summary_url: $("#wd-url-sum", el).value, detail_url: $("#wd-url-det", el).value,
@@ -1295,6 +1305,15 @@ function renderInstructions() {
       <p><strong>Splitting a person across grants:</strong> when you add a person, the form lets you enter their total salary and pick which grant pays — and optionally a second source with a percentage for each. A person paid from two sources shows <em>two rows</em> in their table, one per grant, with a <strong>%</strong> column (e.g., a postdoc paid 50% by one grant + 50% by “Other”). Pick <strong>“Other”</strong> as the source for salary shares paid outside your grants (department, college, another PI) — it appears on the People tab but never counts against your budgets.</p>
       <p>The <strong>auto-generate monthly charges</strong> switch on an appointment makes the <strong>↻ Update Salaries</strong> button (top bar) create the actual monthly salary + fringe expenses, prorated and never duplicated. Leave it OFF if your actual numbers come from DBR imports — projections work either way.</p>`)}
 
+    ${sec("📧 Monthly expense report", `
+      <p>At the start of each month the app offers to email you <strong>last month's expenses</strong> — and you can send one any time from <strong>⚙ Settings → Send a report now</strong> or the 🔔 notification.</p>
+      <p><strong>It goes to you, not to your accountant.</strong> You read it, check it's right, and forward it on. That's deliberate: the app never emails anyone on your behalf, so there's no accountant address to keep configured, and nothing goes out that you haven't seen.</p>
+      <p><strong>What's in it.</strong> A table with Workday's own column names — Date, Amount, Spend Category, Business Purpose, Grant/Worktag, Award, Cost Center, Fund, Person, Receipt — so your accountant can key it straight in. Attached: the same rows as a <strong>CSV</strong> (for importing, if your Workday setup allows it) and a <strong>zip of that month's receipts</strong>. It also lists any expenses you added, edited or deleted in the app that month, so you can vouch for the numbers, and flags anything hand-entered with a receipt still missing.</p>`)}
+
+    ${sec("🔔 Notifications", `
+      <p>The bell in the top bar shows a <strong>red dot</strong> when something needs you: a grant gone over budget, a category over its line for the current year, an award ending within 60 days, receipts missing from recent manual entries, or a monthly report you haven't sent yet.</p>
+      <p>Click a notification to jump straight to what it's about. <em>Mark all read</em> clears the dot until something new happens. If you've added the app to your home screen or dock, the badge appears on the app icon too, and the browser tab icon carries a small red count.</p>`)}
+
     ${sec("📋 All Expenses — filtering, bulk edits, receipts", `
       <p><strong>Filters.</strong> The filter bar narrows by search text, grant, category, person, <em>date range</em>, <em>amount range</em>, source, and whether a receipt is attached. They stack, and the header always shows how many rows match and their <strong>total</strong> — handy for "how much travel did this grant spend last spring?". <strong>⬇ Export shown (CSV)</strong> exports exactly what's on screen, not everything.</p>
       <p><strong>Fixing several at once.</strong> Tick the checkboxes (or the one in the header to take everything currently shown) and a blue action bar appears: <em>Change category</em>, <em>Move to grant</em>, <em>Set person</em>, or <em>Delete selected</em>. This is the fast way to fix a batch of mis-categorized charges. Moving expenses to another grant automatically remaps their category and recalculates the budget year for the destination. Bulk deletes go to <strong>⚙ Settings → Recently deleted</strong> like any other delete, so a wrong selection is recoverable.</p>
@@ -1339,6 +1358,230 @@ function renderInstructions() {
       <p><strong>Undo.</strong> Deleting a grant, person, appointment, or expense no longer loses it immediately — it goes to <strong>⚙ Settings → 🗑 Recently deleted</strong> for 30 days. Restoring a grant brings back its expenses, budget lines, and appointments too. After 30 days it's cleared for good, so if a deletion was a mistake, restore it sooner rather than later.</p>
       <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>⚠️ Important — OneDrive and this app.</strong> This folder is synced by OneDrive, which is great for having your data on other devices, but there's one real risk to know about: <strong>never run Grants Manager on two computers at the same time</strong>, and let OneDrive finish syncing (its icon stops spinning) before you open the app on a different machine. Databases don't merge like documents — if two copies are open at once, OneDrive can't combine them and will either overwrite one or leave a file named something like <em>"grants-DESKTOP-ABC123.db"</em> next to the real one. If you ever see a "conflicted copy" file appear, don't delete it: it may hold work that's missing from the main file — check both, or restore from a backup in ⚙ Settings. For the same reason, don't edit from your phone and your Mac simultaneously.</p>`)}
   `;
+}
+
+/* ------------------------------------------------------- notifications */
+// Each notification gets a stable id so "seen" survives reloads. Anything
+// whose id the user hasn't dismissed counts as new and lights the red dot.
+function monthKeyNow() { return todayISO().slice(0, 7); }
+function prevMonthKey() {
+  const [y, m] = todayISO().slice(0, 7).split("-").map(Number);
+  const d = new Date(y, m - 2, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function monthLabel(k) {
+  return new Date(+k.slice(0, 4), +k.slice(5, 7) - 1, 1)
+    .toLocaleDateString(undefined, { month: "long", year: "numeric" });
+}
+
+function seenNotifs() {
+  try { return JSON.parse(localStorage.getItem("gm-seen-notifs") || "[]"); }
+  catch { return []; }
+}
+function markNotifsSeen(ids) {
+  localStorage.setItem("gm-seen-notifs", JSON.stringify([...new Set(ids)].slice(-200)));
+}
+
+function computeNotifications() {
+  if (!S) return [];
+  const out = [];
+  const today = S.today;
+
+  for (const g of realGrants()) {
+    if (g.status !== "active") continue;
+    const spent = grantSpent(g.id);
+    const avail = g.initial_amount - spent;
+    if (g.initial_amount > 0 && avail < 0) {
+      out.push({ id: `over:${g.id}:${Math.round(spent)}`, level: "red",
+                 text: `${g.name} is overspent by ${money(Math.abs(avail))}.`,
+                 go: () => { view = { name: "grant", grantId: g.id }; render(); } });
+    } else if (g.initial_amount > 0 && spent / g.initial_amount >= 0.9) {
+      out.push({ id: `near:${g.id}:${Math.round(spent / g.initial_amount * 100)}`,
+                 level: "amber",
+                 text: `${g.name}: ${Math.round(spent / g.initial_amount * 100)}% of the award is spent.`,
+                 go: () => { view = { name: "grant", grantId: g.id }; render(); } });
+    }
+    // category overruns in the grant's current budget year
+    const yr = budgetYearOf(g, today);
+    for (const c of grantCats(g)) {
+      const b = budgetFor(g.id, c.id, yr);
+      if (b <= 0) continue;
+      const sp = spentFor(g.id, c.id, yr);
+      if (sp > b + 0.01) {
+        out.push({ id: `cat:${g.id}:${c.id}:${yr}:${Math.round(sp)}`, level: "red",
+                   text: `${g.name} · ${c.name} (Year ${yr}) is over budget by ${money(sp - b)}.`,
+                   go: () => { view = { name: "grant", grantId: g.id }; render(); } });
+      }
+    }
+    const dl = daysLeft(g);
+    if (dl !== null && dl >= 0 && dl <= 60) {
+      out.push({ id: `end:${g.id}:${effectiveEnd(g)}`, level: "amber",
+                 text: `${g.name} ends in ${dl} day${dl === 1 ? "" : "s"} (${effectiveEnd(g)}).`,
+                 go: () => { view = { name: "grant", grantId: g.id }; render(); } });
+    }
+  }
+
+  // last month's expense report not sent yet
+  const sent = (WD && WD.reports_sent) || {};
+  const prev = prevMonthKey();
+  const hasPrev = S.expenses.some((e) => e.date.slice(0, 7) === prev);
+  if (hasPrev && !sent[prev]) {
+    out.push({ id: `report:${prev}`, level: "blue",
+               text: `Expense report for ${monthLabel(prev)} hasn't been sent yet.`,
+               go: () => reportModal(prev) });
+  }
+
+  // expenses entered by hand with no receipt, this month and last
+  const noReceipt = S.expenses.filter((e) => e.source === "manual" && !e.receipt_path &&
+      (e.date.slice(0, 7) === monthKeyNow() || e.date.slice(0, 7) === prev));
+  if (noReceipt.length) {
+    out.push({ id: `receipts:${noReceipt.length}:${monthKeyNow()}`, level: "amber",
+               text: `${noReceipt.length} recent expense${noReceipt.length === 1 ? "" : "s"} ${noReceipt.length === 1 ? "has" : "have"} no receipt attached.`,
+               go: () => { view = { name: "allexpenses", f: { q: "", grant: "", cat: "", person: "", source: "manual", from: "", to: "", min: "", max: "", receipt: "no" } }; render(); } });
+  }
+  return out;
+}
+
+function refreshNotifBadge() {
+  const list = computeNotifications();
+  const seen = seenNotifs();
+  const unseen = list.filter((n) => !seen.includes(n.id));
+  const dot = $("#bell-dot");
+  if (dot) dot.hidden = unseen.length === 0;
+  const bell = $("#btn-bell");
+  if (bell) bell.title = unseen.length
+    ? `${unseen.length} new notification${unseen.length === 1 ? "" : "s"}`
+    : "Notifications";
+  applyAppBadge(unseen.length);
+  return { list, unseen };
+}
+
+// Red dot on the installed app icon (PWA / macOS dock via Safari) plus a
+// drawn-on favicon badge, so the tab shows it too.
+function applyAppBadge(n) {
+  try {
+    if (navigator.setAppBadge) n ? navigator.setAppBadge(n) : navigator.clearAppBadge();
+  } catch { /* not supported here — favicon badge below still applies */ }
+  const link = $("#favicon");
+  if (!link) return;
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement("canvas");
+    c.width = c.height = 64;
+    const x = c.getContext("2d");
+    x.drawImage(img, 0, 0, 64, 64);
+    if (n) {
+      x.beginPath(); x.arc(48, 16, 15, 0, Math.PI * 2);
+      x.fillStyle = "#ffffff"; x.fill();
+      x.beginPath(); x.arc(48, 16, 12, 0, Math.PI * 2);
+      x.fillStyle = "#d24545"; x.fill();
+      if (n < 10) {
+        x.fillStyle = "#fff"; x.font = "bold 16px -apple-system, sans-serif";
+        x.textAlign = "center"; x.textBaseline = "middle";
+        x.fillText(String(n), 48, 17);
+      }
+    }
+    link.href = c.toDataURL("image/png");
+  };
+  img.src = "/app/icon.png";
+}
+
+function notifPanel() {
+  const old = $(".notif-panel");
+  if (old) { old.remove(); return; }
+  const { list, unseen } = refreshNotifBadge();
+  const seen = seenNotifs();
+  const el = document.createElement("div");
+  el.className = "notif-panel";
+  el.innerHTML = `
+    <div class="notif-head"><span>Notifications</span>
+      ${list.length ? `<button class="btn ghost small" id="notif-clear">Mark all read</button>` : ""}</div>
+    <div class="notif-list">
+      ${list.length ? list.map((n, i) => `
+        <div class="notif" data-i="${i}">
+          <span class="dot ${n.level}"></span>
+          <div><div>${esc(n.text)}</div>
+            ${seen.includes(n.id) ? "" : `<div class="when">new</div>`}</div>
+        </div>`).join("")
+      : `<div class="notif-empty">Nothing needs your attention.</div>`}
+    </div>`;
+  document.body.appendChild(el);
+  const close = () => el.remove();
+  $$(".notif", el).forEach((row) => row.onclick = () => {
+    const n = list[+row.dataset.i];
+    markNotifsSeen([...seen, n.id]);
+    close(); refreshNotifBadge();
+    if (n.go) n.go();
+  });
+  const clear = $("#notif-clear", el);
+  if (clear) clear.onclick = () => {
+    markNotifsSeen(list.map((n) => n.id));
+    close(); refreshNotifBadge();
+    toast("Notifications marked read");
+  };
+  setTimeout(() => {
+    document.addEventListener("click", function away(ev) {
+      if (!el.contains(ev.target) && ev.target !== $("#btn-bell")) {
+        el.remove(); document.removeEventListener("click", away);
+      }
+    });
+  }, 0);
+}
+
+/* ------------------------------------------------- monthly expense report */
+async function reportModal(month) {
+  month = month || prevMonthKey();
+  let d;
+  try { d = await api(`/api/report/preview?month=${month}`); }
+  catch (e) { toast("Couldn't build the report: " + e.message); return; }
+
+  const owner = d.owner_email || "";
+  const rowsHtml = d.rows.length
+    ? `<div style="overflow-x:auto;max-height:320px;overflow-y:auto;border:1px solid var(--border);border-radius:8px">
+        <table><thead><tr>${d.columns.map((c) => `<th style="white-space:nowrap">${esc(c)}</th>`).join("")}</tr></thead>
+        <tbody>${d.rows.map((r) => `<tr>${d.columns.map((c) =>
+          `<td class="${c === "Amount" ? "num" : ""}" style="white-space:${c === "Business Purpose" ? "normal" : "nowrap"}">${esc(r[c])}</td>`).join("")}</tr>`).join("")}</tbody></table>
+      </div>`
+    : `<div class="empty">No expenses recorded for ${esc(d.label)}.</div>`;
+
+  modal(`
+    <h2>📧 Expense report — ${esc(d.label)}</h2>
+    <p class="sub" style="margin-bottom:12px">${d.rows.length} expense${d.rows.length === 1 ? "" : "s"} · <strong>${money2(d.total)}</strong>.
+      This goes to <strong>you</strong> — check it, then forward to your accountant. The email includes a table like the one below plus a CSV in Workday's column order${d.rows.some((r) => r.Receipt) ? ", and a zip of the receipts" : ""}.</p>
+    ${d.missing_receipts ? `<p class="sub" style="background:var(--amber-soft);color:var(--amber);padding:9px 12px;border-radius:8px;margin-bottom:12px"><strong>${d.missing_receipts}</strong> hand-entered expense${d.missing_receipts === 1 ? "" : "s"} ${d.missing_receipts === 1 ? "has" : "have"} no receipt attached.</p>` : ""}
+    ${rowsHtml}
+    ${d.changes.length ? `<p class="sub" style="margin:12px 0 4px"><strong>${d.changes.length}</strong> change${d.changes.length === 1 ? "" : "s"} made in the app this month will be listed too, so you can verify them.</p>` : ""}
+    <div class="form-row" style="margin-top:14px">
+      <label class="field"><span>Send to (you)</span><input id="rep-to" type="email" value="${esc(owner)}" placeholder="you@uark.edu"></label>
+      <label class="field" style="max-width:150px"><span>Month</span><input id="rep-month" type="month" value="${esc(d.month)}"></label>
+    </div>
+    <div class="actions">
+      <button class="btn secondary" id="m-cancel">Close</button>
+      <button class="btn" id="m-send" ${d.rows.length ? "" : "disabled"}>✉ Send report to me</button>
+    </div>`, (el, close) => {
+    $("#m-cancel", el).onclick = close;
+    $("#rep-month", el).onchange = () => {
+      const v = $("#rep-month", el).value;
+      if (v) { close(); reportModal(v); }
+    };
+    $("#m-send", el).onclick = async () => {
+      const to = $("#rep-to", el).value.trim();
+      if (!to) { toast("Enter your email address"); return; }
+      const btn = $("#m-send", el);
+      btn.disabled = true; btn.textContent = "Sending…";
+      try {
+        const r = await api("/api/report/send", "POST", { month: d.month, to });
+        close();
+        toast(`Report for ${d.label} sent to ${r.to} — check it, then forward to your accountant`);
+        markNotifsSeen([...seenNotifs(), `report:${d.month}`]);
+        WD = await api("/api/workday/state");
+        refreshNotifBadge();
+      } catch (e) {
+        btn.disabled = false; btn.textContent = "✉ Send report to me";
+        toast("Send failed: " + e.message);
+      }
+    };
+  });
 }
 
 /* ------------------------------------------------------ close-out report */
@@ -2462,6 +2705,7 @@ if (READONLY) {
   $("#btn-gen-salaries").style.display = "none";
   $("#btn-workday").style.display = "none";
   $("#btn-settings").style.display = "none";
+  $("#btn-bell").style.display = "none";
 }
 $$("#nav button").forEach((b) => b.onclick = () => { view = { name: b.dataset.view }; render(); });
 $("#btn-new-grant").onclick = () => grantModal(null);
@@ -2539,16 +2783,30 @@ $("#btn-settings").onclick = async () => {
   settingsModal();
 };
 
+$("#btn-bell").onclick = (e) => { e.stopPropagation(); notifPanel(); };
+
 reload().then(async () => {
   // Opening the app: offer to connect to Workday (or work offline).
   try {
     WD = await api("/api/workday/state");
     render(); // inject the Workday cards now that WD is loaded
     wdTopbarUpdate();
+    refreshNotifBadge();
     const syncedToday = WD.last_sync && WD.last_sync.date === S.today;
     if (!syncedToday && !wdOffline() && !sessionStorage.getItem("wd-connect-prompted")) {
       sessionStorage.setItem("wd-connect-prompted", "1");
       wdConnectModal();
+    }
+    // Start of a new month: offer last month's report once, and only if
+    // there is actually something to report.
+    const prev = prevMonthKey();
+    const due = !(WD.reports_sent || {})[prev] &&
+                S.expenses.some((e) => e.date.slice(0, 7) === prev);
+    if (due && !READONLY && !sessionStorage.getItem("report-prompted-" + prev)) {
+      sessionStorage.setItem("report-prompted-" + prev, "1");
+      setTimeout(() => {
+        if (!$(".modal")) reportModal(prev);
+      }, 1400);
     }
   } catch { /* Workday is optional — never block the app */ }
 }).catch((e) => {

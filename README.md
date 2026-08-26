@@ -1,11 +1,13 @@
 # Grants Manager
 
-A small, private grant-tracking app for research faculty. Budgets by category
-and year, expenses with receipts, salary/fringe projections from appointments,
-and reports you can hand to your sponsor.
+A grant-tracking app for research faculty who manage their awards in
+**Workday**. Budgets by category and year, expenses with receipts,
+salary/fringe projections from appointments, and reports you can hand to your
+sponsor.
 
-Everything runs **on your own computer**. No accounts, no cloud service, no
-internet connection needed. Your data never leaves your machine.
+It's built so you can **download your reports from Workday or enter expenses
+manually**, and finally get a visual, at-a-glance understanding of your
+accounts and where the money is going.
 
 Built by **Sam Fernandes** — <samuelbf@uark.edu>
 

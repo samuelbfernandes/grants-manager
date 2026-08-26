@@ -27,6 +27,7 @@ APP_DIR = os.path.join(BASE_DIR, "app")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 RECEIPTS_DIR = os.path.join(BASE_DIR, "receipts")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
+REPORTS_DIR = os.path.join(DATA_DIR, "reports")
 DB_PATH = os.path.join(DATA_DIR, "grants.db")
 BACKUP_RETENTION_DAYS = 30
 TRASH_RETENTION_DAYS = 30
@@ -130,6 +131,16 @@ CREATE TABLE IF NOT EXISTS workday_balances (
   budget REAL, commitment REAL, obligation REAL, actuals REAL, available REAL,
   as_of TEXT,
   UNIQUE(grant_code, object_class)
+);
+CREATE TABLE IF NOT EXISTS audit (
+  id INTEGER PRIMARY KEY,
+  at TEXT NOT NULL,
+  action TEXT NOT NULL,
+  expense_id INTEGER,
+  grant_id INTEGER,
+  descr TEXT,
+  amount REAL,
+  detail TEXT
 );
 CREATE TABLE IF NOT EXISTS trash (
   id INTEGER PRIMARY KEY,
@@ -336,6 +347,61 @@ def prune_trash(conn):
 
 def money_str(v):
     return "${:,.2f}".format(v or 0)
+
+
+# --------------------------------------------------------------- audit log
+#
+# Records what a person changed by hand, so the monthly report can show the
+# account owner "here is what moved this month" and they can vouch for it.
+# Only human edits are logged — Workday imports are the system's own record
+# and would just add noise.
+
+AUDIT_WATCH = ("amount", "date", "description", "category_id", "grant_id",
+               "person_id", "wd_worktag")
+
+
+def audit_log(conn, action, expense_id=None, grant_id=None, descr=None,
+              amount=None, detail=None):
+    conn.execute(
+        "INSERT INTO audit (at, action, expense_id, grant_id, descr, amount, "
+        "detail) VALUES (?,?,?,?,?,?,?)",
+        (datetime.now().isoformat(timespec="seconds"), action, expense_id,
+         grant_id, descr, amount, detail))
+
+
+def audit_describe_change(conn, before, after):
+    """Human-readable 'what changed' for an expense edit, or None if nothing
+    a person would care about actually moved."""
+    names = {"amount": "amount", "date": "date", "description": "description",
+             "category_id": "category", "grant_id": "grant",
+             "person_id": "person", "wd_worktag": "worktag"}
+    def label(field, val):
+        if val in (None, ""):
+            return "—"
+        if field == "category_id":
+            r = conn.execute("SELECT name FROM categories WHERE id=?", (val,)).fetchone()
+            return r["name"] if r else str(val)
+        if field == "grant_id":
+            r = conn.execute("SELECT name FROM grants WHERE id=?", (val,)).fetchone()
+            return r["name"] if r else str(val)
+        if field == "person_id":
+            r = conn.execute("SELECT name FROM people WHERE id=?", (val,)).fetchone()
+            return r["name"] if r else str(val)
+        if field == "amount":
+            return money_str(val)
+        return str(val)
+    bits = []
+    for f in AUDIT_WATCH:
+        if f not in after:
+            continue
+        old, new = before[f], after[f]
+        if f == "amount":
+            if abs((old or 0) - (new or 0)) < 0.005:
+                continue
+        elif str(old or "") == str(new or ""):
+            continue
+        bits.append("%s: %s → %s" % (names[f], label(f, old), label(f, new)))
+    return "; ".join(bits) if bits else None
 
 
 def rows_to_list(rows):
@@ -969,28 +1035,38 @@ def wd_push_state(conn):
             "profiles": get_setting(conn, "workday_worktags", {}) or {}}
 
 
-def wd_send_mail(to, cc, subject, body, attachment=None):
+def wd_send_mail(to, cc, subject, body, attachment=None, html=None):
     """Compose and send through Microsoft Outlook — macOS (AppleScript) or
     Windows (Outlook COM via PowerShell). Outlook lets us attach the receipt
     PDF, which a mailto: link cannot. First use on a Mac asks macOS for
-    permission to control Outlook."""
+    permission to control Outlook.
+
+    `attachment` may be a single path or a list of paths. `html`, when given,
+    is sent as the message body instead of `body` (which stays the plain-text
+    fallback) — the monthly report needs a real table an accountant can read.
+    """
     import subprocess
+    attachments = ([attachment] if isinstance(attachment, str)
+                   else list(attachment or []))
+    attachments = [a for a in attachments if a and os.path.isfile(a)]
     if sys.platform == "darwin":
         def q(s):  # AppleScript string literal escaping
             return str(s).replace("\\", "\\\\").replace('"', '\\"')
+        content = ('content:"%s"' % q(html) if html
+                   else 'plain text content:"%s"' % q(body))
         lines = [
             'tell application "Microsoft Outlook"',
             'set msg to make new outgoing message with properties '
-            '{subject:"%s", plain text content:"%s"}' % (q(subject), q(body)),
+            '{subject:"%s", %s}' % (q(subject), content),
             'make new recipient at msg with properties '
             '{email address:{address:"%s"}}' % q(to),
         ]
         if cc:
             lines.append('make new cc recipient at msg with properties '
                          '{email address:{address:"%s"}}' % q(cc))
-        if attachment:
+        for a in attachments:
             lines.append('make new attachment at msg with properties '
-                         '{file:POSIX file "%s"}' % q(attachment))
+                         '{file:POSIX file "%s"}' % q(a))
         lines += ['send msg', 'end tell']
         args = ["osascript"]
         for ln in lines:
@@ -1007,11 +1083,14 @@ def wd_send_mail(to, cc, subject, body, attachment=None):
               "$m.To = '%s'" % q(to)]
         if cc:
             ps.append("$m.CC = '%s'" % q(cc))
-        ps += ["$m.Subject = '%s'" % q(subject),
-               # single-quoted PS strings keep literal newlines as-is
-               "$m.Body = '%s'" % q(body.replace("\r", ""))]
-        if attachment:
-            ps.append("$null = $m.Attachments.Add('%s')" % q(attachment))
+        ps.append("$m.Subject = '%s'" % q(subject))
+        if html:
+            ps.append("$m.HTMLBody = '%s'" % q(html.replace("\r", "")))
+        else:
+            # single-quoted PS strings keep literal newlines as-is
+            ps.append("$m.Body = '%s'" % q(body.replace("\r", "")))
+        for a in attachments:
+            ps.append("$null = $m.Attachments.Add('%s')" % q(a))
         ps.append("$m.Send()")
         args = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
                 "; ".join(ps)]
@@ -1028,6 +1107,198 @@ def wd_send_mail(to, cc, subject, body, attachment=None):
         err = (r.stderr or b"").decode("utf-8", "replace").strip()
         raise RuntimeError("Outlook could not send: %s. %s"
                            % (err or "unknown error", hint))
+
+
+# ------------------------------------------------------- monthly report
+#
+# Goes to the ACCOUNT OWNER, not the accountant: the owner checks it and
+# forwards it on. Columns are named the way Workday names them so the
+# accountant can key them in (or import the attached CSV) without translating.
+
+REPORT_COLUMNS = ["Date", "Amount", "Spend Category", "Business Purpose",
+                  "Grant / Worktag", "Award", "Cost Center", "Fund",
+                  "Person", "Receipt", "Entered"]
+
+
+def month_bounds(month):
+    """'YYYY-MM' -> (first_day, last_day) as ISO strings."""
+    y, mo = int(month[:4]), int(month[5:7])
+    first = date(y, mo, 1)
+    last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    return first.isoformat(), last.isoformat()
+
+
+def report_rows(conn, month):
+    """Every expense dated inside `month`, shaped for an accountant."""
+    start, end = month_bounds(month)
+    ps = wd_push_state(conn)
+    out = []
+    for e in conn.execute(
+            "SELECT e.*, c.name AS category, p.name AS person, g.name AS grant_name "
+            "FROM expenses e LEFT JOIN categories c ON c.id=e.category_id "
+            "LEFT JOIN people p ON p.id=e.person_id "
+            "JOIN grants g ON g.id=e.grant_id "
+            "WHERE e.date>=? AND e.date<=? ORDER BY g.name, e.date",
+            (start, end)):
+        code = ps["codes"].get(e["grant_id"], {})
+        prof = ps["profiles"].get(str(e["grant_id"]), {})
+        out.append({
+            "Date": e["date"],
+            "Amount": "%.2f" % e["amount"],
+            "Spend Category": ps["spend_suggest"].get(e["category_id"],
+                                                      e["category"] or ""),
+            "Business Purpose": e["description"] or "",
+            "Grant / Worktag": (e["wd_worktag"] or code.get("wd_grant_name")
+                                or code.get("grant_code") or e["grant_name"]),
+            "Award": code.get("award", ""),
+            "Cost Center": prof.get("cost_center", ""),
+            "Fund": prof.get("fund", ""),
+            "Person": e["person"] or "",
+            "Receipt": os.path.basename(e["receipt_path"]) if e["receipt_path"] else "",
+            "Entered": "by hand" if e["source"] == "manual" else "from Workday",
+            "_amount": e["amount"],
+            "_grant": e["grant_name"],
+            "_receipt_path": e["receipt_path"] or "",
+        })
+    return out
+
+
+def report_changes(conn, month):
+    start, end = month_bounds(month)
+    return rows_to_list(conn.execute(
+        "SELECT * FROM audit WHERE at>=? AND at<=? ORDER BY at",
+        (start + "T00:00:00", end + "T23:59:59")))
+
+
+def report_data(conn, month):
+    rows = report_rows(conn, month)
+    changes = report_changes(conn, month)
+    by_grant = {}
+    for r in rows:
+        by_grant.setdefault(r["_grant"], {"n": 0, "total": 0.0})
+        by_grant[r["_grant"]]["n"] += 1
+        by_grant[r["_grant"]]["total"] += r["_amount"]
+    return {
+        "month": month,
+        "label": datetime.strptime(month + "-01", "%Y-%m-%d").strftime("%B %Y"),
+        "rows": rows,
+        "changes": changes,
+        "total": sum(r["_amount"] for r in rows),
+        "by_grant": by_grant,
+        "missing_receipts": sum(1 for r in rows
+                                if not r["Receipt"] and r["Entered"] == "by hand"),
+    }
+
+
+def report_csv_path(data):
+    """CSV in the same column order as the table — for Workday import."""
+    import csv
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    path = os.path.join(REPORTS_DIR, "expenses_%s.csv" % data["month"])
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=REPORT_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        for r in data["rows"]:
+            # neutralise anything a spreadsheet would run as a formula
+            w.writerow({k: ("'" + str(r[k])
+                            if re.match(r"^[=+\-@]", str(r.get(k, ""))) else r[k])
+                        for k in REPORT_COLUMNS})
+    return path
+
+
+def report_receipts_zip(data):
+    """One zip of the month's receipts, so the accountant gets them together."""
+    import zipfile
+    paths = [r["_receipt_path"] for r in data["rows"] if r["_receipt_path"]]
+    if not paths:
+        return None
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    out = os.path.join(REPORTS_DIR, "receipts_%s.zip" % data["month"])
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel in paths:
+            full = os.path.join(RECEIPTS_DIR, rel)
+            if os.path.isfile(full):
+                z.write(full, os.path.basename(rel))
+    return out
+
+
+def report_html(data, owner=""):
+    esc = lambda s: (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;"))
+    th = "".join('<th style="text-align:left;padding:7px 9px;border-bottom:2px solid #444;'
+                 'font-size:12px;text-transform:uppercase;letter-spacing:.04em;'
+                 'white-space:nowrap">%s</th>' % esc(c) for c in REPORT_COLUMNS)
+    trs = []
+    for i, r in enumerate(data["rows"]):
+        bg = "#ffffff" if i % 2 == 0 else "#f7f8fa"
+        tds = "".join(
+            '<td style="padding:6px 9px;border-bottom:1px solid #e6e8ec;'
+            'font-size:13px;%s">%s</td>'
+            % ("text-align:right;white-space:nowrap" if c == "Amount" else "",
+               esc(r[c]))
+            for c in REPORT_COLUMNS)
+        trs.append('<tr style="background:%s">%s</tr>' % (bg, tds))
+    grant_rows = "".join(
+        '<tr><td style="padding:5px 9px;font-size:13px">%s</td>'
+        '<td style="padding:5px 9px;font-size:13px;text-align:right">%d</td>'
+        '<td style="padding:5px 9px;font-size:13px;text-align:right;'
+        'white-space:nowrap"><strong>%s</strong></td></tr>'
+        % (esc(g), v["n"], money_str(v["total"]))
+        for g, v in sorted(data["by_grant"].items()))
+    changes = ""
+    if data["changes"]:
+        rows = "".join(
+            '<tr><td style="padding:5px 9px;font-size:12.5px;white-space:nowrap">%s</td>'
+            '<td style="padding:5px 9px;font-size:12.5px">%s</td>'
+            '<td style="padding:5px 9px;font-size:12.5px">%s</td></tr>'
+            % (esc(c["at"].replace("T", " ")[:16]), esc(c["action"]),
+               esc("%s%s" % (c["descr"] or "",
+                             " — " + c["detail"] if c["detail"] else "")))
+            for c in data["changes"])
+        changes = (
+            '<h3 style="font-size:15px;margin:26px 0 8px">Changes made in the app '
+            'this month</h3>'
+            '<p style="font-size:13px;color:#555;margin:0 0 8px">Entries added, '
+            'edited or removed by hand — so you can confirm the list above '
+            'reflects what actually happened.</p>'
+            '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;'
+            'width:100%%;border:1px solid #e6e8ec">%s</table>' % rows)
+    warn = ""
+    if data["missing_receipts"]:
+        warn = ('<p style="background:#fbf1de;border-left:3px solid #8a5a10;'
+                'padding:10px 14px;font-size:13px;margin:0 0 18px">'
+                '<strong>%d hand-entered expense(s) have no receipt attached.</strong> '
+                'Worth checking before this goes to the accountant.</p>'
+                % data["missing_receipts"])
+    return """<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#16202e;max-width:1000px">
+<h2 style="margin:0 0 4px;font-size:20px">Grant expenses — %s</h2>
+<p style="margin:0 0 18px;color:#555;font-size:13.5px">%d expense(s) · total <strong>%s</strong>%s</p>
+%s
+<p style="font-size:13.5px;margin:0 0 16px">Please check the table below. Once it looks right, forward this email to your accountant — the attached CSV has the same rows in Workday's column order, ready to key in or import.</p>
+<h3 style="font-size:15px;margin:0 0 8px">By grant</h3>
+<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin:0 0 22px;border:1px solid #e6e8ec">%s</table>
+<h3 style="font-size:15px;margin:0 0 8px">All expenses</h3>
+<div style="overflow-x:auto"><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%%;border:1px solid #e6e8ec"><thead><tr style="background:#eef1f5">%s</tr></thead><tbody>%s</tbody></table></div>
+%s
+<p style="font-size:12px;color:#777;margin:26px 0 0;border-top:1px solid #e6e8ec;padding-top:12px">
+Generated by Grants Manager on %s%s. Amounts are as recorded in the app; Workday remains the system of record.</p>
+</div>""" % (
+        esc(data["label"]), len(data["rows"]), money_str(data["total"]),
+        (" · %d receipt(s) attached" % sum(1 for r in data["rows"] if r["Receipt"]))
+        if any(r["Receipt"] for r in data["rows"]) else "",
+        warn, grant_rows, th, "".join(trs), changes,
+        date.today().isoformat(),
+        " for " + esc(owner) if owner else "")
+
+
+def report_text(data):
+    lines = ["Grant expenses — %s" % data["label"], "",
+             "%d expense(s), total %s" % (len(data["rows"]),
+                                          money_str(data["total"])), ""]
+    for g, v in sorted(data["by_grant"].items()):
+        lines.append("  %-34s %3d   %s" % (g[:34], v["n"], money_str(v["total"])))
+    lines += ["", "Full details are in the attached CSV.", ""]
+    return "\n".join(lines)
 
 
 def wd_state(conn):
@@ -1047,6 +1318,7 @@ def wd_state(conn):
         "import_dir": WD_IMPORT_DIR,
         "raas": get_setting(conn, "workday_raas", {}) or {},
         "push_cfg": get_setting(conn, "workday_push", {}) or {},
+        "reports_sent": get_setting(conn, "reports_sent", {}) or {},
         "last_sync": get_setting(conn, "workday_last_sync"),
         "session_unlocked": bool(WD_SESSION["password"]),
         "push": wd_push_state(conn),
@@ -1187,6 +1459,21 @@ class Handler(BaseHTTPRequestHandler):
                     conn.close()
             elif path.startswith("/api/export/"):
                 self.handle_export(path)
+            elif path.startswith("/api/report/preview"):
+                q = urlparse(self.path).query
+                month = dict(p.split("=", 1) for p in q.split("&") if "=" in p
+                             ).get("month") or date.today().strftime("%Y-%m")
+                conn = db()
+                try:
+                    d = report_data(conn, month)
+                    d["rows"] = [{k: v for k, v in r.items()
+                                  if not k.startswith("_")} for r in d["rows"]]
+                    d["columns"] = REPORT_COLUMNS
+                    d["owner_email"] = (get_setting(conn, "workday_push", {})
+                                        or {}).get("owner_email", "")
+                    self.send_json(d)
+                finally:
+                    conn.close()
             elif path == "/api/lan_info":
                 self.send_json({"lan_ip": lan_ip(), "port": PORT})
             elif path == "/api/trash":
@@ -1303,6 +1590,9 @@ class Handler(BaseHTTPRequestHandler):
                     f"INSERT INTO {table} ({','.join(cols)}) "
                     f"VALUES ({','.join('?' * len(cols))})",
                     [data[c] for c in cols])
+                if table == "expenses":
+                    audit_log(conn, "added", cur.lastrowid, data.get("grant_id"),
+                              data.get("description"), data.get("amount"))
                 conn.commit()
                 self.send_json({"id": cur.lastrowid})
                 return
@@ -1318,9 +1608,20 @@ class Handler(BaseHTTPRequestHandler):
                     data["receipt_path"] = save_receipt(grant, data.pop("receipt"))
                 cols = [c for c in TABLES[table] if c in data]
                 if cols:
+                    before = (conn.execute("SELECT * FROM expenses WHERE id=?",
+                                           (rid,)).fetchone()
+                              if table == "expenses" else None)
                     conn.execute(
                         f"UPDATE {table} SET {','.join(c + '=?' for c in cols)} "
                         f"WHERE id=?", [data[c] for c in cols] + [rid])
+                    if before is not None:
+                        after = conn.execute("SELECT * FROM expenses WHERE id=?",
+                                             (rid,)).fetchone()
+                        change = audit_describe_change(conn, before, dict(after))
+                        if change:
+                            audit_log(conn, "edited", rid, after["grant_id"],
+                                      after["description"], after["amount"],
+                                      change)
                     conn.commit()
                 self.send_json({"ok": True})
                 return
@@ -1342,6 +1643,8 @@ class Handler(BaseHTTPRequestHandler):
                     for r in rows:
                         trash_capture(conn, batch, summary, "delete",
                                       "expenses", r["id"], row=r)
+                        audit_log(conn, "deleted", r["id"], r["grant_id"],
+                                  r["description"], r["amount"])
                     conn.execute(f"DELETE FROM expenses WHERE id IN ({marks})", ids)
                     conn.commit()
                     self.send_json({"ok": True, "count": len(rows),
@@ -1418,9 +1721,37 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/workday/push_config":
                 set_setting(conn, "workday_push", {
-                    "financial_email": (data.get("financial_email") or "").strip(),
-                    "cc_email": (data.get("cc_email") or "").strip()})
+                    "owner_email": (data.get("owner_email") or "").strip()})
                 self.send_json({"ok": True})
+                return
+            if path == "/api/report/send":
+                cfg = get_setting(conn, "workday_push", {}) or {}
+                to = (data.get("to") or cfg.get("owner_email") or "").strip()
+                if not to:
+                    self.send_json({"error": "Add your email under ⚙ Settings "
+                                    "so the report has somewhere to go."}, 400)
+                    return
+                month = data.get("month") or date.today().strftime("%Y-%m")
+                d = report_data(conn, month)
+                if not d["rows"]:
+                    self.send_json({"error": "No expenses recorded for %s — "
+                                    "nothing to report yet." % d["label"]}, 400)
+                    return
+                attach = [report_csv_path(d)]
+                zp = report_receipts_zip(d)
+                if zp:
+                    attach.append(zp)
+                wd_send_mail(to, "", "Grant expenses — %s" % d["label"],
+                             report_text(d), attachment=attach,
+                             html=report_html(d, to))
+                sent = get_setting(conn, "reports_sent", {}) or {}
+                sent[month] = datetime.now().isoformat(timespec="seconds")
+                set_setting(conn, "reports_sent", sent)
+                if not cfg.get("owner_email"):
+                    cfg["owner_email"] = to
+                    set_setting(conn, "workday_push", cfg)
+                self.send_json({"ok": True, "to": to, "count": len(d["rows"]),
+                                "attachments": [os.path.basename(a) for a in attach]})
                 return
             if path == "/api/workday/send_email":
                 to = (data.get("to") or "").strip()
@@ -1432,17 +1763,17 @@ class Handler(BaseHTTPRequestHandler):
                     p = os.path.join(RECEIPTS_DIR, data["receipt_path"])
                     if os.path.isfile(p):
                         attach = p
-                wd_send_mail(to, (data.get("cc") or "").strip(),
+                wd_send_mail(to, "",
                              data.get("subject") or "Workday expense entry",
                              data.get("body") or "", attach)
                 for eid in data.get("expense_ids") or []:
                     conn.execute("UPDATE expenses SET wd_entry='sent' WHERE id=?",
                                  (int(eid),))
                 conn.commit()
-                # remember the addresses as defaults for next time
-                set_setting(conn, "workday_push", {
-                    "financial_email": to,
-                    "cc_email": (data.get("cc") or "").strip()})
+                # remember it as the owner address for next time
+                cfg = get_setting(conn, "workday_push", {}) or {}
+                cfg["owner_email"] = to
+                set_setting(conn, "workday_push", cfg)
                 self.send_json({"ok": True})
                 return
             if path == "/api/workday/worktags":
@@ -1631,6 +1962,9 @@ class Handler(BaseHTTPRequestHandler):
                 summary = f"Budget line #{rid}"
 
             trash_capture(conn, batch, summary, "delete", table, rid, row=row)
+            if table == "expenses":
+                audit_log(conn, "deleted", rid, row["grant_id"],
+                          row["description"], row["amount"])
             conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
             conn.commit()
             self.send_json({"ok": True, "batch_id": batch})

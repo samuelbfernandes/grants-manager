@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Grants Manager</title>
   <link rel="stylesheet" href="/app/styles.css">
-  <link rel="icon" type="image/png" href="/app/icon.png">
+  <link rel="icon" type="image/png" href="/app/icon.png" id="favicon">
   <link rel="apple-touch-icon" href="/app/icon.png">
   <link rel="manifest" href="/app/manifest.json">
   <meta name="apple-mobile-web-app-capable" content="yes">
@@ -31,6 +31,7 @@
       <input id="global-search" placeholder="Search…" autocomplete="off">
       <div id="search-results" class="search-results" style="display:none"></div>
     </div>
+    <button class="icon-btn bell" id="btn-bell" title="Notifications" style="font-size:16px">🔔<span id="bell-dot" class="bell-dot" hidden></span></button>
     <button class="btn secondary small" id="btn-workday" title="Workday sync and import">⇅ Workday</button>
     <button class="icon-btn" id="btn-dark" title="Toggle dark mode" style="font-size:17px">🌙</button>
     <button class="btn secondary small" id="btn-gen-salaries" title="Create monthly salary + fringe charges for appointments with auto-charge enabled">↻ Update Salaries</button>
