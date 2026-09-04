@@ -31,7 +31,41 @@ REPORTS_DIR = os.path.join(DATA_DIR, "reports")
 DB_PATH = os.path.join(DATA_DIR, "grants.db")
 BACKUP_RETENTION_DAYS = 30
 TRASH_RETENTION_DAYS = 30
-READONLY_MSG = "This is a view-only link — changes can't be made here."
+
+# The server listens on every interface so a phone on the same Wi-Fi can reach
+# it. That also means anyone else on that network can, so requests arriving
+# from off-machine must carry an access key; requests from this computer
+# (loopback) never need one. The key lives beside the database, not in it, so
+# restoring a backup can't hand someone an old key.
+ACCESS_KEY_PATH = os.path.join(DATA_DIR, "access_key.txt")
+ACCESS_KEY = None
+
+
+def _load_key(path):
+    """Read a key file, creating one on first run. 160 bits of urandom."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    try:
+        with open(path) as f:
+            k = f.read().strip()
+        if k:
+            return k
+    except OSError:
+        pass
+    k = base64.urlsafe_b64encode(os.urandom(20)).decode().rstrip("=")
+    with open(path, "w") as f:
+        f.write(k)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return k
+
+
+def load_access_key():
+    """Load the key that guards access from other devices."""
+    global ACCESS_KEY
+    ACCESS_KEY = _load_key(ACCESS_KEY_PATH)
+    return ACCESS_KEY
 
 STANDARD_CATEGORIES = [
     "Personnel", "Fringe", "Tuition", "Travel",
@@ -1122,6 +1156,10 @@ REPORT_COLUMNS = ["Date", "Amount", "Spend Category", "Business Purpose",
 
 def month_bounds(month):
     """'YYYY-MM' -> (first_day, last_day) as ISO strings."""
+    # validated explicitly: `month` reaches a filename in report_csv_path(),
+    # so anything path-shaped must never get that far
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(month or "")):
+        raise ValueError("Month must look like 2026-07")
     y, mo = int(month[:4]), int(month[5:7])
     first = date(y, mo, 1)
     last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
@@ -1190,6 +1228,19 @@ def report_data(conn, month):
     }
 
 
+def csv_safe(v):
+    """Stop a spreadsheet treating a cell as a formula.
+
+    Excel/Sheets execute a cell starting with = + - @ (and will skip leading
+    tabs/CRs to find one). Expense descriptions are free text, so a pasted or
+    imported value could otherwise run when the accountant opens the file.
+    """
+    s = "" if v is None else str(v)
+    if s and s.lstrip("\t\r ")[:1] in ("=", "+", "-", "@"):
+        return "'" + s
+    return s
+
+
 def report_csv_path(data):
     """CSV in the same column order as the table — for Workday import."""
     import csv
@@ -1200,8 +1251,8 @@ def report_csv_path(data):
         w.writeheader()
         for r in data["rows"]:
             # neutralise anything a spreadsheet would run as a formula
-            w.writerow({k: ("'" + str(r[k])
-                            if re.match(r"^[=+\-@]", str(r.get(k, ""))) else r[k])
+            w.writerow({k: (r[k] if isinstance(r.get(k), (int, float))
+                            else csv_safe(r.get(k, "")))
                         for k in REPORT_COLUMNS})
     return path
 
@@ -1336,8 +1387,90 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
+APP_VERSION = "1.2.0"
+UPDATE_REPO = "samuelbfernandes/grants-manager"
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
+UPDATE_INTERVAL_DAYS = 15
+
+
+def _version_tuple(v):
+    """'v1.2.3' -> (1, 2, 3). Unparseable parts sort as 0."""
+    nums = re.findall(r"\d+", str(v or ""))
+    return tuple(int(n) for n in nums[:4]) or (0,)
+
+
+def read_update_cache():
+    try:
+        with open(UPDATE_CACHE_PATH) as f:
+            c = json.load(f)
+        return c if isinstance(c, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def check_for_update(force=False):
+    """Ask GitHub for the latest release, at most once every 15 days.
+
+    Entirely best-effort: with no internet this does nothing at all — it does
+    not record the attempt, so the next launch simply tries again, and the app
+    never blocks, warns, or errors because of it.
+    """
+    cache = read_update_cache()
+    if not force and cache.get("checked"):
+        try:
+            age = (date.today() - date.fromisoformat(cache["checked"])).days
+            if 0 <= age < UPDATE_INTERVAL_DAYS:
+                return cache
+        except ValueError:
+            pass
+    import urllib.request
+    try:
+        req = urllib.request.Request(UPDATE_API, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "GrantsManager/%s" % APP_VERSION})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read(1_000_000).decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 — offline, DNS, rate limit, anything
+        return cache
+    if not isinstance(data, dict):
+        return cache
+    fresh = {
+        "checked": date.today().isoformat(),
+        "latest": str(data.get("tag_name") or "").lstrip("vV"),
+        "name": str(data.get("name") or "")[:200],
+        "notes": str(data.get("body") or "")[:4000],
+        "url": "",
+        "published": str(data.get("published_at") or "")[:10],
+    }
+    # Only trust a link that actually points at this project's releases.
+    link = str(data.get("html_url") or "")
+    if link.startswith("https://github.com/%s/releases/" % UPDATE_REPO):
+        fresh["url"] = link
+    try:
+        with open(UPDATE_CACHE_PATH, "w") as f:
+            json.dump(fresh, f)
+    except OSError:
+        pass
+    return fresh
+
+
+def update_info():
+    """What the UI needs: only flagged when a newer version really exists."""
+    c = read_update_cache()
+    latest = c.get("latest") or ""
+    info = {"current": APP_VERSION, "available": False}
+    if latest and _version_tuple(latest) > _version_tuple(APP_VERSION):
+        info.update(available=True, latest=latest, notes=c.get("notes") or "",
+                    url=c.get("url") or "", published=c.get("published") or "",
+                    name=c.get("name") or "")
+    return info
+
+
 def full_state(conn):
     return {
+        "version": APP_VERSION,
+        "update": update_info(),
         "grants": rows_to_list(conn.execute(
             "SELECT * FROM grants ORDER BY status, end_date")),
         "categories": rows_to_list(conn.execute(
@@ -1349,6 +1482,27 @@ def full_state(conn):
             "SELECT * FROM expenses ORDER BY date DESC, id DESC")),
         "today": date.today().isoformat(),
     }
+
+
+def safe_under(base, untrusted):
+    """Resolve `untrusted` (from a URL) inside `base` and refuse anything that
+    escapes it.
+
+    os.path.join(base, "/etc/passwd") returns "/etc/passwd" — join DISCARDS the
+    base when the second argument is absolute — so a leading-".." check alone
+    lets an absolute path walk straight out. Strip any leading separator, join,
+    fully resolve (following symlinks), and require the result to still sit
+    under the resolved base.
+    """
+    rel = untrusted.replace("\\", "/").lstrip("/")
+    rel = os.path.normpath(rel)
+    if rel.startswith("..") or os.path.isabs(rel):
+        raise PermissionError("path outside allowed directory")
+    full = os.path.realpath(os.path.join(base, rel))
+    root = os.path.realpath(base)
+    if full != root and not full.startswith(root + os.sep):
+        raise PermissionError("path outside allowed directory")
+    return full
 
 
 def save_receipt(grant, payload):
@@ -1386,6 +1540,62 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    # ------------------------------------------------------------ security
+    def is_local(self):
+        host = (self.client_address[0] or "")
+        return host in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+
+    def presented_key(self):
+        q = urlparse(self.path).query
+        for part in q.split("&"):
+            if part.startswith("k="):
+                return unquote(part[2:])
+        hdr = self.headers.get("X-Grants-Key")
+        if hdr:
+            return hdr
+        cookie = self.headers.get("Cookie") or ""
+        for c in cookie.split(";"):
+            c = c.strip()
+            if c.startswith("gmkey="):
+                return c[len("gmkey="):]
+        return None
+
+    def check_access(self):
+        """Off-machine requests need the access key. Returns True to continue."""
+        if self.is_local() or ACCESS_KEY is None:
+            return True
+        import hmac
+        given = self.presented_key() or ""
+        if hmac.compare_digest(given, ACCESS_KEY):
+            return True
+        self.send_json({"error": "This computer isn't authorised to open "
+                        "Grants Manager. Ask the owner for the link that "
+                        "includes the access key."}, 403)
+        return False
+
+    def check_not_csrf(self):
+        """Block another website from driving this app through the browser.
+
+        A page on evil.example can POST here with a 'simple' content type and
+        no preflight. Two cheap, standard defences: reject a cross-site
+        Origin outright, and require a custom header that a cross-origin
+        request cannot set without triggering a preflight we never answer.
+        """
+        origin = self.headers.get("Origin")
+        if origin:
+            host = self.headers.get("Host") or ""
+            allowed = {"http://" + host, "https://" + host,
+                       "http://127.0.0.1:%d" % PORT, "http://localhost:%d" % PORT}
+            if origin not in allowed:
+                self.send_json({"error": "Blocked a change requested by "
+                                "another website."}, 403)
+                return False
+        if self.headers.get("X-Grants-App") != "1":
+            self.send_json({"error": "Blocked a change that didn't come from "
+                            "the Grants Manager page itself."}, 403)
+            return False
+        return True
+
     # ------------------------------------------------------------- helpers
     def send_json(self, obj, code=200):
         body = json.dumps(obj).encode()
@@ -1395,10 +1605,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # Bodies are read whole into memory (base64 uploads), so cap them rather
+    # than trusting a client-supplied Content-Length.
+    MAX_BODY = 260 * 1024 * 1024
+
     def read_body(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length == 0:
             return {}
+        if length > self.MAX_BODY:
+            raise ValueError("Request too large")
         return json.loads(self.rfile.read(length))
 
     def send_file(self, path, download_name=None):
@@ -1426,19 +1642,21 @@ class Handler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------- routing
     def do_GET(self):
         path = unquote(urlparse(self.path).path)
+        # Unauthenticated identity probe. Carries no user data — it exists so a
+        # second launch can tell "Grants Manager is already running here" from
+        # "some unrelated program owns this port" without needing the key.
+        if path == "/api/ping":
+            self.send_json({"app": "grants-manager"})
+            return
+        if not self.check_access():
+            return
         try:
             if path == "/" or path == "/index.html":
                 self.send_file(os.path.join(APP_DIR, "index.html"))
             elif path.startswith("/app/"):
-                safe = os.path.normpath(path[len("/app/"):])
-                if safe.startswith(".."):
-                    raise ValueError("bad path")
-                self.send_file(os.path.join(APP_DIR, safe))
+                self.send_file(safe_under(APP_DIR, path[len("/app/"):]))
             elif path.startswith("/receipts/"):
-                safe = os.path.normpath(path[len("/receipts/"):])
-                if safe.startswith(".."):
-                    raise ValueError("bad path")
-                self.send_file(os.path.join(RECEIPTS_DIR, safe))
+                self.send_file(safe_under(RECEIPTS_DIR, path[len("/receipts/"):]))
             elif path == "/api/state":
                 conn = db()
                 try:
@@ -1475,7 +1693,8 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     conn.close()
             elif path == "/api/lan_info":
-                self.send_json({"lan_ip": lan_ip(), "port": PORT})
+                self.send_json({"lan_ip": lan_ip(), "port": PORT,
+                                "key": ACCESS_KEY})
             elif path == "/api/trash":
                 conn = db()
                 try:
@@ -1488,8 +1707,13 @@ class Handler(BaseHTTPRequestHandler):
                     f"grants_backup_{date.today().isoformat()}.db"))
             else:
                 self.send_json({"error": "not found"}, 404)
+        except PermissionError:
+            self.send_json({"error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001
-            self.send_json({"error": str(e)}, 500)
+            # don't hand absolute paths / internals to the caller
+            print("GET %s failed: %r" % (path, e))
+            self.send_json({"error": "Something went wrong handling that "
+                            "request."}, 500)
 
     def handle_export(self, path):
         m = re.match(r"/api/export/grant/(\d+)\.csv", path)
@@ -1516,9 +1740,10 @@ class Handler(BaseHTTPRequestHandler):
             w.writerow(["Date", "Category", "Budget Year", "Amount",
                         "Description", "Person", "Receipt", "Source"])
             for r in rows:
-                w.writerow([r["date"], r["category"], r["year"], f"{r['amount']:.2f}",
-                            r["description"], r["person"] or "",
-                            r["receipt_path"] or "", r["source"]])
+                w.writerow([r["date"], csv_safe(r["category"]), r["year"],
+                            f"{r['amount']:.2f}",
+                            csv_safe(r["description"]), csv_safe(r["person"] or ""),
+                            csv_safe(r["receipt_path"] or ""), csv_safe(r["source"])])
             body = buf.getvalue().encode()
             name = f"{slugify(grant['name'])}_ledger.csv"
             self.send_response(200)
@@ -1547,17 +1772,18 @@ class Handler(BaseHTTPRequestHandler):
             prof = ps["profiles"].get(str(e["grant_id"]), {})
             w.writerow([
                 e["date"], "%.2f" % e["amount"],
-                ps["spend_suggest"].get(e["category_id"],
-                                        e["category"] or ""),
-                e["description"],
-                e["wd_worktag"] or code.get("wd_grant_name")
-                or code.get("grant_code") or e["grant_name"],
-                code.get("award", ""),
-                prof.get("cost_center", ""), prof.get("fund", ""),
-                prof.get("extra", ""), e["person"] or "",
-                os.path.basename(e["receipt_path"] or ""),
-                "entered, waiting to post" if e["wd_entry"] == "sent"
-                else "needs entry",
+                csv_safe(ps["spend_suggest"].get(e["category_id"],
+                                                 e["category"] or "")),
+                csv_safe(e["description"]),
+                csv_safe(e["wd_worktag"] or code.get("wd_grant_name")
+                         or code.get("grant_code") or e["grant_name"]),
+                csv_safe(code.get("award", "")),
+                csv_safe(prof.get("cost_center", "")),
+                csv_safe(prof.get("fund", "")),
+                csv_safe(prof.get("extra", "")), csv_safe(e["person"] or ""),
+                csv_safe(os.path.basename(e["receipt_path"] or "")),
+                "Sent, waiting" if e["wd_entry"] == "sent"
+                else "Not sent yet",
                 e["id"]])
         body = buf.getvalue().encode()
         self.send_response(200)
@@ -1569,10 +1795,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        path = unquote(urlparse(self.path).path)
-        if self.headers.get("X-Grants-Readonly") == "1":
-            self.send_json({"error": READONLY_MSG}, 403)
+        if not self.check_access() or not self.check_not_csrf():
             return
+        path = unquote(urlparse(self.path).path)
         conn = db()
         try:
             data = self.read_body()
@@ -1888,10 +2113,9 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=write_snapshot, daemon=True).start()
 
     def do_DELETE(self):
-        path = unquote(urlparse(self.path).path)
-        if self.headers.get("X-Grants-Readonly") == "1":
-            self.send_json({"error": READONLY_MSG}, 403)
+        if not self.check_access() or not self.check_not_csrf():
             return
+        path = unquote(urlparse(self.path).path)
         conn = db()
         try:
             m = re.match(r"/api/(grants|categories|people|appointments|expenses"
@@ -2036,6 +2260,10 @@ def write_snapshot():
     try:
         conn = db()
         fmt = lambda v: "${:,.0f}".format(v)
+        # Grant/category names are free text (and can arrive from a Workday
+        # import), so escape them rather than trusting them in HTML.
+        esc = lambda t: (str(t if t is not None else "").replace("&", "&amp;")
+                         .replace("<", "&lt;").replace(">", "&gt;"))
         projs = compute_projections(conn)
         grants = rows_to_list(conn.execute(
             "SELECT * FROM grants ORDER BY status, end_date"))
@@ -2076,13 +2304,13 @@ def write_snapshot():
             tot_avail += avail
             end = g["nce_end_date"] or g["end_date"] or "—"
             rows = "".join(
-                f"<tr><td>{n}</td><td class=n>{fmt(v['budget'] - v['spent'])}</td></tr>"
+                f"<tr><td>{esc(n)}</td><td class=n>{fmt(v['budget'] - v['spent'])}</td></tr>"
                 for n, v in sorted(per_cat.items())
                 if v["budget"] or v["spent"])
             neg = ' style="color:#d24545"' if sal_proj < 0 else ""
             cards.append(
-                f"<div class=card><h2>{g['name']}</h2>"
-                f"<div class=sub>{g['agency']} · ends {end}</div>"
+                f"<div class=card><h2>{esc(g['name'])}</h2>"
+                f"<div class=sub>{esc(g['agency'])} · ends {esc(end)}</div>"
                 f"<div class=big>{fmt(avail)} <small>available now</small></div>"
                 f"<div class=big2{neg}>{fmt(sal_proj)} <small>salary after "
                 f"projections</small></div>"
@@ -2327,9 +2555,9 @@ def is_our_server(port):
     import urllib.request
     try:
         with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/api/state", timeout=1.5) as resp:
+                f"http://127.0.0.1:{port}/api/ping", timeout=1.5) as resp:
             data = json.loads(resp.read())
-        return isinstance(data, dict) and "grants" in data and "categories" in data
+        return isinstance(data, dict) and data.get("app") == "grants-manager"
     except Exception:  # noqa: BLE001 — any failure means "not us"
         return False
 
@@ -2392,6 +2620,9 @@ def main():
         print("  Help: samuelbf@uark.edu\n")
         sys.exit(1)
     write_snapshot()
+    # Look for a new release in the background — never delays startup, and is
+    # silently skipped when there's no internet.
+    threading.Thread(target=check_for_update, daemon=True).start()
     try:
         make_backup()  # one automatic dated copy per day, pruned after 30
         prune_backups()
@@ -2406,12 +2637,15 @@ def main():
         make_clean_copy()  # keep the shareable (data-free) zip fresh
     except OSError:
         pass
+    load_access_key()
     # bind all interfaces so the app is reachable from a phone on the same Wi-Fi
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"Grants Manager running at {url}  (Ctrl+C to stop)")
     ip = lan_ip()
     if ip:
-        print(f"On your iPhone (same Wi-Fi): http://{ip}:{PORT}")
+        print(f"On your iPhone (same Wi-Fi): http://{ip}:{PORT}/?k={ACCESS_KEY}")
+        print("  ^ that link includes your access key — anyone with it can see")
+        print("    your grants, so treat it like a password.")
     if launch:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:

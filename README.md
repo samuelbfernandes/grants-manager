@@ -41,11 +41,84 @@ The starter offers to open the right page for you:
 
 ---
 
+## Getting your Workday numbers in
+
+The app **works offline by default** — it never asks you to sign in to
+anything, and you can simply type expenses in by hand. Most people can't
+connect to Workday directly (single sign-on and Duo block it), so the normal
+way to use it is: **download a report from Workday, import the file here.**
+
+**In Workday**
+
+1. Sign in as you normally do.
+2. Search for `Grant Budget Vs Actuals` and open the report (usually
+   **RPT - Grant Budget Vs Actuals**). Names vary by university — any
+   budget-versus-actuals report for your grant works.
+3. Fill in **Grant** or **Award** with your grant, click **OK**.
+4. At the top-right of the report table, click the small **Excel icon**
+   (*Export to Excel*) → **Download**. You get an `.xlsx` in your Downloads
+   folder. That's your **balances** file.
+5. *Optional but recommended:* click an **Actuals amount** to drill into the
+   individual transactions, and export that screen too. That's your
+   **transactions** file — it's what shows you each charge, not just totals.
+
+**In the app**
+
+6. Click **⇅ Workday** in the top bar.
+7. Click **📁 Choose files**, select the `.xlsx` file(s) — you can pick
+   several at once. They're read immediately; you never need to find or use
+   any folder yourself.
+8. First time only: match Workday's grant codes and object classes to your
+   grants and categories. It won't ask again.
+
+Repeat whenever you want fresh numbers. Re-importing never creates
+duplicates.
+
+### Connecting directly (optional, advanced)
+
+Workday can serve a report at a private URL that the app pulls automatically,
+configured under **⚙ Settings → Direct connection (RaaS)**. This needs
+permissions ordinary faculty accounts usually don't have — rights to create
+custom reports (*Report Writer*), rights to tick **Enable As Web Service**,
+and an account that accepts a username and password rather than SSO-only
+(which typically means asking IT for an *Integration System User* exempt from
+SSO and MFA). The Instructions tab in the app lists the exact access levels to
+ask for. **If it doesn't work, nothing is wrong** — the import steps above
+give you the same numbers.
+
+---
+
 ## Using it on your phone
 
 With the app running on your computer and your phone on the **same Wi-Fi**,
-open the `http://192.168.x.x:8765` address the app prints at startup. On
+open the `http://192.168.x.x:8765/?k=…` address the app prints at startup. On
 iPhone, Safari → Share → **Add to Home Screen** installs it like an app.
+
+**That link ends in an access key — treat it like a password.** Anything on
+your network that has it can read and change your grants; anything without it
+is refused. The key is created on first run and kept in
+`data/access_key.txt`. On the computer running the app you never need it —
+`http://127.0.0.1:8765` just works.
+
+### Showing your numbers to someone else
+
+Anyone with that link and key has full access, so to share figures with a
+co-PI or department admin use **🖨 Print report** on a grant (a clean page
+with the charts, ready to print or save as PDF) or **⬇ Export CSV**. Both are
+a snapshot they can keep, with nothing connected back to your app.
+
+---
+
+## Updates
+
+The bell in the top bar tells you when a newer version is out, and shows
+what changed in it. About once every 15 days the app asks GitHub for the
+latest released version number — it sends nothing about you or your grants,
+and if you're offline it quietly does nothing and tries again later.
+
+To update: download the new `GrantsManager.zip`, unzip it, and copy your
+existing `data` folder into the new folder, replacing the empty one. Your
+grants, expenses and receipts all live in there.
 
 ---
 
