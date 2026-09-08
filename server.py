@@ -7,7 +7,9 @@ Run:  python3 server.py            (starts server, prints URL)
 If the server is already running, --launch just opens the browser.
 """
 import base64
+import ipaddress
 import json
+import math
 import os
 import re
 import shutil
@@ -15,6 +17,7 @@ import socket
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from datetime import date, datetime, timedelta
@@ -219,6 +222,14 @@ MIGRATIONS = [  # (table, column, DDL type/default)
     # explicit worktag typed at entry time — used for expenses (e.g. "Other"
     # external accounts) that have no grant-level Workday mapping to pull one from
     ("expenses", "wd_worktag", "TEXT DEFAULT ''"),
+    # P-card purchases. The university's reconciliation form asks for these on
+    # every card transaction, so they are recorded at entry time rather than
+    # reconstructed from memory at month end.
+    ("expenses", "pcard", "INTEGER DEFAULT 0"),
+    # "Purchased by (if different from cardholder)" — usually blank
+    ("expenses", "pcard_buyer", "TEXT DEFAULT ''"),
+    # per-expense override; normally inherited from the card set up in Settings
+    ("expenses", "pcard_holder", "TEXT DEFAULT ''"),
 ]
 
 
@@ -438,6 +449,47 @@ def audit_describe_change(conn, before, after):
     return "; ".join(bits) if bits else None
 
 
+def json_safe(o):
+    """Replace infinities/NaN with 0 on the way OUT.
+
+    Python's json writes them as bare `Infinity`/`NaN`, which is not valid
+    JSON — one such value anywhere in /api/state makes the browser's
+    JSON.parse throw and the whole app fail to load, with no way to delete the
+    offending row from inside the app. reject_wild_numbers() keeps them from
+    being stored in the first place; this is the escape hatch for a database
+    that already picked one up.
+    """
+    if isinstance(o, float):
+        return o if math.isfinite(o) else 0
+    if isinstance(o, dict):
+        return {k: json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [json_safe(v) for v in o]
+    return o
+
+
+def reject_wild_numbers(o, depth=0):
+    """Refuse infinities/NaN on the way IN.
+
+    JavaScript turns anything past ~1.8e308 into Infinity, so pasting a long
+    row of digits into an amount box is enough to produce one — no malice
+    required. Stored, it poisons every total silently (NaN loses all
+    comparisons) and breaks the JSON the app is served with.
+    """
+    if depth > 40:
+        raise ValueError("That data is nested too deeply to store.")
+    if isinstance(o, float) and not math.isfinite(o):
+        raise ValueError("That number is too large (or not a number) to "
+                         "store — check the amount you typed.")
+    if isinstance(o, dict):
+        for v in o.values():
+            reject_wild_numbers(v, depth + 1)
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            reject_wild_numbers(v, depth + 1)
+    return o
+
+
 def rows_to_list(rows):
     return [dict(r) for r in rows]
 
@@ -572,10 +624,104 @@ WD_IMPORT_DIR = os.path.join(os.path.dirname(BASE_DIR), "workday_imports")
 _XLSX_NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 
 
+# The two reports the app understands, and the columns that identify each.
+# Kept here so the format checks, the error messages and the example workbook
+# can never drift apart from what wd_ingest_rows() actually reads.
+WD_DETAIL_KEYS = {"Accounting Date", "Transaction Amount"}
+WD_SUMMARY_KEYS = {"Object Class", "Budget", "Available Balance"}
+WD_DETAIL_COLUMNS = ["Accounting Date", "Budget Date", "Operational Transaction",
+                     "Award", "Grant", "Worker", "Supplier", "Ledger Account",
+                     "Transaction Amount", "Object Class", "Spend Category"]
+WD_SUMMARY_COLUMNS = ["Grant", "Award", "Object Class", "Budget", "Commitment",
+                      "Obligation", "Actuals", "Available Balance"]
+# an .xlsx is a zip; refuse one that expands to more than this (zip bomb)
+XLSX_MAX_UNPACKED = 400 * 1024 * 1024
+
+
+def sniff_spreadsheet(path):
+    """Say plainly what a file that isn't a readable .xlsx actually is.
+
+    People export the wrong thing far more often than they hit a real bug:
+    Workday's "Print" gives a PDF, older Excel and some Windows setups give
+    .xls, "Export to CSV" gives text, and Numbers/Sheets hand back their own
+    formats. Every one of those used to be renamed to .xlsx on upload and then
+    fail deep inside the XML parser. Returns an explanation, or None if the
+    file looks like a genuine .xlsx.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return "The file could not be read."
+    if head[:4] == b"%PDF":
+        return ("That's a PDF. In Workday use the “Export to Excel” button "
+                "(the little grid icon above the report), not Print or "
+                "Download PDF.")
+    if head[:4] == b"\xd0\xcf\x11\xe0":
+        return ("That's the older Excel format (.xls). Open it in Excel and "
+                "use File → Save As → Excel Workbook (.xlsx), then upload "
+                "that.")
+    if head[:2] != b"PK":
+        return ("That isn't an Excel workbook. If you exported a CSV or text "
+                "file, run the Workday export again and choose Excel "
+                "(.xlsx).")
+    import zipfile
+    try:
+        z = zipfile.ZipFile(path)
+        names = z.namelist()
+    except zipfile.BadZipFile:
+        return "The file is damaged — try exporting it from Workday again."
+    if not any(n.startswith("xl/") for n in names):
+        if any(n.startswith("word/") for n in names):
+            return "That's a Word document, not a Workday export."
+        if any(n.startswith("ppt/") for n in names):
+            return "That's a PowerPoint file, not a Workday export."
+        if any(n.endswith(".iwa") or n.startswith("Index/") for n in names):
+            return ("That's an Apple Numbers file. Open it and use File → "
+                    "Export To → Excel, then upload the .xlsx.")
+        return ("That isn't an Excel workbook — it's a different kind of zip "
+                "file.")
+    if sum(i.file_size for i in z.infolist()) > XLSX_MAX_UNPACKED:
+        return ("That workbook is far too large to be a grant report — "
+                "check you exported the right thing.")
+    if not any(n.startswith("xl/worksheets/") for n in names):
+        return "That workbook has no worksheets in it."
+    return None
+
+
+def wd_describe_bad_headers(headers):
+    """Explain which of the two reports a sheet almost matched, and what's
+    missing — instead of silently importing nothing."""
+    hset = {h for h in headers if h}
+    if not hset:
+        return ("The first sheet has no column headings. Make sure you upload "
+                "the exported report itself, not a copy you've edited.")
+    detail_missing = sorted(WD_DETAIL_KEYS - hset)
+    summary_missing = sorted(WD_SUMMARY_KEYS - hset)
+    # whichever report it's closer to is almost certainly the one intended
+    if len(detail_missing) <= len(summary_missing):
+        kind, missing, cols = ("transactions", detail_missing,
+                               WD_DETAIL_COLUMNS)
+    else:
+        kind, missing, cols = ("balances", summary_missing, WD_SUMMARY_COLUMNS)
+    found = ", ".join(sorted(hset)[:8]) + ("…" if len(hset) > 8 else "")
+    return ("This looks like it's meant to be the %s report, but the "
+            "column%s %s %s missing. The %s report needs these columns, "
+            "spelled exactly this way: %s. Columns found instead: %s. "
+            "Download the example file to see the expected layout."
+            % (kind, "" if len(missing) == 1 else "s",
+               ", ".join("“%s”" % m for m in missing),
+               "is" if len(missing) == 1 else "are",
+               kind, ", ".join(cols), found))
+
+
 def parse_xlsx(path):
     """Minimal stdlib .xlsx reader -> (headers, rows-as-dicts). Sheet 1 only."""
     import zipfile
     import xml.etree.ElementTree as ET
+    bad = sniff_spreadsheet(path)
+    if bad:
+        raise ValueError(bad)
     z = zipfile.ZipFile(path)
     shared = []
     if "xl/sharedStrings.xml" in z.namelist():
@@ -608,14 +754,39 @@ def parse_xlsx(path):
             width = max(cells) + 1
             grid.append([cells.get(i, "") for i in range(width)])
     if not grid:
-        return [], []
-    headers = [str(h).strip() for h in grid[0]]
+        raise ValueError("The first sheet of that workbook is empty.")
+    hrow = find_header_row(grid)
+    headers = [str(h).strip() for h in grid[hrow]]
     rows = []
-    for raw in grid[1:]:
+    for raw in grid[hrow + 1:]:
         d = {headers[i]: raw[i] if i < len(raw) else ""
              for i in range(len(headers)) if headers[i]}
         rows.append(d)
     return headers, rows
+
+
+def find_header_row(grid):
+    """Index of the row holding the column names.
+
+    Workday exports often lead with a title ("RPT - Grant Budget vs Actuals"),
+    a filter summary, or a blank row, so the headings are not always row 1 —
+    and taking row 1 regardless made a perfectly good export look like an
+    unrecognised format. Pick whichever of the first few rows names the most
+    columns we recognise; fall back to the first non-empty row.
+    """
+    known = WD_DETAIL_KEYS | WD_SUMMARY_KEYS | set(WD_DETAIL_COLUMNS) \
+        | set(WD_SUMMARY_COLUMNS)
+    best, best_hits = None, 0
+    for i, row in enumerate(grid[:8]):
+        hits = sum(1 for c in row if str(c).strip() in known)
+        if hits > best_hits:
+            best, best_hits = i, hits
+    if best is not None and best_hits >= 2:
+        return best
+    for i, row in enumerate(grid):
+        if any(str(c).strip() for c in row):
+            return i
+    return 0
 
 
 def excel_date(v):
@@ -690,6 +861,175 @@ def _wd_category_on_grant(conn, cat_id, grant_id):
     other = conn.execute(
         "SELECT id FROM categories WHERE name='Other' AND grant_id IS NULL").fetchone()
     return other["id"] if other else None
+
+
+# ------------------------------------------------- example workbook
+#
+# A two-sheet .xlsx with obviously fake data, generated on demand so it can
+# never fall out of step with WD_*_COLUMNS above. Written by hand because the
+# app has no third-party dependencies — an .xlsx is just a zip of XML.
+
+WD_EXAMPLE_DETAIL_ROWS = [
+    ["2026-03-04", "2026-03-04", "Supplier Invoice: SINV-100241", "AWD-000123",
+     "GR000123 Example Grant — Soil Microbiome", "", "Example Lab Supply Co",
+     "6300:Supplies", 412.75, "Supplies", "Laboratory Supplies"],
+    ["2026-03-11", "2026-03-11", "Expense Report: EXP-004417", "AWD-000123",
+     "GR000123 Example Grant — Soil Microbiome", "Doe, Jane", "",
+     "6500:Travel", 1284.10, "Travel", "Airfare - Domestic"],
+    ["2026-03-31", "2026-03-31", "Payroll: PAY-2026-03", "AWD-000123",
+     "GR000123 Example Grant — Soil Microbiome", "Roe, Alex", "",
+     "6100:Salaries", 4166.67, "Personnel", "Salaries - Postdoctoral"],
+    ["2026-03-31", "2026-03-31", "Payroll: PAY-2026-03", "AWD-000123",
+     "GR000123 Example Grant — Soil Microbiome", "Roe, Alex", "",
+     "6150:Fringe", 1145.83, "Fringe", "Fringe Benefits"],
+    ["2026-04-02", "2026-04-02", "Supplier Invoice: SINV-100388", "AWD-000456",
+     "GR000456 Example Grant — Field Trial", "", "Example Seed Supply",
+     "6300:Supplies", 87.40, "Supplies", "Field Supplies"],
+]
+
+WD_EXAMPLE_SUMMARY_ROWS = [
+    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Personnel",
+     150000, 0, 0, 4166.67, 145833.33],
+    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Fringe",
+     41250, 0, 0, 1145.83, 40104.17],
+    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Supplies",
+     20000, 1500, 0, 412.75, 18087.25],
+    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Travel",
+     12000, 0, 0, 1284.10, 10715.90],
+    ["GR000456 Example Grant — Field Trial", "AWD-000456", "Supplies",
+     8000, 0, 0, 87.40, 7912.60],
+]
+
+
+def _xlsx_sheet_xml(columns, rows):
+    """One worksheet as SpreadsheetML, with inline strings so there is no
+    shared-string table to keep in sync."""
+    def esc(v):
+        return (str(v).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+    def cell(col, rownum, v, style=""):
+        ref = "%s%d" % (col, rownum)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return '<c r="%s"%s><v>%s</v></c>' % (ref, style, v)
+        if v == "" or v is None:
+            return ''
+        return ('<c r="%s"%s t="inlineStr"><is><t xml:space="preserve">%s'
+                '</t></is></c>' % (ref, style, esc(v)))
+
+    def colname(i):
+        name = ""
+        i += 1
+        while i:
+            i, r = divmod(i - 1, 26)
+            name = chr(65 + r) + name
+        return name
+
+    # width each column to its widest value, so nothing opens as ####
+    widths = []
+    for i, head in enumerate(columns):
+        longest = max([len(str(head))]
+                      + [len(str(r[i])) for r in rows if i < len(r)])
+        widths.append('<col min="%d" max="%d" width="%.1f" customWidth="1"/>'
+                      % (i + 1, i + 1, min(52, max(9, longest + 2))))
+    out = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+           '<worksheet xmlns="http://schemas.openxmlformats.org/'
+           'spreadsheetml/2006/main">'
+           # keep the headings on screen while scrolling a long month
+           '<sheetViews><sheetView workbookViewId="0">'
+           '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" '
+           'state="frozen"/></sheetView></sheetViews>'
+           '<cols>%s</cols><sheetData>' % "".join(widths)]
+    money_cols = {i for i, c in enumerate(columns) if str(c) == "Amount"}
+    for n, row in enumerate([columns] + rows, start=1):
+        # style 1 = bold header, style 2 = two-decimal money (see _XLSX_STYLES)
+        cells = "".join(
+            cell(colname(i), n, v,
+                 ' s="1"' if n == 1 else (' s="2"' if i in money_cols else ''))
+            for i, v in enumerate(row))
+        out.append('<row r="%d">%s</row>' % (n, cells))
+    out.append("</sheetData></worksheet>")
+    return "".join(out)
+
+
+_XLSX_STYLES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/'
+    '2006/main">'
+    '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font>'
+    '<font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+    '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill></fills>'
+    '<borders count="1"><border/></borders>'
+    '<cellStyleXfs count="1"><xf/></cellStyleXfs>'
+    '<cellXfs count="3"><xf xfId="0"/>'
+    '<xf xfId="0" fontId="1" applyFont="1"/>'
+    # style 2: money, always two decimals — 88.4 in a column of dollars
+    # reads as an error to whoever is checking the totals
+    '<xf xfId="0" numFmtId="2" applyNumberFormat="1"/></cellXfs>'
+    '</styleSheet>')
+
+
+def write_xlsx(path, sheets):
+    """Write a real .xlsx — an OOXML package built by hand, because this app
+    has no third-party dependencies. `sheets` is [(name, columns, rows)]."""
+    import zipfile
+    ns = "http://schemas.openxmlformats.org/"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Types xmlns="%spackage/2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/'
+                   'vnd.openxmlformats-package.relationships+xml"/>'
+                   '<Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/xl/workbook.xml" ContentType='
+                   '"application/vnd.openxmlformats-officedocument.'
+                   'spreadsheetml.sheet.main+xml"/>'
+                   '<Override PartName="/xl/styles.xml" ContentType='
+                   '"application/vnd.openxmlformats-officedocument.'
+                   'spreadsheetml.styles+xml"/>%s</Types>'
+                   % (ns, "".join(
+                       '<Override PartName="/xl/worksheets/sheet%d.xml" '
+                       'ContentType="application/vnd.openxmlformats-'
+                       'officedocument.spreadsheetml.worksheet+xml"/>' % i
+                       for i in range(1, len(sheets) + 1))))
+        z.writestr("_rels/.rels",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="%spackage/2006/relationships">'
+                   '<Relationship Id="rId1" Type="%sofficeDocument/2006/'
+                   'relationships/officeDocument" Target="xl/workbook.xml"/>'
+                   '</Relationships>' % (ns, ns))
+        z.writestr("xl/workbook.xml",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<workbook xmlns="%sspreadsheetml/2006/main" '
+                   'xmlns:r="%sofficeDocument/2006/relationships"><sheets>%s'
+                   '</sheets></workbook>'
+                   % (ns, ns, "".join(
+                       '<sheet name="%s" sheetId="%d" r:id="rId%d"/>'
+                       % (name, i, i)
+                       for i, (name, _, _) in enumerate(sheets, start=1))))
+        rels = "".join(
+            '<Relationship Id="rId%d" Type="%sofficeDocument/2006/'
+            'relationships/worksheet" Target="worksheets/sheet%d.xml"/>'
+            % (i, ns, i) for i in range(1, len(sheets) + 1))
+        rels += ('<Relationship Id="rIdStyles" Type="%sofficeDocument/2006/'
+                 'relationships/styles" Target="styles.xml"/>' % ns)
+        z.writestr("xl/_rels/workbook.xml.rels",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="%spackage/2006/relationships">%s'
+                   '</Relationships>' % (ns, rels))
+        z.writestr("xl/styles.xml", _XLSX_STYLES)
+        for i, (_, cols, rows) in enumerate(sheets, start=1):
+            z.writestr("xl/worksheets/sheet%d.xml" % i,
+                       _xlsx_sheet_xml(cols, rows))
+    return path
+
+
+def wd_example_workbook(path):
+    """The example .xlsx (sheet 1 = transactions, sheet 2 = balances)."""
+    return write_xlsx(path, [
+        ("Transactions", WD_DETAIL_COLUMNS, WD_EXAMPLE_DETAIL_ROWS),
+        ("Balances", WD_SUMMARY_COLUMNS, WD_EXAMPLE_SUMMARY_ROWS)])
 
 
 def wd_ingest_file(conn, path):
@@ -777,7 +1117,7 @@ def wd_ingest_rows(conn, headers, rows):
                  date.today().isoformat()))
             n += 1
         return "summary", n
-    return "unknown", 0
+    raise ValueError(wd_describe_bad_headers(headers))
 
 
 def wd_seed_category_maps(conn):
@@ -907,8 +1247,25 @@ def wd_save_uploaded(payload):
     export filename) never clobber each other."""
     fname = os.path.basename(payload.get("name") or "import.xlsx")
     fname = re.sub(r"[^A-Za-z0-9._ -]+", "_", fname)
+    # Renaming whatever arrives to .xlsx (the old behaviour) only moved the
+    # failure deeper, where the message was about XML rather than about the
+    # file the person actually picked.
     if not fname.lower().endswith(".xlsx"):
-        fname += ".xlsx"
+        ext = os.path.splitext(fname)[1].lower() or "(no extension)"
+        hints = {
+            ".xls": "Open it in Excel and use File → Save As → Excel Workbook "
+                    "(.xlsx).",
+            ".csv": "Run the Workday export again and choose Excel (.xlsx) "
+                    "rather than CSV.",
+            ".pdf": "Use Workday's “Export to Excel” button, not Print.",
+            ".numbers": "Open it in Numbers and use File → Export To → Excel.",
+            ".txt": "Run the Workday export again and choose Excel (.xlsx).",
+        }
+        raise ValueError("“%s” is a %s file — Grants Manager reads Workday's "
+                         ".xlsx exports. %s"
+                         % (fname, ext, hints.get(ext, "Export the report "
+                                                  "from Workday as Excel "
+                                                  "(.xlsx).")))
     raw = base64.b64decode(payload["data"])
     if len(raw) > 20 * 1024 * 1024:
         raise ValueError("%s is too large (max 20 MB) — is it really an "
@@ -932,7 +1289,18 @@ def wd_import(conn):
         try:
             kind, n = wd_ingest_file(conn, path)
         except Exception as e:  # noqa: BLE001 — one bad file shouldn't stop the rest
-            files.append({"file": name, "kind": "error", "rows": 0, "error": str(e)})
+            files.append({"file": name, "kind": "error", "rows": 0,
+                          "error": str(e)})
+            # Every import rescans this whole folder, so a file left here
+            # would report the same failure forever. Set it aside instead of
+            # deleting it — the person may have picked the wrong file of two,
+            # and it's theirs.
+            try:
+                reject = os.path.join(WD_IMPORT_DIR, "not-readable")
+                os.makedirs(reject, exist_ok=True)
+                os.replace(path, os.path.join(reject, name))
+            except OSError:
+                pass
             continue
         files.append({"file": name, "kind": kind, "rows": n})
         if kind == "detail":
@@ -1069,15 +1437,133 @@ def wd_push_state(conn):
             "profiles": get_setting(conn, "workday_worktags", {}) or {}}
 
 
-def wd_send_mail(to, cc, subject, body, attachment=None, html=None):
+# Kept in Application Support, not in data/: data/ is inside the OneDrive
+# folder, and an .app bundle that a sync client rewrites (or copies to another
+# Mac) loses the code identity macOS remembers the Automation approval against.
+MAIL_HELPER_DIR = os.path.expanduser(
+    "~/Library/Application Support/Grants Manager")
+MAIL_HELPER_APP = os.path.join(MAIL_HELPER_DIR, "Grants Manager.app")
+MAIL_JOB_PATH = os.path.join(MAIL_HELPER_DIR, "outlook_job.applescript")
+MAIL_RESULT_PATH = os.path.join(MAIL_HELPER_DIR, "outlook_job.result")
+
+# The applet's whole job: read the script we just wrote, run it, write down
+# what happened. It is compiled once, on this machine, with the paths baked in
+# — nothing inside the bundle is ever rewritten afterwards, because changing a
+# bundle's contents changes its code hash and macOS would then treat it as a
+# different app and ask for Automation permission all over again.
+_MAIL_HELPER_SRC = '''on run
+\tset jobFile to "%(job)s"
+\tset outFile to "%(out)s"
+\ttry
+\t\tset src to (read (POSIX file jobFile) as «class utf8»)
+\t\trun script src
+\t\tset res to "OK"
+\ton error errMsg
+\t\tset res to "ERR " & errMsg
+\tend try
+\ttry
+\t\tset fh to open for access (POSIX file outFile) with write permission
+\t\tset eof fh to 0
+\t\twrite res to fh as «class utf8»
+\t\tclose access fh
+\tend try
+end run'''
+
+
+def mac_mail_helper():
+    """Path to a tiny app bundle named “Grants Manager”, built on first use.
+
+    macOS attributes an Automation prompt to the app *responsible* for the
+    Apple Event, and a detached `python3` started by a launcher script is not
+    a recognisable app — so the alert ends up naming whatever happened to
+    start the server: “Terminal”, “python3”, or the editor a developer ran it
+    from. People are being asked to let an unfamiliar program read their mail,
+    which is exactly the prompt they should refuse.
+
+    Sending through an applet of our own fixes the attribution at the source:
+    the event now comes from a bundle whose name really is Grants Manager, so
+    that is what the prompt says, and the approval it records is one the user
+    can find and revoke under Privacy & Security → Automation.
+
+    Returns None if the bundle can't be built (then we fall back to plain
+    osascript, which still sends — just with a vaguer prompt).
+    """
+    import subprocess
+    plist = os.path.join(MAIL_HELPER_APP, "Contents", "Info.plist")
+    if os.path.isdir(MAIL_HELPER_APP) and os.path.isfile(plist):
+        return MAIL_HELPER_APP
+    try:
+        os.makedirs(MAIL_HELPER_DIR, exist_ok=True)
+        if os.path.isdir(MAIL_HELPER_APP):
+            shutil.rmtree(MAIL_HELPER_APP)
+        src = _MAIL_HELPER_SRC % {"job": MAIL_JOB_PATH, "out": MAIL_RESULT_PATH}
+        r = subprocess.run(["osacompile", "-o", MAIL_HELPER_APP, "-e", src],
+                           capture_output=True, timeout=60)
+        if r.returncode != 0 or not os.path.isfile(plist):
+            return None
+        # LSUIElement keeps it out of the Dock; the usage string is what the
+        # permission alert shows underneath the app name.
+        subprocess.run(["defaults", "write", plist, "LSUIElement", "-bool",
+                        "true"], capture_output=True, timeout=30)
+        subprocess.run(["defaults", "write", plist,
+                        "NSAppleEventsUsageDescription", "-string",
+                        "Grants Manager uses Microsoft Outlook to send your "
+                        "expense report to you, with the receipts attached."],
+                       capture_output=True, timeout=30)
+        subprocess.run(["defaults", "write", plist, "CFBundleName", "-string",
+                        "Grants Manager"], capture_output=True, timeout=30)
+        # ad-hoc signature so macOS has a stable identity to remember the
+        # Automation approval against, instead of re-asking every launch
+        subprocess.run(["codesign", "--force", "--sign", "-", MAIL_HELPER_APP],
+                       capture_output=True, timeout=60)
+        return MAIL_HELPER_APP
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def run_applescript_as_app(lines, timeout=90):
+    """Run an AppleScript through the “Grants Manager” helper applet.
+
+    Returns True if the helper ran it, False if there is no helper to run it
+    with (caller falls back to osascript). Raises RuntimeError with Outlook's
+    own words if the script itself failed.
+    """
+    import subprocess
+    app = mac_mail_helper()
+    if not app:
+        return False
+    try:
+        with open(MAIL_JOB_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        if os.path.exists(MAIL_RESULT_PATH):
+            os.remove(MAIL_RESULT_PATH)
+        subprocess.run(["open", "-n", "-a", app], capture_output=True,
+                       timeout=30, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.isfile(MAIL_RESULT_PATH):
+            with open(MAIL_RESULT_PATH, encoding="utf-8",
+                      errors="replace") as f:
+                res = f.read().strip()
+            os.remove(MAIL_RESULT_PATH)
+            if res.startswith("OK"):
+                return True
+            raise RuntimeError(res[4:].strip() or "unknown error")
+        time.sleep(0.25)
+    raise RuntimeError("Outlook did not respond in time")
+
+
+def wd_send_mail(to, cc, subject, body, attachment=None):
     """Compose and send through Microsoft Outlook — macOS (AppleScript) or
     Windows (Outlook COM via PowerShell). Outlook lets us attach the receipt
     PDF, which a mailto: link cannot. First use on a Mac asks macOS for
     permission to control Outlook.
 
-    `attachment` may be a single path or a list of paths. `html`, when given,
-    is sent as the message body instead of `body` (which stays the plain-text
-    fallback) — the monthly report needs a real table an accountant can read.
+    `attachment` may be a single path or a list of paths. Bodies are plain
+    text: the monthly report is a tab-separated table meant to be pasted into
+    a spreadsheet, and HTML would fight that.
     """
     import subprocess
     attachments = ([attachment] if isinstance(attachment, str)
@@ -1086,8 +1572,7 @@ def wd_send_mail(to, cc, subject, body, attachment=None, html=None):
     if sys.platform == "darwin":
         def q(s):  # AppleScript string literal escaping
             return str(s).replace("\\", "\\\\").replace('"', '\\"')
-        content = ('content:"%s"' % q(html) if html
-                   else 'plain text content:"%s"' % q(body))
+        content = 'plain text content:"%s"' % q(body)
         lines = [
             'tell application "Microsoft Outlook"',
             'set msg to make new outgoing message with properties '
@@ -1102,13 +1587,22 @@ def wd_send_mail(to, cc, subject, body, attachment=None, html=None):
             lines.append('make new attachment at msg with properties '
                          '{file:POSIX file "%s"}' % q(a))
         lines += ['send msg', 'end tell']
+        hint = ("Check that Microsoft Outlook is installed and signed in, and "
+                "that Grants Manager is allowed to control it (System Settings "
+                "→ Privacy & Security → Automation → Grants Manager). If you "
+                "use “New Outlook”, enable AppleScript support or use "
+                "“Copy as text” instead.")
+        # Preferred path: send from our own “Grants Manager” applet, so the
+        # macOS permission alert names this app rather than whatever process
+        # happens to be hosting the server.
+        try:
+            if run_applescript_as_app(lines):
+                return
+        except RuntimeError as e:
+            raise RuntimeError("Outlook could not send: %s. %s" % (e, hint))
         args = ["osascript"]
         for ln in lines:
             args += ["-e", ln]
-        hint = ("Check that Microsoft Outlook is installed and signed in, and "
-                "that this app is allowed to control it (System Settings → "
-                "Privacy & Security → Automation). If you use “New Outlook”, "
-                "enable AppleScript support or use “Copy as text” instead.")
     elif sys.platform == "win32":
         def q(s):  # PowerShell single-quoted literal escaping
             return str(s).replace("'", "''")
@@ -1118,11 +1612,8 @@ def wd_send_mail(to, cc, subject, body, attachment=None, html=None):
         if cc:
             ps.append("$m.CC = '%s'" % q(cc))
         ps.append("$m.Subject = '%s'" % q(subject))
-        if html:
-            ps.append("$m.HTMLBody = '%s'" % q(html.replace("\r", "")))
-        else:
-            # single-quoted PS strings keep literal newlines as-is
-            ps.append("$m.Body = '%s'" % q(body.replace("\r", "")))
+        # single-quoted PS strings keep literal newlines as-is
+        ps.append("$m.Body = '%s'" % q(body.replace("\r", "")))
         for a in attachments:
             ps.append("$null = $m.Attachments.Add('%s')" % q(a))
         ps.append("$m.Send()")
@@ -1151,12 +1642,21 @@ def wd_send_mail(to, cc, subject, body, attachment=None, html=None):
 
 REPORT_COLUMNS = ["Date", "Amount", "Spend Category", "Business Purpose",
                   "Grant / Worktag", "Award", "Cost Center", "Fund",
-                  "Person", "Receipt", "Entered"]
+                  "Person", "Receipt"]
+
+# The p-card block, appended to the right of the ordinary columns and blank on
+# any expense that was not a card purchase, so one sheet still covers the whole
+# month. The cost centre is already in "Cost Center" above, and the reason for
+# the purchase is already in "Business Purpose" — no point printing either twice.
+PCARD_COLUMNS = ["P-card", "Print cardholder's name", "Name on the P-card",
+                 "Purchased by (if different from cardholder)"]
+
+REPORT_XLSX_COLUMNS = REPORT_COLUMNS + PCARD_COLUMNS
 
 
 def month_bounds(month):
     """'YYYY-MM' -> (first_day, last_day) as ISO strings."""
-    # validated explicitly: `month` reaches a filename in report_csv_path(),
+    # validated explicitly: `month` reaches a filename in report_xlsx_path(),
     # so anything path-shaped must never get that far
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", str(month or "")):
         raise ValueError("Month must look like 2026-07")
@@ -1170,6 +1670,7 @@ def report_rows(conn, month):
     """Every expense dated inside `month`, shaped for an accountant."""
     start, end = month_bounds(month)
     ps = wd_push_state(conn)
+    card = get_setting(conn, "pcard", {}) or {}
     out = []
     for e in conn.execute(
             "SELECT e.*, c.name AS category, p.name AS person, g.name AS grant_name "
@@ -1193,10 +1694,20 @@ def report_rows(conn, month):
             "Fund": prof.get("fund", ""),
             "Person": e["person"] or "",
             "Receipt": os.path.basename(e["receipt_path"]) if e["receipt_path"] else "",
-            "Entered": "by hand" if e["source"] == "manual" else "from Workday",
+            # p-card block: only filled in when the purchase was on a card, so
+            # the accountant can see at a glance which rows need a form
+            "P-card": "Yes" if e["pcard"] else "",
+            "Print cardholder's name": ((e["pcard_holder"] or "").strip()
+                                        or card.get("cardholder", ""))
+                                       if e["pcard"] else "",
+            "Name on the P-card": card.get("card_name", "") if e["pcard"] else "",
+            "Purchased by (if different from cardholder)":
+                (e["pcard_buyer"] or "") if e["pcard"] else "",
             "_amount": e["amount"],
             "_grant": e["grant_name"],
             "_receipt_path": e["receipt_path"] or "",
+            "_pcard": bool(e["pcard"]),
+            "_manual": e["source"] == "manual",
         })
     return out
 
@@ -1224,7 +1735,7 @@ def report_data(conn, month):
         "total": sum(r["_amount"] for r in rows),
         "by_grant": by_grant,
         "missing_receipts": sum(1 for r in rows
-                                if not r["Receipt"] and r["Entered"] == "by hand"),
+                                if not r["Receipt"] and r["_manual"]),
     }
 
 
@@ -1241,114 +1752,136 @@ def csv_safe(v):
     return s
 
 
-def report_csv_path(data):
-    """CSV in the same column order as the table — for Workday import."""
-    import csv
+def report_xlsx_path(data):
+    """The month's expenses as a real Excel workbook.
+
+    Two sheets: every expense on the first, and only the p-card purchases on
+    the second, because those are the rows that need a reconciliation form and
+    nobody wants to filter for them by hand.
+    """
     os.makedirs(REPORTS_DIR, exist_ok=True)
-    path = os.path.join(REPORTS_DIR, "expenses_%s.csv" % data["month"])
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=REPORT_COLUMNS, extrasaction="ignore")
-        w.writeheader()
-        for r in data["rows"]:
-            # neutralise anything a spreadsheet would run as a formula
-            w.writerow({k: (r[k] if isinstance(r.get(k), (int, float))
-                            else csv_safe(r.get(k, "")))
-                        for k in REPORT_COLUMNS})
-    return path
+    path = os.path.join(REPORTS_DIR, "expenses_%s.xlsx" % data["month"])
 
+    def row_of(r):
+        out = []
+        for c in REPORT_XLSX_COLUMNS:
+            v = r.get(c, "")
+            # amounts go in as numbers so the accountant can sum the column
+            out.append(round(r["_amount"], 2) if c == "Amount" else csv_safe(v))
+        return out
 
-def report_receipts_zip(data):
-    """One zip of the month's receipts, so the accountant gets them together."""
-    import zipfile
-    paths = [r["_receipt_path"] for r in data["rows"] if r["_receipt_path"]]
-    if not paths:
-        return None
-    os.makedirs(REPORTS_DIR, exist_ok=True)
-    out = os.path.join(REPORTS_DIR, "receipts_%s.zip" % data["month"])
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-        for rel in paths:
-            full = os.path.join(RECEIPTS_DIR, rel)
-            if os.path.isfile(full):
-                z.write(full, os.path.basename(rel))
-    return out
-
-
-def report_html(data, owner=""):
-    esc = lambda s: (str(s).replace("&", "&amp;").replace("<", "&lt;")
-                     .replace(">", "&gt;"))
-    th = "".join('<th style="text-align:left;padding:7px 9px;border-bottom:2px solid #444;'
-                 'font-size:12px;text-transform:uppercase;letter-spacing:.04em;'
-                 'white-space:nowrap">%s</th>' % esc(c) for c in REPORT_COLUMNS)
-    trs = []
-    for i, r in enumerate(data["rows"]):
-        bg = "#ffffff" if i % 2 == 0 else "#f7f8fa"
-        tds = "".join(
-            '<td style="padding:6px 9px;border-bottom:1px solid #e6e8ec;'
-            'font-size:13px;%s">%s</td>'
-            % ("text-align:right;white-space:nowrap" if c == "Amount" else "",
-               esc(r[c]))
-            for c in REPORT_COLUMNS)
-        trs.append('<tr style="background:%s">%s</tr>' % (bg, tds))
-    grant_rows = "".join(
-        '<tr><td style="padding:5px 9px;font-size:13px">%s</td>'
-        '<td style="padding:5px 9px;font-size:13px;text-align:right">%d</td>'
-        '<td style="padding:5px 9px;font-size:13px;text-align:right;'
-        'white-space:nowrap"><strong>%s</strong></td></tr>'
-        % (esc(g), v["n"], money_str(v["total"]))
-        for g, v in sorted(data["by_grant"].items()))
-    changes = ""
+    sheets = [("Expenses", REPORT_XLSX_COLUMNS,
+               [row_of(r) for r in data["rows"]])]
+    pcard = [r for r in data["rows"] if r.get("_pcard")]
+    if pcard:
+        cols = ["Date", "Amount", "Business Purpose", "Grant / Worktag",
+                "Receipt"] + PCARD_COLUMNS[1:]
+        sheets.append(("P-card purchases", cols,
+                       [[round(r["_amount"], 2) if c == "Amount"
+                         else csv_safe(r.get(c, "")) for c in cols]
+                        for r in pcard]))
     if data["changes"]:
-        rows = "".join(
-            '<tr><td style="padding:5px 9px;font-size:12.5px;white-space:nowrap">%s</td>'
-            '<td style="padding:5px 9px;font-size:12.5px">%s</td>'
-            '<td style="padding:5px 9px;font-size:12.5px">%s</td></tr>'
-            % (esc(c["at"].replace("T", " ")[:16]), esc(c["action"]),
-               esc("%s%s" % (c["descr"] or "",
-                             " — " + c["detail"] if c["detail"] else "")))
-            for c in data["changes"])
-        changes = (
-            '<h3 style="font-size:15px;margin:26px 0 8px">Changes made in the app '
-            'this month</h3>'
-            '<p style="font-size:13px;color:#555;margin:0 0 8px">Entries added, '
-            'edited or removed by hand — so you can confirm the list above '
-            'reflects what actually happened.</p>'
-            '<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;'
-            'width:100%%;border:1px solid #e6e8ec">%s</table>' % rows)
-    warn = ""
+        sheets.append(("Changes this month",
+                       ["When", "Action", "Description", "Detail"],
+                       [[c["at"].replace("T", " ")[:16], c["action"],
+                         csv_safe(c["descr"] or ""), csv_safe(c["detail"] or "")]
+                        for c in data["changes"]]))
+    return write_xlsx(path, sheets)
+
+
+# Outlook and most mail servers reject a message much past 25 MB; stop well
+# short and fall back to one zip rather than have the send fail outright.
+RECEIPT_ATTACH_LIMIT = 18 * 1024 * 1024
+
+
+def report_receipt_attachments(data):
+    """Each receipt as its own attachment, named exactly as the Receipt column
+    names it, so a row in the table can be matched to a file by eye.
+
+    Receipts live in per-grant folders, so two of them can share a basename;
+    where that happens both the file and the cell get a numbered suffix, and
+    they stay in step. Returns (paths, note) — note is a line for the email
+    when something had to be zipped or skipped instead.
+    """
+    import shutil
+    rows = [r for r in data["rows"] if r["_receipt_path"]]
+    if not rows:
+        return [], ""
+    stage = os.path.join(REPORTS_DIR, "receipts_%s" % data["month"])
+    if os.path.isdir(stage):
+        shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage, exist_ok=True)
+    used, staged, total, missing = {}, [], 0, 0
+    for r in rows:
+        full = os.path.join(RECEIPTS_DIR, r["_receipt_path"])
+        if not os.path.isfile(full):
+            r["Receipt"] = "(file missing)"
+            missing += 1
+            continue
+        name = os.path.basename(r["_receipt_path"])
+        if name in used:
+            used[name] += 1
+            stem, ext = os.path.splitext(name)
+            name = "%s (%d)%s" % (stem, used[name], ext)
+        else:
+            used[name] = 1
+        dest = os.path.join(stage, name)
+        shutil.copy2(full, dest)
+        r["Receipt"] = name          # keep the cell and the attachment in step
+        staged.append(dest)
+        total += os.path.getsize(dest)
+    note = ""
+    if missing:
+        note = ("%d receipt file(s) recorded in the app could not be found on "
+                "disk and are marked “(file missing)” in the table."
+                % missing)
+    if total > RECEIPT_ATTACH_LIMIT:
+        import zipfile
+        out = os.path.join(REPORTS_DIR, "receipts_%s.zip" % data["month"])
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+            for pth in staged:
+                z.write(pth, os.path.basename(pth))
+        note = (("%s " % note if note else "")
+                + "The %d receipts came to %.0f MB, too much for one email, so "
+                  "they are attached as a single zip instead — the names "
+                  "inside it still match the Receipt column."
+                  % (len(staged), total / 1048576.0))
+        return [out], note
+    return staged, note
+
+
+def report_text(data, owner_name="", note=""):
+    """The email body: one sentence, and only what a person needs to read.
+
+    Everything else now lives in the attached workbook — the table used to be
+    pasted into the body, which made the message long and awkward to read on a
+    phone, and Excel is where these numbers were always going to end up.
+    """
+    who = (owner_name or "").strip()
+    lead = ("%s's expense report for the month of %s."
+            % (who, data["label"]) if who
+            else "Expense report for the month of %s." % data["label"])
+    lines = [lead, "",
+             "%d expense(s), total %s — the full table is attached as "
+             "expenses_%s.xlsx." % (len(data["rows"]),
+                                    money_str(data["total"]), data["month"])]
+    receipts = sum(1 for r in data["rows"] if r["Receipt"]
+                   and r["Receipt"] != "(file missing)")
+    if receipts:
+        lines.append("%d receipt file(s) are attached, each named as the "
+                     "Receipt column in the workbook names it." % receipts)
+    pcard = sum(1 for r in data["rows"] if r.get("_pcard"))
+    if pcard:
+        lines.append("%d of them were P-card purchases; the workbook has a "
+                     "“P-card purchases” sheet listing just those." % pcard)
+    if note:
+        lines.append(note)
     if data["missing_receipts"]:
-        warn = ('<p style="background:#fbf1de;border-left:3px solid #8a5a10;'
-                'padding:10px 14px;font-size:13px;margin:0 0 18px">'
-                '<strong>%d hand-entered expense(s) have no receipt attached.</strong> '
-                'Worth checking before this goes to the accountant.</p>'
-                % data["missing_receipts"])
-    return """<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#16202e;max-width:1000px">
-<h2 style="margin:0 0 4px;font-size:20px">Grant expenses — %s</h2>
-<p style="margin:0 0 18px;color:#555;font-size:13.5px">%d expense(s) · total <strong>%s</strong>%s</p>
-%s
-<p style="font-size:13.5px;margin:0 0 16px">Please check the table below. Once it looks right, forward this email to your accountant — the attached CSV has the same rows in Workday's column order, ready to key in or import.</p>
-<h3 style="font-size:15px;margin:0 0 8px">By grant</h3>
-<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin:0 0 22px;border:1px solid #e6e8ec">%s</table>
-<h3 style="font-size:15px;margin:0 0 8px">All expenses</h3>
-<div style="overflow-x:auto"><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%%;border:1px solid #e6e8ec"><thead><tr style="background:#eef1f5">%s</tr></thead><tbody>%s</tbody></table></div>
-%s
-<p style="font-size:12px;color:#777;margin:26px 0 0;border-top:1px solid #e6e8ec;padding-top:12px">
-Generated by Grants Manager on %s%s. Amounts are as recorded in the app; Workday remains the system of record.</p>
-</div>""" % (
-        esc(data["label"]), len(data["rows"]), money_str(data["total"]),
-        (" · %d receipt(s) attached" % sum(1 for r in data["rows"] if r["Receipt"]))
-        if any(r["Receipt"] for r in data["rows"]) else "",
-        warn, grant_rows, th, "".join(trs), changes,
-        date.today().isoformat(),
-        " for " + esc(owner) if owner else "")
-
-
-def report_text(data):
-    lines = ["Grant expenses — %s" % data["label"], "",
-             "%d expense(s), total %s" % (len(data["rows"]),
-                                          money_str(data["total"])), ""]
-    for g, v in sorted(data["by_grant"].items()):
-        lines.append("  %-34s %3d   %s" % (g[:34], v["n"], money_str(v["total"])))
-    lines += ["", "Full details are in the attached CSV.", ""]
+        lines.append("%d hand-entered expense(s) have no receipt attached — "
+                     "worth checking before this goes to the accountant."
+                     % data["missing_receipts"])
+    lines += ["", "Amounts are as recorded in Grants Manager; Workday remains "
+              "the system of record."]
     return "\n".join(lines)
 
 
@@ -1369,6 +1902,7 @@ def wd_state(conn):
         "import_dir": WD_IMPORT_DIR,
         "raas": get_setting(conn, "workday_raas", {}) or {},
         "push_cfg": get_setting(conn, "workday_push", {}) or {},
+        "pcard": get_setting(conn, "pcard", {}) or {},
         "reports_sent": get_setting(conn, "reports_sent", {}) or {},
         "last_sync": get_setting(conn, "workday_last_sync"),
         "session_unlocked": bool(WD_SESSION["password"]),
@@ -1387,7 +1921,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -1467,9 +2001,18 @@ def update_info():
     return info
 
 
+# Changes every time the app starts. The dashboard hangs dismissed alerts off
+# it, which is what makes "hidden until I open the app again" mean exactly
+# that: a page reload keeps them hidden, quitting and reopening brings them
+# back. A date or a browser session can't express that — one is too coarse,
+# the other survives a quit or dies on a reload depending on the browser.
+RUN_ID = uuid.uuid4().hex[:12]
+
+
 def full_state(conn):
     return {
         "version": APP_VERSION,
+        "run_id": RUN_ID,
         "update": update_info(),
         "grants": rows_to_list(conn.execute(
             "SELECT * FROM grants ORDER BY status, end_date")),
@@ -1532,8 +2075,57 @@ TABLES = {
                      "auto_charge", "pct"],
     "expenses": ["grant_id", "category_id", "year", "date", "amount",
                  "description", "person_id", "receipt_path", "source",
-                 "wd_entry", "wd_worktag"],
+                 "wd_entry", "wd_worktag", "pcard", "pcard_buyer",
+                 "pcard_holder"],
 }
+
+
+DATE_FIELDS = ("date", "start_date", "end_date", "nce_end_date")
+MONEY_FIELDS = ("amount", "initial_amount", "monthly_salary", "fringe_rate",
+                "annual_tuition", "pct")
+# a dollar figure no grant will ever legitimately reach; past this the number
+# is a typo or a paste accident, and letting it in wrecks every chart's scale
+MONEY_LIMIT = 1e12
+
+
+def validate_row(table, data, creating):
+    """Check a row before it reaches SQLite.
+
+    Without this the user sees the database's own complaint — "NOT NULL
+    constraint failed: expenses.date" — and a mistyped date like "03/14" is
+    stored verbatim, where it sorts wrong, lands in no budget year, and
+    quietly disappears from every month's report.
+    """
+    for f in DATE_FIELDS:
+        v = data.get(f)
+        if v is None or v == "":
+            continue
+        try:
+            datetime.strptime(str(v), "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("“%s” isn't a date the app can read. Use the "
+                             "date picker, or type it as YYYY-MM-DD." % v)
+    for f in MONEY_FIELDS:
+        if f not in data or data[f] is None or data[f] == "":
+            continue
+        try:
+            n = float(data[f])
+        except (TypeError, ValueError):
+            raise ValueError("“%s” isn't a number." % (data[f],))
+        if not math.isfinite(n) or abs(n) > MONEY_LIMIT:
+            raise ValueError("That amount is out of range — check for an "
+                             "extra digit or a stray paste.")
+        data[f] = n
+    if table == "expenses" and creating:
+        if not data.get("date"):
+            raise ValueError("An expense needs a date.")
+        if not data.get("grant_id"):
+            raise ValueError("An expense needs a grant.")
+    if table == "grants":
+        s, e = data.get("start_date"), data.get("end_date")
+        if s and e and e < s:
+            raise ValueError("The end date is before the start date.")
+    return data
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1559,6 +2151,45 @@ class Handler(BaseHTTPRequestHandler):
             if c.startswith("gmkey="):
                 return c[len("gmkey="):]
         return None
+
+    def check_host(self):
+        """Refuse requests that address this server by a *domain name*.
+
+        Without this, a page on evil.example can point its own hostname at
+        127.0.0.1 (short DNS TTL, then re-answer with the loopback address —
+        "DNS rebinding"). The victim's browser then treats evil.example:8765
+        as same-origin with Grants Manager: `is_local()` sees a loopback
+        client so no access key is asked for, and the CSRF check passes too
+        because Origin and Host now agree. Every grant, expense and receipt is
+        readable and writable by that page.
+
+        The defence is that a rebinding attack always arrives under a NAME.
+        Legitimate use is always by address — 127.0.0.1, localhost, or the
+        LAN IP printed at startup — so only those are accepted.
+        """
+        host = (self.headers.get("Host") or "").strip()
+        if not host:          # HTTP/1.0 clients may omit it
+            return True
+        if host.startswith("["):                       # [::1]:8765
+            name = host[1:host.find("]")] if "]" in host else host[1:]
+        else:                                          # host:8765 / bare IPv6
+            name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        name = name.strip().rstrip(".").lower()
+        if name in ("localhost", "0.0.0.0"):
+            return True
+        try:
+            ipaddress.ip_address(name)   # a literal address can't be rebound
+            return True
+        except ValueError:
+            pass
+        short = socket.gethostname().split(".")[0].lower()
+        if name in (short, short + ".local"):   # Bonjour name on the same Wi-Fi
+            return True
+        self.send_json({"error": "Grants Manager only answers to its own "
+                        "address. Open it at http://127.0.0.1:%d (or the "
+                        "http://<ip>:%d link shown when it started), not "
+                        "through some other web address." % (PORT, PORT)}, 403)
+        return False
 
     def check_access(self):
         """Off-machine requests need the access key. Returns True to continue."""
@@ -1598,12 +2229,34 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------- helpers
     def send_json(self, obj, code=200):
-        body = json.dumps(obj).encode()
+        body = json.dumps(json_safe(obj), allow_nan=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_error_json(self, where, exc):
+        """One place that decides what a failed write is allowed to say.
+
+        Messages we wrote ourselves (ValueError/RuntimeError/PermissionError)
+        are meant for the person using the app, so they pass through. Anything
+        else is a bug or a database complaint — "NOT NULL constraint failed:
+        expenses.date", "'NoneType' object is not iterable" — which tells the
+        user nothing and tells a stranger a little about our internals. Log it
+        here, show a plain sentence there.
+        """
+        if isinstance(exc, json.JSONDecodeError):
+            self.send_json({"error": "That request wasn't understood."}, 400)
+            return
+        if isinstance(exc, (ValueError, RuntimeError, PermissionError)):
+            self.send_json({"error": str(exc)}, 400)
+            return
+        print("%s failed: %r" % (where, exc))
+        self.send_json({"error": "Something went wrong saving that. Nothing "
+                        "was changed. If it keeps happening, quit and reopen "
+                        "Grants Manager — your data and backups are intact."},
+                       500)
 
     # Bodies are read whole into memory (base64 uploads), so cap them rather
     # than trusting a client-supplied Content-Length.
@@ -1615,7 +2268,7 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         if length > self.MAX_BODY:
             raise ValueError("Request too large")
-        return json.loads(self.rfile.read(length))
+        return reject_wild_numbers(json.loads(self.rfile.read(length)))
 
     def send_file(self, path, download_name=None):
         if not os.path.isfile(path):
@@ -1626,7 +2279,9 @@ class Handler(BaseHTTPRequestHandler):
                   ".jpeg": "image/jpeg", ".gif": "image/gif",
                   ".pdf": "application/pdf", ".svg": "image/svg+xml",
                   ".csv": "text/csv", ".heic": "image/heic",
-                  ".webp": "image/webp", ".json": "application/json"}
+                  ".webp": "image/webp", ".json": "application/json",
+                  ".xlsx": "application/vnd.openxmlformats-officedocument."
+                           "spreadsheetml.sheet"}
         ext = os.path.splitext(path)[1].lower()
         with open(path, "rb") as f:
             body = f.read()
@@ -1641,6 +2296,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------- routing
     def do_GET(self):
+        if not self.check_host():
+            return
         path = unquote(urlparse(self.path).path)
         # Unauthenticated identity probe. Carries no user data — it exists so a
         # second launch can tell "Grants Manager is already running here" from
@@ -1669,6 +2326,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(wd_state(conn))
                 finally:
                     conn.close()
+            elif path == "/api/workday/example.xlsx":
+                # regenerated on every request so it always matches the
+                # columns the importer actually looks for
+                ex = os.path.join(DATA_DIR, "workday_example.xlsx")
+                wd_example_workbook(ex)
+                self.send_file(ex, download_name=(
+                    "Workday export example (fake data).xlsx"))
             elif path == "/api/workday/entry_sheet.csv":
                 conn = db()
                 try:
@@ -1686,7 +2350,9 @@ class Handler(BaseHTTPRequestHandler):
                     d = report_data(conn, month)
                     d["rows"] = [{k: v for k, v in r.items()
                                   if not k.startswith("_")} for r in d["rows"]]
-                    d["columns"] = REPORT_COLUMNS
+                    # the preview shows exactly the workbook's columns, so
+                    # what you check is what your accountant receives
+                    d["columns"] = REPORT_XLSX_COLUMNS
                     d["owner_email"] = (get_setting(conn, "workday_push", {})
                                         or {}).get("owner_email", "")
                     self.send_json(d)
@@ -1709,6 +2375,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "not found"}, 404)
         except PermissionError:
             self.send_json({"error": "not found"}, 404)
+        except ValueError as e:
+            # a bad parameter (e.g. ?month=abc) is the caller's mistake, not
+            # a server fault — say what's wrong instead of "500"
+            self.send_json({"error": str(e)}, 400)
         except Exception as e:  # noqa: BLE001
             # don't hand absolute paths / internals to the caller
             print("GET %s failed: %r" % (path, e))
@@ -1795,7 +2465,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if not self.check_access() or not self.check_not_csrf():
+        if not self.check_host() or not self.check_access() \
+                or not self.check_not_csrf():
             return
         path = unquote(urlparse(self.path).path)
         conn = db()
@@ -1806,10 +2477,15 @@ class Handler(BaseHTTPRequestHandler):
                          path)
             if m:
                 table = m.group(1)
+                validate_row(table, data, creating=True)
                 if table == "expenses" and data.get("receipt"):
-                    grant = dict(conn.execute("SELECT * FROM grants WHERE id=?",
-                                              (data["grant_id"],)).fetchone())
-                    data["receipt_path"] = save_receipt(grant, data.pop("receipt"))
+                    grant = conn.execute("SELECT * FROM grants WHERE id=?",
+                                         (data["grant_id"],)).fetchone()
+                    if grant is None:
+                        raise ValueError("That grant no longer exists — "
+                                         "reload the page and try again.")
+                    data["receipt_path"] = save_receipt(dict(grant),
+                                                        data.pop("receipt"))
                 cols = [c for c in TABLES[table] if c in data]
                 cur = conn.execute(
                     f"INSERT INTO {table} ({','.join(cols)}) "
@@ -1826,11 +2502,16 @@ class Handler(BaseHTTPRequestHandler):
                          r"/(\d+)$", path)
             if m:
                 table, rid = m.group(1), int(m.group(2))
+                validate_row(table, data, creating=False)
                 if table == "expenses" and data.get("receipt"):
-                    grant = dict(conn.execute(
+                    grant = conn.execute(
                         "SELECT g.* FROM grants g JOIN expenses e ON e.grant_id=g.id "
-                        "WHERE e.id=?", (rid,)).fetchone())
-                    data["receipt_path"] = save_receipt(grant, data.pop("receipt"))
+                        "WHERE e.id=?", (rid,)).fetchone()
+                    if grant is None:
+                        raise ValueError("That expense no longer exists — "
+                                         "reload the page and try again.")
+                    data["receipt_path"] = save_receipt(dict(grant),
+                                                        data.pop("receipt"))
                 cols = [c for c in TABLES[table] if c in data]
                 if cols:
                     before = (conn.execute("SELECT * FROM expenses WHERE id=?",
@@ -1945,16 +2626,25 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(res)
                 return
             if path == "/api/workday/push_config":
-                set_setting(conn, "workday_push", {
-                    "owner_email": (data.get("owner_email") or "").strip()})
+                cfg = get_setting(conn, "workday_push", {}) or {}
+                for k in ("owner_email", "owner_name"):
+                    if k in data:
+                        cfg[k] = (data.get(k) or "").strip()
+                set_setting(conn, "workday_push", cfg)
+                self.send_json({"ok": True})
+                return
+            if path == "/api/pcard_config":
+                set_setting(conn, "pcard", {
+                    "cardholder": (data.get("cardholder") or "").strip(),
+                    "card_name": (data.get("card_name") or "").strip()})
                 self.send_json({"ok": True})
                 return
             if path == "/api/report/send":
                 cfg = get_setting(conn, "workday_push", {}) or {}
                 to = (data.get("to") or cfg.get("owner_email") or "").strip()
                 if not to:
-                    self.send_json({"error": "Add your email under ⚙ Settings "
-                                    "so the report has somewhere to go."}, 400)
+                    self.send_json({"error": "Type the email address the "
+                                    "report should go to."}, 400)
                     return
                 month = data.get("month") or date.today().strftime("%Y-%m")
                 d = report_data(conn, month)
@@ -1962,17 +2652,22 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "No expenses recorded for %s — "
                                     "nothing to report yet." % d["label"]}, 400)
                     return
-                attach = [report_csv_path(d)]
-                zp = report_receipts_zip(d)
-                if zp:
-                    attach.append(zp)
-                wd_send_mail(to, "", "Grant expenses — %s" % d["label"],
-                             report_text(d), attachment=attach,
-                             html=report_html(d, to))
+                # receipts are staged FIRST: staging renames any clashing
+                # basenames and writes the final name back into each row, so
+                # the table must be rendered after it, not before
+                receipts, note = report_receipt_attachments(d)
+                attach = [report_xlsx_path(d)] + receipts
+                who = (cfg.get("owner_name") or "").strip()
+                subject = ("%s — expense report, %s" % (who, d["label"])
+                           if who else "Expense report — %s" % d["label"])
+                wd_send_mail(to, "", subject,
+                             report_text(d, who, note), attachment=attach)
                 sent = get_setting(conn, "reports_sent", {}) or {}
                 sent[month] = datetime.now().isoformat(timespec="seconds")
                 set_setting(conn, "reports_sent", sent)
-                if not cfg.get("owner_email"):
+                # remember the address actually used, so Settings never has
+                # to be opened just to set it (and a corrected address sticks)
+                if cfg.get("owner_email") != to:
                     cfg["owner_email"] = to
                     set_setting(conn, "workday_push", cfg)
                 self.send_json({"ok": True, "to": to, "count": len(d["rows"]),
@@ -2107,13 +2802,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json({"error": "not found"}, 404)
         except Exception as e:  # noqa: BLE001
-            self.send_json({"error": str(e)}, 400)
+            self.send_error_json("POST %s" % path, e)
         finally:
             conn.close()
             threading.Thread(target=write_snapshot, daemon=True).start()
 
     def do_DELETE(self):
-        if not self.check_access() or not self.check_not_csrf():
+        if not self.check_host() or not self.check_access() \
+                or not self.check_not_csrf():
             return
         path = unquote(urlparse(self.path).path)
         conn = db()
@@ -2193,7 +2889,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.commit()
             self.send_json({"ok": True, "batch_id": batch})
         except Exception as e:  # noqa: BLE001
-            self.send_json({"error": str(e)}, 400)
+            self.send_error_json("DELETE %s" % path, e)
         finally:
             conn.close()
             threading.Thread(target=write_snapshot, daemon=True).start()
@@ -2525,6 +3221,14 @@ def make_clean_copy():
         ("app/icon.png", os.path.join(APP_DIR, "icon.png")),
         ("app/manifest.json", os.path.join(APP_DIR, "manifest.json")),
     ]
+    # the Instructions walkthrough clips — swept rather than listed, so a new
+    # one is shared automatically instead of showing as a broken image
+    help_dir = os.path.join(APP_DIR, "help")
+    if os.path.isdir(help_dir):
+        for name in sorted(os.listdir(help_dir)):
+            if name.lower().endswith((".gif", ".png")):
+                include.append(("app/help/" + name,
+                                os.path.join(help_dir, name)))
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for arc, src in include:
             if os.path.isfile(src):

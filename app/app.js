@@ -239,18 +239,59 @@ function grantProjection(gid) {
   proj.availableProjected = proj.availableNow - proj.total;
   return proj;
 }
+/* Dashboard alerts you have already read.
+
+   Keyed by the server's run id, so "hide this" lasts exactly as long as the
+   running app: reloading the page keeps it hidden, quitting Grants Manager
+   and opening it again brings every still-true alert back. Old runs are
+   dropped on write, so this never grows. */
+function dismissedAlerts() {
+  if (!S.run_id) return [];
+  try {
+    const all = JSON.parse(localStorage.getItem("gm-dismissed-alerts") || "{}");
+    return all[S.run_id] || [];
+  } catch { return []; }
+}
+
+function dismissAlert(id) {
+  if (!S.run_id) return;
+  const list = [...new Set([...dismissedAlerts(), id])];
+  // only this run's entries are kept — yesterday's ids mean nothing now
+  try {
+    localStorage.setItem("gm-dismissed-alerts",
+                         JSON.stringify({ [S.run_id]: list }));
+  } catch { /* private browsing: the alert just comes back on reload */ }
+}
+
+function visibleAlerts() {
+  const hidden = dismissedAlerts();
+  return computeAlerts().filter((a) => !hidden.includes(a.id));
+}
+
 function computeAlerts() {
   const alerts = [];
   for (const g of S.grants) {
     if (g.status !== "active" || isExternal(g)) continue;
     const dl = daysLeft(g);
     if (dl !== null && dl < 0)
-      alerts.push({ level: "red", grantId: g.id, text: `${g.name} ended ${-dl} days ago — mark it closed or extend the end date.` });
+      alerts.push({ id: `end:${g.id}`, level: "red", grantId: g.id, text: `${g.name} ended ${-dl} days ago — mark it closed or extend the end date.` });
     else if (dl !== null && dl <= 183)
-      alerts.push({ level: dl <= 60 ? "red" : "amber", grantId: g.id, text: `${g.name} ends in ${dl} days (${g.end_date}).` });
+      alerts.push({ id: `end:${g.id}`, level: dl <= 60 ? "red" : "amber", grantId: g.id, text: `${g.name} ends in ${dl} days (${g.end_date}).` });
     const spent = grantSpent(g.id);
     if (g.initial_amount > 0 && spent / g.initial_amount >= 0.9)
-      alerts.push({ level: "red", grantId: g.id, text: `${g.name}: ${Math.round(spent / g.initial_amount * 100)}% of the total award spent.` });
+      alerts.push({ id: `spent:${g.id}`, level: "red", grantId: g.id, text: `${g.name}: ${Math.round(spent / g.initial_amount * 100)}% of the total award spent.` });
+    // Running dry before the end date is the thing you can still act on, and
+    // it was only visible as a sentence buried in the grant's own card.
+    const burn = grantBurn(g);
+    if (burn && burn.runOut) {
+      const m = Math.floor(burn.monthsOfMoney);
+      const early = burn.monthsToEnd - m;
+      // "runs out 0 months before it ends" is just "it ends" — not news
+      if (early >= 1) alerts.push({
+        id: `runout:${g.id}`, level: early >= 6 ? "red" : "amber", grantId: g.id,
+        text: `${g.name}: at ${money(burn.avg)}/month the money runs out in about ${m} month${m === 1 ? "" : "s"} — ${early} month${early === 1 ? "" : "s"} before the grant ends (${effectiveEnd(g)}). Slow the burn or request a no-cost extension.`,
+      });
+    }
     // only the grant's current budget year — closed cycles are history
     const curYear = budgetYearOf(g, S.today);
     for (const c of grantCats(g)) {
@@ -258,9 +299,9 @@ function computeAlerts() {
       if (b <= 0) continue;
       const sp = spentFor(g.id, c.id, curYear);
       if (sp > b + 0.01)
-        alerts.push({ level: "red", grantId: g.id, text: `${g.name} · Y${curYear} ${c.name}: overspent (${money(sp)} of ${money(b)}).` });
+        alerts.push({ id: `over:${g.id}:${c.id}`, level: "red", grantId: g.id, text: `${g.name} · Y${curYear} ${c.name}: overspent (${money(sp)} of ${money(b)}).` });
       else if (sp / b >= 0.8 && sp < b)
-        alerts.push({ level: "amber", grantId: g.id, text: `${g.name} · Y${curYear} ${c.name}: ${Math.round(sp / b * 100)}% spent (${money(b - sp)} left).` });
+        alerts.push({ id: `near:${g.id}:${c.id}`, level: "amber", grantId: g.id, text: `${g.name} · Y${curYear} ${c.name}: ${Math.round(sp / b * 100)}% spent (${money(b - sp)} left).` });
     }
   }
   return alerts;
@@ -317,7 +358,7 @@ function renderDashboard() {
   const totalAvail = active.reduce((s, g) => s + grantAvailable(g.id), 0);
   const totalAward = active.reduce((s, g) => s + g.initial_amount, 0);
   const ytd = S.expenses.filter((e) => e.date.startsWith(S.today.slice(0, 4)) && e.source !== "adjust").reduce((s, e) => s + e.amount, 0);
-  const alerts = computeAlerts();
+  const alerts = visibleAlerts();
 
   const hideClosed = localStorage.getItem("gm-hide-closed") === "1";
   return `
@@ -325,6 +366,18 @@ function renderDashboard() {
     <p class="sub">${active.length} active grant${active.length === 1 ? "" : "s"} · updated ${S.today}</p>
 
     ${firstRunCard()}
+
+    ${active.length ? `<div class="stats" style="margin-bottom:18px">
+      <div class="stat"><div class="label">Available (all active)</div><div class="value">${money(totalAvail)}</div></div>
+      <div class="stat"><div class="label">Total awarded (active)</div><div class="value">${money(totalAward)}</div></div>
+      <div class="stat"><div class="label">Spent this year</div><div class="value">${money(ytd)}</div></div>
+      <div class="stat"><div class="label">People funded</div><div class="value">${S.people.length}</div></div>
+    </div>` : ""}
+
+    ${alerts.length ? `<div class="alerts">${alerts.map((a) =>
+      `<div class="alert ${a.level}" data-goto-grant="${a.grantId}">⚠️ <span>${esc(a.text)}</span>
+        <button class="alert-x" data-dismiss-alert="${esc(a.id)}" title="Hide until you next open Grants Manager" aria-label="Hide this warning">✕</button>
+      </div>`).join("")}</div>` : ""}
 
     ${!active.length ? "" : `<div class="card no-print">
       <h2>Quick add expense</h2>
@@ -346,12 +399,11 @@ function renderDashboard() {
         </div>
         <input type="file" id="q-file" hidden>
         <label style="display:flex;align-items:center;gap:6px;align-self:flex-end;padding-bottom:10px;white-space:nowrap;font-size:13px;cursor:pointer"><input type="checkbox" id="q-workday" style="width:auto" checked>📤 Add to Workday</label>
+        <label style="display:flex;align-items:center;gap:6px;align-self:flex-end;padding-bottom:10px;white-space:nowrap;font-size:13px;cursor:pointer" title="Bought on a university purchasing card — the report will carry the details reconciliation asks for"><input type="checkbox" id="q-pcard" style="width:auto">💳 P-card</label>
+        ${pcardFields("q")}
         <button class="btn" id="q-save">Add</button>
       </div>
     </div>`}
-
-    ${alerts.length ? `<div class="alerts">${alerts.map((a) =>
-      `<div class="alert ${a.level}" data-goto-grant="${a.grantId}">⚠️ ${esc(a.text)}</div>`).join("")}</div>` : ""}
 
     ${wdDashCards()}
 
@@ -364,13 +416,6 @@ function renderDashboard() {
         <h2>Spending by month — all grants</h2>
         <div class="chart-wrap" style="height:210px"><canvas id="dash-month-chart"></canvas></div>
       </div>` : ""}
-
-    <div class="stats" style="margin-top:22px">
-      <div class="stat"><div class="label">Available (all active)</div><div class="value">${money(totalAvail)}</div></div>
-      <div class="stat"><div class="label">Total awarded (active)</div><div class="value">${money(totalAward)}</div></div>
-      <div class="stat"><div class="label">Spent this year</div><div class="value">${money(ytd)}</div></div>
-      <div class="stat"><div class="label">People funded</div><div class="value">${S.people.length}</div></div>
-    </div>
 
     ${closed.length ? `
       <div class="section-head" style="margin-top:8px">
@@ -1069,11 +1114,36 @@ async function wdSync(creds) {
   }
 }
 
+const EXAMPLE_LINK = `<a href="${withKey("/api/workday/example.xlsx")}"><button class="btn secondary small">⬇ Download example file</button></a>`;
+
+/* A wrong export used to disappear into "1 file read · 0 new transactions",
+   leaving the person to guess. Anything that failed now gets its own line
+   saying what the file actually was and what to do about it. */
 function wdReportImportResult(r) {
-  const bad = r.files.filter((f) => f.kind === "error");
-  toast(`${r.files.length} file${r.files.length === 1 ? "" : "s"} read · ${r.new_lines} new transactions · ${r.matched} matched · ${r.created} added` +
-        (r.pending ? ` · ${r.pending} awaiting mapping` : "") +
-        (bad.length ? ` · ${bad.length} unreadable` : ""));
+  const bad = [...r.files.filter((f) => f.kind === "error")
+    .map((f) => ({ name: f.file, why: f.error })),
+  ...(r.upload_errors || []).map((e) => {
+    const i = e.indexOf(": ");
+    return i > 0 ? { name: e.slice(0, i), why: e.slice(i + 2) } : { name: "", why: e };
+  })];
+  const good = r.files.filter((f) => f.kind === "detail" || f.kind === "summary");
+  if (!bad.length) {
+    toast(`${good.length} file${good.length === 1 ? "" : "s"} read · ${r.new_lines} new transactions · ${r.matched} matched · ${r.created} added` +
+          (r.pending ? ` · ${r.pending} awaiting mapping` : ""));
+    return;
+  }
+  modal(`
+    <h2>${bad.length} file${bad.length === 1 ? "" : "s"} couldn't be read</h2>
+    ${good.length ? `<p class="sub" style="margin-bottom:12px">${good.length} other file${good.length === 1 ? "" : "s"} imported fine — ${r.new_lines} new transactions, ${r.matched} matched, ${r.created} added.</p>`
+      : `<p class="sub" style="margin-bottom:12px">Nothing was imported. Your existing data is untouched.</p>`}
+    ${bad.map((b) => `<div style="border-left:3px solid var(--red,#b3261e);padding:8px 0 8px 12px;margin-bottom:12px">
+      ${b.name ? `<div style="font-weight:600;font-size:13px;word-break:break-all">${esc(b.name)}</div>` : ""}
+      <div class="sub" style="margin:4px 0 0">${esc(b.why)}</div>
+    </div>`).join("")}
+    <p class="sub" style="margin:14px 0 8px">The example workbook below has the exact columns Grants Manager expects, filled with obviously fake data — open it beside your export and compare the heading row. Files that couldn't be read have been moved to <code>workday_imports/not-readable/</code> so they don't come up again; nothing was deleted.</p>
+    <div class="toolbar">${EXAMPLE_LINK}</div>
+    <div class="actions"><button class="btn" id="m-cancel">Close</button></div>`,
+    (el, close) => { $("#m-cancel", el).onclick = close; });
 }
 
 async function wdImportFiles() {
@@ -1085,8 +1155,31 @@ async function wdImportFiles() {
 }
 
 async function wdUploadFiles(fileList) {
-  const files = [...fileList].filter((f) => /\.xlsx$/i.test(f.name));
-  if (!files.length) { toast("Pick .xlsx files exported from Workday"); return; }
+  const all = [...fileList];
+  // Say which file is wrong and why, rather than silently dropping it.
+  const wrong = all.filter((f) => !/\.xlsx$/i.test(f.name));
+  const files = all.filter((f) => /\.xlsx$/i.test(f.name));
+  if (!files.length) {
+    const ext = (n) => (n.match(/\.[^.]+$/) || ["(no extension)"])[0].toLowerCase();
+    const tips = {
+      ".xls": "Open it in Excel and use File → Save As → Excel Workbook (.xlsx).",
+      ".csv": "Run the Workday export again and choose Excel (.xlsx) rather than CSV.",
+      ".pdf": "Use Workday's “Export to Excel” button (the grid icon above the report), not Print.",
+      ".numbers": "Open it in Numbers and use File → Export To → Excel.",
+      ".txt": "Run the Workday export again and choose Excel (.xlsx).",
+    };
+    modal(`
+      <h2>That isn't a Workday Excel export</h2>
+      ${wrong.map((f) => `<div style="margin-bottom:10px">
+        <div style="font-weight:600;font-size:13px;word-break:break-all">${esc(f.name)}</div>
+        <div class="sub" style="margin-top:3px">${esc(tips[ext(f.name)] || "Grants Manager reads the .xlsx files Workday's “Export to Excel” button produces.")}</div>
+      </div>`).join("")}
+      <p class="sub" style="margin:14px 0 8px">Not sure what the export should look like? The example workbook has the expected columns with fake data in them.</p>
+      <div class="toolbar">${EXAMPLE_LINK}</div>
+      <div class="actions"><button class="btn" id="m-cancel">Close</button></div>`,
+      (el, close) => { $("#m-cancel", el).onclick = close; });
+    return;
+  }
   toast(`Reading ${files.length} file${files.length === 1 ? "" : "s"}…`);
   try {
     const payloads = await Promise.all(files.map(fileToPayload));
@@ -1158,9 +1251,10 @@ function wdSettingsModal() {
     <p class="sub" style="margin-bottom:8px">Pick one or more <code>.xlsx</code> files exported from Workday — select as many at once as you like (one per grant is fine).</p>
     <div class="dropzone" id="wd-pick-zone" style="width:100%;box-sizing:border-box">📁 Choose files or drop them here<br><span style="font-size:12px;opacity:.75">you can select several at once</span></div>
     <input type="file" id="wd-file-input" accept=".xlsx" multiple hidden>
-    <p class="sub" style="margin:10px 0 0;font-size:12px">Already saved files into <code>workday_imports/</code> yourself? <button class="btn ghost small" id="wd-import-btn" style="padding:2px 8px">⟳ Import from that folder instead</button></p>
+    <p class="sub" style="margin:10px 0 6px;font-size:12px">Not sure which export to run, or whether yours has the right columns? ${EXAMPLE_LINK} — fake data in the exact format expected.</p>
+    <p class="sub" style="margin:6px 0 0;font-size:12px">Already saved files into <code>workday_imports/</code> yourself? <button class="btn ghost small" id="wd-import-btn" style="padding:2px 8px">⟳ Import from that folder instead</button></p>
 
-    ${connected ? "" : `<p class="sub" style="margin:10px 0 0">No direct connection set up yet. Add your Workday report URLs under <strong>⚙ Settings</strong> to sync automatically.</p>`}
+    ${connected ? "" : `<p class="sub" style="margin:10px 0 0">No direct connection set up yet. Add your Workday report URLs under <strong>⚙ Settings → Advanced</strong> to sync automatically.</p>`}
     <div class="actions">
       <button class="btn secondary" id="wd-open-settings">⚙ Settings</button>
       <button class="btn secondary" id="m-cancel">Close</button>
@@ -1184,12 +1278,16 @@ function wdSettingsModal() {
   });
 }
 
-/* the ⚙ Settings gear: defaults, Workday connection, grant worktags —
-   everything you set once and forget. Opened from the top-bar gear. */
+/* the ⚙ Settings gear: backups, recently-deleted, the monthly report.
+   Almost everyone runs this app offline from imported files, so the Workday
+   connection and the remembered email addresses sit behind "Advanced" rather
+   than filling the panel with fields most people never touch. */
 async function settingsModal() {
   const r = WD?.raas || {};
   const pc = WD?.push_cfg || {};
+  const connected = !!(r.summary_url || r.detail_url);
   const push = WD?.push || { profiles: {}, codes: {} };
+  const card = WD?.pcard || {};
   const activeGrants = realGrants().filter((g) => g.status === "active");
   let trash = [];
   try { trash = (await api("/api/trash")).batches; } catch { /* non-critical */ }
@@ -1215,42 +1313,55 @@ async function settingsModal() {
       </tr>`).join("")}</tbody>
     </table>` : `<div class="empty" style="margin-bottom:16px">Nothing deleted recently.</div>`}
 
-    <h2 style="font-size:14px;margin-top:6px">Defaults</h2>
-    <p class="sub" style="margin-bottom:8px">Set once, auto-filled everywhere — the login popup only ever asks for email and password, and the send box comes pre-addressed.</p>
-    <div class="form-row">
-      <label class="field"><span>Email (Workday login)</span><input id="wd-user" value="${esc(r.username || "")}" placeholder="you@uark.edu"></label>
-      <label class="field"><span>Your email (reports come to you)</span><input id="wd-owner-email" type="email" value="${esc(pc.owner_email || "")}" placeholder="you@uark.edu"></label>
+    <h2 style="font-size:14px;margin-top:6px">Your name on the report</h2>
+    <p class="sub" style="margin-bottom:8px">Used to title the report email — “Jane Doe's expense report for the month of September 2026”.</p>
+    <div class="form-row" style="align-items:flex-end">
+      <label class="field" style="max-width:260px"><span>Your name</span><input id="set-owner-name" value="${esc(pc.owner_name || "")}" placeholder="Jane Doe"></label>
+      <button class="btn secondary small" id="btn-save-name" style="margin-bottom:4px">Save</button>
     </div>
-    <p class="sub" style="margin:-4px 0 0;font-size:12.5px">Expense reports and entry sheets are sent to <em>you</em> to check, then you forward them to your accountant — the app never emails them directly.</p>
+
+    <h2 style="font-size:14px;margin-top:16px">💳 P-card</h2>
+    <p class="sub" style="margin-bottom:8px">Set once. Every expense you tick as a P-card purchase carries these into the report, so reconciliation has the cardholder against each line.</p>
+    <div class="form-row" style="align-items:flex-end">
+      <label class="field"><span>Print cardholder's name</span><input id="set-cardholder" value="${esc(card.cardholder || "")}" placeholder="Jane Doe"></label>
+      <label class="field"><span>Name on the P-card</span><input id="set-card-name" value="${esc(card.card_name || "")}" placeholder="as embossed on the card"></label>
+      <button class="btn secondary small" id="btn-save-card" style="margin-bottom:4px">Save</button>
+    </div>
 
     <h2 style="font-size:14px;margin-top:16px">Monthly expense report</h2>
-    <p class="sub" style="margin-bottom:8px">At the start of each month the app offers to email you last month's expenses, formatted for your accountant. You can also send one any time.</p>
+    <p class="sub" style="margin-bottom:8px">At the start of each month the app offers to email you last month's expenses, formatted for your accountant. You can also send one any time — the address you send to is remembered, so there is nothing to set up here first.</p>
     <div class="toolbar" style="margin-bottom:4px">
       <button class="btn secondary small" id="btn-send-report">📧 Send a report now…</button>
     </div>
 
-    <h2 style="font-size:14px;margin-top:14px">Direct connection (RaaS) <span class="sub" style="font-weight:400">— optional, advanced</span></h2>
-    <p class="sub" style="margin-bottom:8px">Leave these empty to keep working offline (the normal setup). Filling them in lets the app pull reports straight from Workday instead of you exporting files — but it needs report-writing rights and an account that isn't SSO-only, which most people don't have. <strong>Instructions tab → “Optional: direct connection (RaaS)”</strong> lists the exact access levels to ask for. To import files instead, use <strong>⇅ Workday</strong> in the top bar.</p>
-    <label class="field"><span>Balances report URL</span><input id="wd-url-sum" value="${esc(r.summary_url || "")}" placeholder="https://….workday.com/ccx/service/customreport2/…"></label>
-    <label class="field"><span>Transactions report URL (optional until you build it)</span><input id="wd-url-det" value="${esc(r.detail_url || "")}" placeholder="https://….workday.com/ccx/service/customreport2/…"></label>
-    <div class="toolbar" style="margin-top:4px">
-      <button class="btn secondary small" id="wd-save-all">Save settings</button>
-    </div>
+    <details class="advanced" ${connected ? "open" : ""}>
+      <summary>Advanced — direct Workday connection &amp; saved email addresses</summary>
+      <p class="sub" style="margin:10px 0 8px">Nothing in here is needed for normal, offline use. Grants Manager works entirely from imported Workday files; these settings only matter if you have a direct connection set up.</p>
 
-    <h2 style="font-size:14px;margin-top:16px">Grant worktags (stamped on every entry)</h2>
-    <p class="sub" style="margin-bottom:8px">Grant/Award codes fill in automatically once a grant's data has been imported; Cost Center and Fund are set here once.</p>
-    ${activeGrants.map((g) => {
-      const c = push.codes[g.id] || {};
-      const p = push.profiles[String(g.id)] || {};
-      return `<div class="form-row" style="align-items:flex-end">
-        <label class="field" style="max-width:170px"><span>${esc(g.name)}</span>
-          <div style="font-size:11.5px;color:var(--muted);padding-top:6px">${c.grant_code ? esc(c.grant_code) : "no code yet"}</div></label>
-        <label class="field"><span>Cost Center</span><input data-wt-cc="${g.id}" value="${esc(p.cost_center || "")}" placeholder="CC067890 …"></label>
-        <label class="field" style="max-width:150px"><span>Fund</span><input data-wt-fund="${g.id}" value="${esc(p.fund || "")}" placeholder="FD100 …"></label>
-        <label class="field"><span>Other worktags</span><input data-wt-extra="${g.id}" value="${esc(p.extra || "")}" placeholder="Function, program…"></label>
-        <button class="btn secondary small" data-wt-save="${g.id}" style="margin-bottom:4px">Save</button>
-      </div>`;
-    }).join("")}
+      <h2 style="font-size:14px;margin-top:14px">Saved email addresses</h2>
+      <p class="sub" style="margin-bottom:8px">Filled in automatically the first time you send a report or sign in — set them by hand only if you want to change them.</p>
+      <div class="form-row">
+        <label class="field"><span>Email (Workday login)</span><input id="wd-user" value="${esc(r.username || "")}" placeholder="you@uark.edu"></label>
+        <label class="field"><span>Your email (reports come to you)</span><input id="wd-owner-email" type="email" value="${esc(pc.owner_email || "")}" placeholder="you@uark.edu"></label>
+      </div>
+      <p class="sub" style="margin:-4px 0 0;font-size:12.5px">Expense reports and entry sheets are sent to <em>you</em> to check, then you forward them to your accountant — the app never emails them directly.</p>
+
+      <h2 style="font-size:14px;margin-top:16px">Direct connection (RaaS)</h2>
+      <p class="sub" style="margin-bottom:8px">Leave these empty to keep working offline (the normal setup). Filling them in lets the app pull reports straight from Workday instead of you exporting files — but it needs report-writing rights and an account that isn't SSO-only, which most people don't have. <strong>Instructions tab → “Optional: direct connection (RaaS)”</strong> lists the exact access levels to ask for. To import files instead, use <strong>⇅ Workday</strong> in the top bar.</p>
+      <label class="field"><span>Balances report URL</span><input id="wd-url-sum" value="${esc(r.summary_url || "")}" placeholder="https://….workday.com/ccx/service/customreport2/…"></label>
+      <label class="field"><span>Transactions report URL (optional until you build it)</span><input id="wd-url-det" value="${esc(r.detail_url || "")}" placeholder="https://….workday.com/ccx/service/customreport2/…"></label>
+      <div class="toolbar" style="margin-top:4px">
+        <button class="btn secondary small" id="wd-save-all">Save advanced settings</button>
+      </div>
+
+      <h2 style="font-size:14px;margin-top:18px">Grant worktags</h2>
+      <p class="sub" style="margin-bottom:8px">Stamped on every entry sent to Workday. Grant and Award codes fill in automatically once a grant's data has been imported; Cost Center and Fund are typed here once. Pick a grant to see or change its worktags.</p>
+      ${activeGrants.length ? `
+        <label class="field" style="max-width:260px"><span>Grant</span>
+          <select id="wt-pick">${activeGrants.map((g, i) =>
+            `<option value="${g.id}" ${i === 0 ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select></label>
+        <div id="wt-panel"></div>` : `<div class="empty">No active grants yet.</div>`}
+    </details>
     <div class="actions"><button class="btn secondary" id="m-cancel">Close</button></div>
   `, (el, close) => {
     $("#m-cancel", el).onclick = close;
@@ -1279,6 +1390,60 @@ async function settingsModal() {
         settingsModal();
       } catch (e) { toast("Restore failed: " + e.message); }
     });
+    $("#btn-save-name", el).onclick = async () => {
+      try {
+        await api("/api/workday/push_config", "POST",
+                  { owner_name: $("#set-owner-name", el).value });
+        WD = await api("/api/workday/state");
+        toast("Saved");
+      } catch (err) { toast("Couldn't save: " + err.message); }
+    };
+    $("#btn-save-card", el).onclick = async () => {
+      try {
+        await api("/api/pcard_config", "POST", {
+          cardholder: $("#set-cardholder", el).value,
+          card_name: $("#set-card-name", el).value,
+        });
+        WD = await api("/api/workday/state");
+        toast("P-card details saved");
+      } catch (err) { toast("Couldn't save: " + err.message); }
+    };
+    const wtPick = $("#wt-pick", el);
+    if (wtPick) {
+      // One grant at a time: a row per grant filled the panel with fields
+      // nobody was looking at, which is why this section was pulled out of
+      // Settings in the first place.
+      const drawWorktags = () => {
+        const gid = wtPick.value;
+        const g = activeGrants.find((x) => String(x.id) === String(gid));
+        const c = push.codes[+gid] || {};
+        const pr = push.profiles[String(gid)] || {};
+        $("#wt-panel", el).innerHTML = `
+          <p class="sub" style="margin:0 0 8px;font-size:12.5px">Workday code for ${esc(g ? g.name : "")}: <strong>${c.grant_code ? esc(c.grant_code) : "none imported yet"}</strong>${c.award ? ` · Award ${esc(c.award)}` : ""}</p>
+          <div class="form-row" style="align-items:flex-end">
+            <label class="field"><span>Cost Center</span><input id="wt-cc" value="${esc(pr.cost_center || "")}" placeholder="CC067890 …"></label>
+            <label class="field" style="max-width:150px"><span>Fund</span><input id="wt-fund" value="${esc(pr.fund || "")}" placeholder="FD100 …"></label>
+            <label class="field"><span>Other worktags</span><input id="wt-extra" value="${esc(pr.extra || "")}" placeholder="Function, program…"></label>
+            <button class="btn secondary small" id="wt-save" style="margin-bottom:4px">Save</button>
+          </div>`;
+        $("#wt-save", el).onclick = async () => {
+          const cc = $("#wt-cc", el).value, fund = $("#wt-fund", el).value,
+                extra = $("#wt-extra", el).value;
+          try {
+            await api("/api/workday/worktags", "POST", {
+              grant_id: +gid, cost_center: cc, fund, extra,
+            });
+            // keep the local copy in step so switching grants and back
+            // doesn't show the pre-save values
+            push.profiles[String(gid)] = { cost_center: cc, fund, extra };
+            WD = await api("/api/workday/state");
+            toast("Worktags saved");
+          } catch (e) { toast("Couldn't save: " + e.message); }
+        };
+      };
+      wtPick.onchange = drawWorktags;
+      drawWorktags();
+    }
     $("#wd-save-all", el).onclick = async () => {
       await api("/api/workday/push_config", "POST", {
         owner_email: $("#wd-owner-email", el).value,
@@ -1292,17 +1457,6 @@ async function settingsModal() {
       close();
       settingsModal();
     };
-    $$("[data-wt-save]", el).forEach((b) => b.onclick = async () => {
-      const gid = b.dataset.wtSave;
-      await api("/api/workday/worktags", "POST", {
-        grant_id: +gid,
-        cost_center: $(`[data-wt-cc="${gid}"]`, el).value,
-        fund: $(`[data-wt-fund="${gid}"]`, el).value,
-        extra: $(`[data-wt-extra="${gid}"]`, el).value,
-      });
-      toast("Worktags saved");
-      WD = await api("/api/workday/state");
-    });
   });
 }
 
@@ -1428,6 +1582,34 @@ function wireWorkdayBits(m) {
 }
 
 /* --------------------------------------------------------- instructions */
+/* Walkthrough clips for the Instructions tab.
+
+   Thirteen looping GIFs animating at once is noise (and needless CPU), so
+   each one shows a still first frame with a Play badge and only swaps in the
+   animation when asked. Re-clicking restarts it, which a plain GIF can't do.
+   All of them were recorded against a throwaway database of invented grants —
+   no real grant, person or amount appears in any frame. */
+function demo(name, caption) {
+  return `<figure class="demo">
+    <button type="button" class="demo-play" data-demo="${esc(name)}">
+      <img src="/app/help/${esc(name)}.png" alt="${esc(caption)}" loading="lazy" decoding="async">
+      <span class="demo-badge">▶&nbsp;Play</span>
+    </button>
+    <figcaption>${esc(caption)} <span class="demo-fake">Example data — not your grants.</span></figcaption>
+  </figure>`;
+}
+
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".demo-play");
+  if (!btn) return;
+  const img = $("img", btn), badge = $(".demo-badge", btn);
+  const name = btn.dataset.demo;
+  // a fresh query string each time, so a second click replays from frame one
+  img.src = `/app/help/${name}.gif?r=${Date.now()}`;
+  btn.classList.add("playing");
+  badge.innerHTML = "↻&nbsp;Replay";
+});
+
 function renderInstructions() {
   const sec = (title, body) => `<div class="card"><h2>${title}</h2><div style="font-size:14px;line-height:1.6">${body}</div></div>`;
   return `
@@ -1438,46 +1620,69 @@ function renderInstructions() {
       <p><strong>Quick add expense</strong> (top): type the amount, pick the grant and category, adjust the date, add comments, and optionally drop a receipt file (PDF or photo) on the dashed box — then click <em>Add</em>. Receipts are copied into <code>GrantsApp/receipts/&lt;grant&gt;/&lt;year&gt;/</code>, so they're backed up by OneDrive.</p>
       <p><strong>Splitting a cost:</strong> pick a second grant under <em>Split with</em> and the percentage that grant pays — the app creates two linked expenses, one on each grant, with the split noted in each. The same option exists in the grant page's <em>+ Add expense</em> form.</p>
       <p><strong>Alerts</strong> warn when (in the current budget year) a grant is ending soon, a category is over 80% spent, or something is overspent. Click an alert to open that grant.</p>
-      <p><strong>Grant cards</strong> show money still available on each grant. The bar starts fully <span style="color:var(--green);font-weight:600">green (available)</span> and fills with gray from left to right as money is spent — a mostly gray bar means the grant is nearly used up.</p><p><strong>“Available” means what you can still spend</strong> — the award minus what you've spent <em>and</em> minus anything already committed (purchase orders and requisitions Workday knows about but hasn't billed yet). That matches the figure your accountant quotes. Commitments only appear once you've imported a Workday report; before that, available is simply award minus spent.</p><p><strong>The two lines under each card answer “am I on track?”</strong> The first compares time against money (“19 of 36 months gone (53%) — you've spent 20% of the money”). The second takes your average spending over the last six months and says where it lands: either how much would be left at the end, or — in amber — how many months early you'd run out. Click a card to open the grant's full page. Totals for all active grants are at the bottom, and closed grants can be hidden with the <em>Hide closed grants</em> button.</p>`)}
+      <p><strong>Grant cards</strong> show money still available on each grant. The bar starts fully <span style="color:var(--green);font-weight:600">green (available)</span> and fills with gray from left to right as money is spent — a mostly gray bar means the grant is nearly used up.</p><p><strong>“Available” means what you can still spend</strong> — the award minus what you've spent <em>and</em> minus anything already committed (purchase orders and requisitions Workday knows about but hasn't billed yet). That matches the figure your accountant quotes. Commitments only appear once you've imported a Workday report; before that, available is simply award minus spent.</p><p><strong>The two lines under each card answer “am I on track?”</strong> The first compares time against money (“19 of 36 months gone (53%) — you've spent 20% of the money”). The second takes your average spending over the last six months and says where it lands: either how much would be left at the end, or — in amber — how many months early you'd run out. Click a card to open the grant's full page. Totals for all active grants are at the bottom, and closed grants can be hidden with the <em>Hide closed grants</em> button.</p>
+      ${demo('dashboard', 'The dashboard, top to bottom: totals for every active grant, then the alerts, then one card per grant.')}
+      ${demo('quick-add', 'Adding an expense — amount, grant, a note, then Add. “Add to Workday” was ticked, so the send box opens straight after.')}
+    `)}
 
     ${sec("📋 Grant page", `
       <p>Open any grant to see: <strong>Available now</strong> (award minus spending) and <strong>Projected available</strong> (after paying every current appointment through its end).</p>
       <p>The <strong>Budget by category × year</strong> matrix shows budgeted / spent / remaining per cell — <em>click any budget number to edit it</em>. Add grant-specific categories with <em>+ custom category</em>.</p>
       <p>The <strong>burn-down chart</strong> compares your actual spending pace against an even pace and projects when the money runs out. Below it, the expense ledger can be filtered by category/year; every expense can be edited (✏️) or deleted (🗑). <strong>⬇ Export CSV</strong> downloads the ledger; <strong>🖨 Print report</strong> makes a clean printable summary.</p>
       <p><strong>📄 Close-out report</strong> builds the document you need when an award ends: award summary, final budget-vs-actual by category (and by year), personnel supported, the complete ledger, and a signature block — plus a flagged list of any manually-entered expenses <em>missing a receipt</em>, which sponsors commonly ask for at close-out. Use <em>🖨 Print / Save as PDF</em> on that page to file it.</p>
-      <p><strong>Edit grant</strong> also lets you: set a <strong>no-cost extension</strong> date (extends the effective end date without new money — an “NCE” badge appears everywhere), mark the grant <strong>closed</strong>, or <strong>exclude it from the historic total</strong>.</p>`)}
+      <p><strong>Edit grant</strong> also lets you: set a <strong>no-cost extension</strong> date (extends the effective end date without new money — an “NCE” badge appears everywhere), mark the grant <strong>closed</strong>, or <strong>exclude it from the historic total</strong>.</p>
+      ${demo('grant-page', 'Opening a grant card: budget by category, the spending burn-down, who is paid from it, and its expense list.')}
+    `)}
 
     ${sec("📊 Summary", `
       <p>The headline <strong>“Salary available to hire — after projections”</strong> is the salary (Personnel) money left across active grants once every current appointment is paid through its end. Fringe and tuition are accounted for: they're charged to their own budgets first and any overrun is taken out of the salary pot. <em>Click the headline card</em> to see the fringe & tuition detail.</p>
       <p><strong>Hiring power by grant</strong> shows two bars per grant — salary now (gray) vs. after projections (green; red = over-committed) — plus a table with both numbers and the overall grant totals.</p>
-      <p><strong>Totals by category</strong> combines all grants per category (toggle to include closed grants). <strong>Historic total</strong> adds up every award you've received; untick a grant's checkbox to exclude it from the total.</p>`)}
+      <p><strong>Totals by category</strong> combines all grants per category (toggle to include closed grants). <strong>Historic total</strong> adds up every award you've received; untick a grant's checkbox to exclude it from the total.</p>
+      ${demo('summary', 'The Summary tab: every grant you have ever held, and category totals across all of them.')}
+    `)}
 
     ${sec("👥 People & projections", `
       <p>Each person can have <strong>appointments</strong>: grant + monthly salary + fringe % + annual tuition + start/end dates (the length). These drive all projections — the app counts months not yet charged (starting after the person's last real paycheck on that grant) through the appointment or grant end, whichever comes first.</p>
       <p><strong>Splitting a person across grants:</strong> when you add a person, the form lets you enter their total salary and pick which grant pays — and optionally a second source with a percentage for each. A person paid from two sources shows <em>two rows</em> in their table, one per grant, with a <strong>%</strong> column (e.g., a postdoc paid 50% by one grant + 50% by “Other”). Pick <strong>“Other”</strong> as the source for salary shares paid outside your grants (department, college, another PI) — it appears on the People tab but never counts against your budgets.</p>
-      <p>The <strong>auto-generate monthly charges</strong> switch on an appointment makes the <strong>↻ Update Salaries</strong> button (top bar) create the actual monthly salary + fringe expenses, prorated and never duplicated. Leave it OFF if your actual numbers come from DBR imports — projections work either way.</p>`)}
+      <p>The <strong>auto-generate monthly charges</strong> switch on an appointment makes the <strong>↻ Update Salaries</strong> button (top bar) create the actual monthly salary + fringe expenses, prorated and never duplicated. Leave it OFF if your actual numbers come from DBR imports — projections work either way.</p>
+      ${demo('people', 'The People tab: appointments with salary, fringe and tuition — what the projections are built from.')}
+    `)}
 
     ${sec("📧 Monthly expense report", `
       <p>At the start of each month the app offers to email you <strong>last month's expenses</strong> — and you can send one any time from <strong>⚙ Settings → Send a report now</strong> or the 🔔 notification.</p>
       <p><strong>It goes to you, not to your accountant.</strong> You read it, check it's right, and forward it on. That's deliberate: the app never emails anyone on your behalf, so there's no accountant address to keep configured, and nothing goes out that you haven't seen.</p>
-      <p><strong>What's in it.</strong> A table with Workday's own column names — Date, Amount, Spend Category, Business Purpose, Grant/Worktag, Award, Cost Center, Fund, Person, Receipt — so your accountant can key it straight in. Attached: the same rows as a <strong>CSV</strong> (for importing, if your Workday setup allows it) and a <strong>zip of that month's receipts</strong>. It also lists any expenses you added, edited or deleted in the app that month, so you can vouch for the numbers, and flags anything hand-entered with a receipt still missing.</p>`)}
+      <p><strong>What's in it.</strong> The email body is a single line — <em>“Jane Doe's expense report for the month of September 2026”</em> — and everything else is attached. The attachment is a real <strong>Excel workbook</strong> with up to three sheets: <em>Expenses</em> (one row per expense — Date, Amount, Spend Category, Business Purpose, Grant/Worktag, Award, Cost Center, Fund, Person, Receipt, then P-card, Print cardholder's name, Name on the P-card and Purchased by), <em>P-card purchases</em> (the same columns filtered to just the card transactions), and <em>Changes this month</em> (anything you added, edited or deleted in the app). Headings are frozen and columns are pre-sized, so it opens ready to read. <strong>Each receipt is attached separately, named exactly as the Receipt column names it</strong>, so you can match a row to its file by eye.</p><p class="sub" style="margin-top:6px">If a month's receipts add up to more than about 18 MB they arrive as one zip instead — too many megabytes and the email would simply bounce. The names inside still match the Receipt column.</p><p><strong>Set your name once</strong> under <strong>⚙ Settings → Your name on the report</strong>, or the email just says “Expense report for the month of …”.</p>
+      ${demo('monthly-report', 'Sending a report: ⚙ Settings → Send a report now, check the table, then send it to yourself.')}
+    `)}
+
+    ${sec("💳 P-card purchases", `
+      <p>Tick <strong>💳 P-card</strong> on the Quick add form (or in any expense's edit box) when the purchase went on a university purchasing card. That is the whole of it — one tick, plus a <strong>Purchased by</strong> box on the rare occasion someone other than the cardholder made the purchase.</p>
+      <p>Everything else is filled in for you. The <em>printed cardholder name</em> and the <em>name on the card</em> come from <strong>⚙ Settings → 💳 P-card</strong>; the cost centre comes from the worktags of whichever grant the expense was charged to; and the reason for the purchase is simply the comment you already typed against the expense.</p>
+      <p>The monthly report then arrives with a <em>P-card purchases</em> sheet listing only the card transactions, so whoever reconciles them does not have to hunt for them among everything else.</p>
+      ${demo('pcard', 'One tick marks an expense as a card purchase; the cardholder and card name come from your settings.')}`)}
 
     ${sec("🔔 Notifications", `
       <p>The bell in the top bar shows a <strong>red dot</strong> when something needs you: a grant gone over budget, a category over its line for the current year, an award ending within 60 days, receipts missing from recent manual entries, or a monthly report you haven't sent yet.</p>
       <p>Click a notification to jump straight to what it's about. <em>Mark all read</em> clears the dot until something new happens. If you've added the app to your home screen or dock, the badge appears on the app icon too, and the browser tab icon carries a small red count.</p>
       <p><strong>New versions.</strong> The bell also tells you when a newer version of Grants Manager has been released. Click it to read <em>what changed</em> in that version and, if you want it, a button to open the download page. Updating never touches your data — you unzip the new folder and copy your existing <code>data</code> folder into it.</p>
-      <p class="sub">How the check works: about <strong>once every 15 days</strong>, the app asks GitHub what the latest released version number is. It sends nothing about you or your grants — no data leaves your computer, it only reads a public version number. If you're offline it silently does nothing and tries again next time; you'll never see an error about it.</p>`)}
+      <p class="sub">How the check works: about <strong>once every 15 days</strong>, the app asks GitHub what the latest released version number is. It sends nothing about you or your grants — no data leaves your computer, it only reads a public version number. If you're offline it silently does nothing and tries again next time; you'll never see an error about it.</p>
+      ${demo('notifications', 'The 🔔 bell collects everything the app wants to tell you; clicking an item opens the grant it is about.')}
+    `)}
 
     ${sec("📋 All Expenses — filtering, bulk edits, receipts", `
       <p><strong>Filters.</strong> The filter bar narrows by search text, grant, category, person, <em>date range</em>, <em>amount range</em>, source, and whether a receipt is attached. They stack, and the header always shows how many rows match and their <strong>total</strong> — handy for "how much travel did this grant spend last spring?". <strong>⬇ Export shown (CSV)</strong> exports exactly what's on screen, not everything.</p>
       <p><strong>Fixing several at once.</strong> Tick the checkboxes (or the one in the header to take everything currently shown) and a blue action bar appears: <em>Change category</em>, <em>Move to grant</em>, <em>Set person</em>, or <em>Delete selected</em>. This is the fast way to fix a batch of mis-categorized charges. Moving expenses to another grant automatically remaps their category and recalculates the budget year for the destination. Bulk deletes go to <strong>⚙ Settings → Recently deleted</strong> like any other delete, so a wrong selection is recoverable.</p>
       <p><strong>Receipts.</strong> Click <strong>✏️</strong> on any row to open it and drop in a receipt — you can attach one to an expense long after it was created. Set the <em>Receipt</em> filter to <em>Missing</em> to find everything still lacking one.</p>
-      <p><strong>Duplicate warning.</strong> If you add an expense with the same amount on the same grant within 30 days of an existing one, the app shows you the matches and asks whether to continue. It's a warning, never a block — real repeats (monthly charges, two identical orders) are normal.</p>`)}
+      <p><strong>Duplicate warning.</strong> If you add an expense with the same amount on the same grant within 30 days of an existing one, the app shows you the matches and asks whether to continue. It's a warning, never a block — real repeats (monthly charges, two identical orders) are normal.</p>
+      ${demo('all-expenses', 'Filtering by text and by grant, then ticking rows to reveal the blue bulk-edit bar.')}
+    `)}
 
     ${sec("🔍 Search, 🌙 dark mode, 📤 sharing", `
       <p>The <strong>search box</strong> (top bar) finds grants, people, and expenses as you type — click a result to jump to it. The <strong>moon/sun button</strong> toggles dark mode.</p>
       <p><strong>Sharing the app (empty copy):</strong> the file <strong>“Grants Manager (shareable).zip”</strong> in your grants_management folder is a ready-to-email copy of the app containing <em>no data at all</em> — no grants, people, expenses, or receipts. It's refreshed automatically every time the app starts. Attach it to an email; the recipient unzips it and double-clicks <strong>Start Grants Manager (Mac).command</strong> or <strong>(Windows).bat</strong> — no admin rights needed.</p>
-      <p><strong>Sharing your numbers:</strong> anyone you give your startup link and access key to has full access, so for a co-PI or department admin the safer route is <strong>🖨 Print report</strong> on a grant (a clean PDF-able page with the charts) or <strong>⬇ Export CSV</strong>. Both are a snapshot they can keep, with nothing connected back to your app.</p>`)}
+      <p><strong>Sharing your numbers:</strong> anyone you give your startup link and access key to has full access, so for a co-PI or department admin the safer route is <strong>🖨 Print report</strong> on a grant (a clean PDF-able page with the charts) or <strong>⬇ Export CSV</strong>. Both are a snapshot they can keep, with nothing connected back to your app.</p>
+      ${demo('search-dark', 'Search finds expenses, grants and people as you type. The 🌙 button switches to dark mode.')}
+    `)}
 
     ${sec("📱 iPhone", `
       <p>Three ways to use it on your phone:</p>
@@ -1489,7 +1694,7 @@ function renderInstructions() {
     ${sec("🔄 Workday — the app works offline by default", `
       <p><strong>You do not need a Workday connection to use this app.</strong> It opens straight into your own data and never asks you to sign in to anything. Most people can't connect directly anyway — university sign-in (SSO) plus the Duo prompt blocks the kind of automatic connection Workday would need — so the normal way to use this app is:</p>
       <p style="border-left:3px solid #2f6fed;padding-left:10px"><strong>Download a report from Workday → import the file here.</strong> That's it. The step-by-step is in the next section. You can also just type expenses in by hand and never touch Workday at all.</p>
-      <p>The <strong>⇅ Workday</strong> button in the top bar is where you import files and see the state (✓ synced today / offline). The <strong>⚙ Settings</strong> gear holds everything optional: the direct-connection settings, email defaults, and grant worktags.</p>
+      <p>The <strong>⇅ Workday</strong> button in the top bar is where you import files and see the state (✓ synced today / offline). The <strong>⚙ Settings</strong> gear holds backups, recently-deleted items and the monthly report; the direct-connection settings and saved email addresses are tucked under <strong>Advanced</strong> there, since offline use needs neither.</p>
       <p><strong>What happens after an import.</strong> The first time, a dashboard card asks you to match each Workday grant code (GR…) and object class (01_Personnel…) to your grants and categories — one time only. After that: charges that match an expense you already entered are <strong>linked</strong> (never duplicated); payroll actuals <strong>replace</strong> projected salary for past months (future months stay projected); anything new is <strong>added</strong> with a <span class="badge green">workday</span> badge. The <strong>Official numbers</strong> table on the Summary tab shows the imported figures side by side with your <strong>New expenses</strong> — the ones you've entered that haven't reached the official ledger yet. Importing the same file twice never duplicates anything, so when in doubt, re-import.</p>`)}
 
     ${sec("📥 Step-by-step: get your Workday report into this app", `
@@ -1507,7 +1712,12 @@ function renderInstructions() {
       <p><strong>9.</strong> That's it — the app reads them immediately. You don't need to find, create, or copy anything into a folder yourself.</p>
       <p><strong>10.</strong> The first time only, the dashboard shows a card asking you to match Workday's grant codes and object classes to your grants and categories. Pick from the dropdowns and save. It won't ask again.</p>
       <p><strong>Repeat whenever you want fresh numbers</strong> — typically once a month after the ledger closes. Just steps 1–9 again; re-importing never creates duplicates.</p>
-      <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>If something doesn't work:</strong> the file must end in <strong>.xlsx</strong> — if yours is a <code>.csv</code> or <code>.xls</code>, open it in Excel and use <em>File → Save As → Excel Workbook (.xlsx)</em>. The app reads the <strong>first sheet</strong> only. If you exported a file that has no recognisable columns, the app will say so rather than importing nonsense — check you exported the report table itself and not a summary chart.</p>`)}
+      <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>If something doesn't work</strong>, the app now tells you exactly what it found — a PDF instead of a workbook, the older <code>.xls</code> format, a CSV, or a sheet whose column headings don't match. It names the missing columns and changes nothing until a file reads cleanly, so a wrong export can't corrupt anything. The app reads the <strong>first sheet</strong> only, and it copes with a title or blank row above the headings.</p>
+      <p><strong>Not sure your export looks right?</strong> Download the example workbook — two sheets (transactions and balances) with obviously fake data in exactly the columns the app looks for. Open it next to your own export and compare the heading row.</p>
+      <div class="toolbar" style="margin:8px 0">${EXAMPLE_LINK}</div>
+      ${demo('workday-import', 'The ⇅ Workday panel: drop your exported .xlsx files here, or download the example to check yours matches.')}
+      ${demo('wrong-file', 'A wrong export: the app names the file, says what it actually was, and offers the example. Nothing is imported.')}
+    `)}
 
     ${sec("🔗 Optional: direct connection (RaaS) — most people can't use this", `
       <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>Read this first.</strong> This section is <em>optional and advanced</em>. It needs permissions in Workday that ordinary faculty accounts don't have, and at most universities — UARK included — single sign-on and the Duo prompt block it outright. <strong>If it doesn't work for you, nothing is wrong and nothing is missing:</strong> the import steps above are the supported way to use this app, and they give you the same numbers. Skip this unless you already know you have report-writing rights.</p>
@@ -1520,22 +1730,26 @@ function renderInstructions() {
       <p><strong>1. Make a custom copy of the report.</strong> In the Workday search bar type <strong>Copy Standard Report to Custom Report</strong>, run the task, and pick <em>RPT - Grant Budget Vs Actuals</em>. Name the copy something like “My Grants RaaS”. <em>(If that task doesn't appear, you don't have report-writing rights — ask your department's Workday report writer to do steps 1–3; it takes them about five minutes.)</em></p>
       <p><strong>2. Enable it as a web service.</strong> Edit the custom report → <strong>Advanced</strong> tab → tick <strong>Enable As Web Service</strong> → OK. If the report has prompts (Grant, Organization…), give them default values so it can run unattended.</p>
       <p><strong>3. Copy the URL.</strong> On the report: related actions (…) → <strong>Web Service</strong> → <strong>View URLs</strong> → right-click the <strong>CSV</strong> link → Copy link. It looks like <code>https://….workday.com/ccx/service/customreport2/…</code></p>
-      <p><strong>4. Paste it here.</strong> Click <strong>⚙ Settings</strong> → paste the URL under <em>Direct connection (RaaS)</em>, enter your Workday username, Save. Then <strong>⇅ Workday → ⇣ Sync from Workday now</strong> and type your password — held in memory for this session only, never written to disk. Once a URL is saved, and only then, the app will offer to connect when it opens.</p>
+      <p><strong>4. Paste it here.</strong> Click <strong>⚙ Settings</strong> → open <strong>Advanced</strong> → paste the URL under <em>Direct connection (RaaS)</em>, enter your Workday username, Save. Then <strong>⇅ Workday → ⇣ Sync from Workday now</strong> and type your password — held in memory for this session only, never written to disk. Once a URL is saved, and only then, the app will offer to connect when it opens.</p>
       <p><strong>Transactions too (optional):</strong> the copied report gives balances only. For the individual charges, create a second custom report (<em>Create Custom Report</em> → Advanced) on a journal-lines data source filtered to your grants, including the columns <em>Accounting Date, Budget Date, Operational Transaction, Award, Grant, Worker, Supplier, Ledger Account, Transaction Amount, Object Class, Spend Category</em>; enable it as a web service the same way and paste its URL in the second field.</p>
-      <p><strong>If the sync says the login was rejected, or that it got a login page back:</strong> your account is SSO-only and this route is closed. That is the expected outcome for most people — use the import steps above instead.</p>`)}
+      <p><strong>If the sync says the login was rejected, or that it got a login page back:</strong> your account is SSO-only and this route is closed. That is the expected outcome for most people — use the import steps above instead.</p>
+      ${demo('advanced-settings', 'Where the optional settings live — ⚙ Settings → Advanced: the RaaS URLs, saved addresses and grant worktags.')}
+    `)}
 
     ${sec("→ Getting expenses INTO Workday (Add to Workday)", `
       <p>Tick <strong>📤 Add to Workday</strong> on the Quick add form and, the moment you hit Add, a box pops up with the expense in <strong>workday-ready format</strong> — amount, date, suggested Spend Category (learned from your imports), business purpose, Grant and Award worktags, Cost Center, Fund — plus the email it will go to. Click <strong>✉ Send email</strong> and it goes to the financial team through <strong>Microsoft Outlook</strong> (works on Mac and Windows) with <strong>your email CC'd</strong> and the <strong>receipt attached</strong> (receipts must be PDF — see the ⓘ next to the receipt box). The box is <strong>ticked by default</strong>. Untick it and the expense is simply saved here — nothing is sent, and it never appears in the “To enter in Workday” list, which is what you want for anything that isn't going on the grant's official ledger.</p>
-      <p>Set the defaults once under <strong>⚙ Settings</strong> (top bar): your Workday login email, the financial team address, and your CC address — they auto-populate the login popup and every send box (the addresses from your last send are remembered). On a Mac, the first send asks permission to control Outlook — click OK once.</p>
+      <p>You don't have to set anything up first: the addresses you use are remembered from your last send and pre-filled next time (⚙ Settings → Advanced is where to correct one). On a Mac, the first send asks permission for <strong>Grants Manager</strong> to control Outlook — click OK once.</p>
       <p><strong>Charging someone else's account:</strong> pick <strong>“Other”</strong> as the grant when a colleague or the department provides the account — a <em>Worktag (whose account)</em> field appears; type in that account's worktag (GR… or CC…). These expenses never count against your grant budgets, but with <strong>📤 Add to Workday</strong> still ticked they're sent to the financial team the same as any other expense, using the worktag you typed instead of one of your own grants.</p>
       <p><strong>Splits:</strong> tick <em>Split across worktags</em> to reveal the split fields — the other grant, its percentage, and its <em>Cost Center</em> and <em>Worktag</em> (auto-filled if the grant is known, editable if not). The email then lists both accounting lines with their percentages and amounts.</p>
-      <p>Set each grant's <strong>Cost Center / Fund / other worktags once</strong> under <strong>⚙ Settings</strong> — Grant and Award codes fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
+      <p>Grant and Award worktags fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
 
     ${sec("📄 Data, backups & undo", `
       <p>Everything lives in one file: <code>GrantsApp/data/grants.db</code>. Older actuals were imported from scanned Workday DBRs; new actuals come from the ⇅ Workday panel.</p>
       <p><strong>Automatic backups.</strong> Every time the app starts, it saves a dated copy of your data into <code>GrantsApp/data/backups/</code> (one per day, kept for 30 days). You don't have to do anything. Under <strong>⚙ Settings → Backups &amp; data safety</strong> you can also <em>Download backup now</em> — do that before anything risky, and keep the file somewhere other than OneDrive. The same panel restores from a backup file if you ever need to roll back.</p>
       <p><strong>Undo.</strong> Deleting a grant, person, appointment, or expense no longer loses it immediately — it goes to <strong>⚙ Settings → 🗑 Recently deleted</strong> for 30 days. Restoring a grant brings back its expenses, budget lines, and appointments too. After 30 days it's cleared for good, so if a deletion was a mistake, restore it sooner rather than later.</p>
-      <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>⚠️ Important — OneDrive and this app.</strong> This folder is synced by OneDrive, which is great for having your data on other devices, but there's one real risk to know about: <strong>never run Grants Manager on two computers at the same time</strong>, and let OneDrive finish syncing (its icon stops spinning) before you open the app on a different machine. Databases don't merge like documents — if two copies are open at once, OneDrive can't combine them and will either overwrite one or leave a file named something like <em>"grants-DESKTOP-ABC123.db"</em> next to the real one. If you ever see a "conflicted copy" file appear, don't delete it: it may hold work that's missing from the main file — check both, or restore from a backup in ⚙ Settings. For the same reason, don't edit from your phone and your Mac simultaneously.</p>`)}
+      <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>⚠️ Important — OneDrive and this app.</strong> This folder is synced by OneDrive, which is great for having your data on other devices, but there's one real risk to know about: <strong>never run Grants Manager on two computers at the same time</strong>, and let OneDrive finish syncing (its icon stops spinning) before you open the app on a different machine. Databases don't merge like documents — if two copies are open at once, OneDrive can't combine them and will either overwrite one or leave a file named something like <em>"grants-DESKTOP-ABC123.db"</em> next to the real one. If you ever see a "conflicted copy" file appear, don't delete it: it may hold work that's missing from the main file — check both, or restore from a backup in ⚙ Settings. For the same reason, don't edit from your phone and your Mac simultaneously.</p>
+      ${demo('backups-undo', '⚙ Settings holds the backup download and the 30-day Recently deleted list.')}
+    `)}
   `;
 }
 
@@ -1763,7 +1977,7 @@ async function reportModal(month) {
   modal(`
     <h2>📧 Expense report — ${esc(d.label)}</h2>
     <p class="sub" style="margin-bottom:12px">${d.rows.length} expense${d.rows.length === 1 ? "" : "s"} · <strong>${money2(d.total)}</strong>.
-      This goes to <strong>you</strong> — check it, then forward to your accountant. The email includes a table like the one below plus a CSV in Workday's column order${d.rows.some((r) => r.Receipt) ? ", and a zip of the receipts" : ""}.</p>
+      This goes to <strong>you</strong> — check it, then forward to your accountant. The email itself is one line; this table arrives as an attached <strong>Excel workbook</strong>${d.rows.some((r) => r.Receipt) ? ", with each receipt attached under the name shown in its Receipt column" : ""}.</p>
     ${d.missing_receipts ? `<p class="sub" style="background:var(--amber-soft);color:var(--amber);padding:9px 12px;border-radius:8px;margin-bottom:12px"><strong>${d.missing_receipts}</strong> hand-entered expense${d.missing_receipts === 1 ? "" : "s"} ${d.missing_receipts === 1 ? "has" : "have"} no receipt attached.</p>` : ""}
     ${rowsHtml}
     ${d.changes.length ? `<p class="sub" style="margin:12px 0 4px"><strong>${d.changes.length}</strong> change${d.changes.length === 1 ? "" : "s"} made in the app this month will be listed too, so you can verify them.</p>` : ""}
@@ -2034,6 +2248,18 @@ function range(n) { return Array.from({ length: n }, (_, i) => i + 1); }
 function wireUp(m) {
   // navigation
   $$("[data-goto-grant]", m).forEach((el) => el.onclick = () => { view = { name: "grant", grantId: +el.dataset.gotoGrant }; render(); });
+
+  // ✕ on an alert. It sits inside the alert, which is itself a link to the
+  // grant, so the click must stop there or dismissing would navigate away.
+  $$("[data-dismiss-alert]", m).forEach((btn) => btn.onclick = (ev) => {
+    ev.stopPropagation();
+    ev.preventDefault();
+    dismissAlert(btn.dataset.dismissAlert);
+    const box = btn.closest(".alert");
+    const wrap = box.parentElement;
+    box.remove();
+    if (!$(".alert", wrap)) wrap.remove();   // drop the empty container's gap
+  });
   $$("[data-goto-dash]", m).forEach((el) => el.onclick = () => { view = { name: "dashboard" }; render(); });
 
   // dashboard quick add
@@ -2266,6 +2492,33 @@ function fileToPayload(f) {
   });
 }
 
+/* The one question a P-card purchase still has to answer at entry time.
+
+   The cardholder and the name on the card come from Settings, and the reason
+   for the purchase is already the expense's own description — so all that is
+   left to ask is who actually made the purchase, when that was not the
+   cardholder. `k` prefixes the ids so the dashboard form and the edit form
+   can both use this without colliding. */
+function pcardFields(k, v) {
+  v = v || {};
+  return `
+    <label class="field ${k}-pcard-field" style="width:170px;display:none"><span>Purchased by</span>
+      <input id="${k}-pcard-buyer" value="${esc(v.pcard_buyer || "")}" placeholder="if not the cardholder"></label>`;
+}
+
+/* Show/hide the field with the tick, and read it back. */
+function wirePcardFields(k, m) {
+  const box = $(`#${k}-pcard`, m);
+  if (!box) return () => ({ pcard: 0 });
+  const sync = () => $$(`.${k}-pcard-field`, m).forEach(
+    (el) => el.style.display = box.checked ? "" : "none");
+  box.onchange = sync;
+  sync();
+  return () => box.checked
+    ? { pcard: 1, pcard_buyer: $(`#${k}-pcard-buyer`, m).value.trim() }
+    : { pcard: 0, pcard_buyer: "" };
+}
+
 function wireQuickAdd(m) {
   const gSel = $("#q-grant", m), cSel = $("#q-cat", m);
   if (!gSel.options.length) return;
@@ -2294,6 +2547,7 @@ function wireQuickAdd(m) {
   splitOn.onchange = () => $$(".q-split-field", m).forEach((el) => {
     el.style.display = splitOn.checked ? "" : "none";
   });
+  const readPcard = wirePcardFields("q", m);
   // picking a split grant prefills its Cost Center / Worktag (still editable)
   $("#q-split-grant", m).onchange = () => {
     const gid = +$("#q-split-grant", m).value;
@@ -2322,6 +2576,7 @@ function wireQuickAdd(m) {
       // never joins the "to enter in Workday" list. Ticked (the default)
       // leaves it blank, so it queues up like any other.
       wd_entry: wdBox.checked ? "" : "na",
+      ...readPcard(),
     };
     // capture everything before the awaits — saving re-renders the form
     const splitG = splitOn.checked ? +$("#q-split-grant", m).value : 0;
@@ -2698,11 +2953,14 @@ function expenseModal(e, grantId) {
     <label class="field"><span>Receipt</span>
       <div class="dropzone ${e?.receipt_path ? "has-file" : ""}" id="m-drop">${e?.receipt_path ? "✓ receipt attached (drop to replace)" : "📎 Drop receipt here or click to choose"}</div>
       <input type="file" id="m-file" hidden></label>
+    <label style="display:flex;align-items:center;gap:7px;font-size:13.5px;cursor:pointer;margin:4px 0 2px"><input type="checkbox" id="m-pcard" style="width:auto" ${e?.pcard ? "checked" : ""}>💳 Bought on a P-card</label>
+    <div class="form-row" style="align-items:flex-end">${pcardFields("m", e || {})}</div>
     <div class="actions">
       <button class="btn secondary" id="m-cancel">Cancel</button>
       <button class="btn" id="m-save">${e ? "Save" : "Add"}</button>
     </div>`, (el, close) => {
     fillCatSelect($("#m-cat", el), grantId, e?.category_id);
+    const readPcard = wirePcardFields("m", el);
     let file = null;
     wireDropzone($("#m-drop", el), $("#m-file", el), (f) => file = f);
     // auto-pick budget year from date
@@ -2719,6 +2977,7 @@ function expenseModal(e, grantId) {
         year: +$("#m-year", el).value, date: dateVal,
         amount, description: $("#m-desc", el).value,
         person_id: $("#m-person", el).value ? +$("#m-person", el).value : null,
+        ...readPcard(),
       };
       const receipt = file ? await fileToPayload(file) : null;
       const splitG = !e && $("#m-split-grant", el) ? +$("#m-split-grant", el).value : 0;

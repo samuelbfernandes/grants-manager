@@ -61,7 +61,11 @@ body {
 
 /* ---------- layout ---------- */
 .topbar {
-  display: flex; align-items: center; gap: 24px;
+  /* The bar needs ~1300px to lay out in one line, and the mobile rules below
+     only start at 760 — so every window between the two (a 1280 laptop, or
+     anything half-screen) got a horizontally scrolling page. Wrapping and a
+     smaller gap keep it inside the window at any width. */
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px 18px;
   padding: 14px 28px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
@@ -77,7 +81,7 @@ body {
   display: inline-flex; align-items: center; justify-content: center;
   color: #fff; font-size: 14px;
 }
-nav { display: flex; gap: 4px; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
 nav button {
   border: 0; background: none; padding: 8px 14px; border-radius: 9px;
   font-size: 14px; font-weight: 500; color: var(--muted); cursor: pointer;
@@ -150,6 +154,17 @@ body.dark .bar.availback .spentfill { background: #3d4a63; }
 }
 .alert.amber { background: var(--amber-soft); color: #8a5c06; border-color: #f3e1b8; }
 .alert.red { background: var(--red-soft); color: #a33333; border-color: #f5cccc; }
+.alert > span { flex: 1; }
+/* ✕ to hide a warning you have read. Inherits the alert's colour so it reads
+   as part of it, and sits at a full 26px so it is hittable on a phone. */
+.alert-x {
+  flex: none; width: 26px; height: 26px; padding: 0; margin: -4px -6px -4px 0;
+  border: 0; border-radius: 7px; background: transparent; cursor: pointer;
+  color: inherit; opacity: .5; font-size: 13px; line-height: 1;
+}
+.alert-x:hover { opacity: 1; background: rgba(0, 0, 0, .09); }
+.alert-x:focus-visible { opacity: 1; outline: 2px solid currentColor; }
+@media print { .alert-x { display: none; } }
 
 /* ---------- stat strip ---------- */
 .stats { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
@@ -266,7 +281,7 @@ a.receipt-link:hover { text-decoration: underline; }
 .notes-block { white-space: pre-wrap; background: var(--bg); border-radius: 10px; padding: 12px 14px; font-size: 13px; color: var(--muted); }
 
 /* ---------- global search ---------- */
-.searchbox { position: relative; }
+.searchbox { position: relative; flex: 0 1 auto; min-width: 0; }
 .searchbox input { width: 190px; padding: 7px 11px 7px 30px; border-radius: 9px; font-size: 13px; }
 .searchbox .mag { position: absolute; left: 9px; top: 7px; color: var(--muted); font-size: 13px; pointer-events: none; }
 .search-results {
@@ -299,8 +314,12 @@ a.receipt-link:hover { text-decoration: underline; }
   main { padding: 14px 12px 60px; }
   h1 { font-size: 20px; }
   .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
-  .stats { flex-direction: column; gap: 8px; }
-  .stat { min-width: 0; }
+  /* Two by two, not one per row: the KPI tiles now lead the dashboard, and
+     stacking all four pushed the alerts and grant cards off a phone screen. */
+  .stats { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+  .stat { flex: 1 1 calc(50% - 12px); min-width: 0; padding: 11px 13px; }
+  .stat .label { font-size: 10.5px; letter-spacing: .3px; }
+  .stat .value { font-size: 18px; }
   .card { padding: 14px; overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .quick { gap: 8px; }
   .quick .amt, .quick .gsel, .quick .csel, .quick .dt, .quick .desc { width: 100%; flex: 1 1 100%; }
@@ -376,3 +395,59 @@ body.dark .notif-panel { box-shadow: 0 12px 32px rgba(0,0,0,.5); }
   .card { box-shadow: none; break-inside: avoid; }
   main { padding: 0; max-width: none; }
 }
+
+/* collapsed-by-default settings: the panel should open on what everyone
+   needs, not on the two fields only a Workday report writer will ever use */
+details.advanced {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+details.advanced > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted);
+  list-style: none;
+  padding: 4px 0;
+  user-select: none;
+}
+details.advanced > summary::-webkit-details-marker { display: none; }
+details.advanced > summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 1em;
+  transition: transform .15s ease;
+}
+details.advanced[open] > summary::before { transform: rotate(90deg); }
+details.advanced > summary:hover { color: var(--text); }
+
+/* ---------- Instructions walkthrough clips ---------- */
+/* Still frame + Play badge; the animation is only fetched on click, so a page
+   with a dozen clips costs one image each and animates none of them. */
+.demo { margin: 12px 0 4px; }
+.demo-play {
+  /* full column width: these are screenshots of a whole desktop window, and
+     squeezing one into a 620px box made the labels in it unreadable */
+  display: block; position: relative; width: 100%;
+  padding: 0; border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; background: var(--surface); cursor: pointer;
+  box-shadow: var(--shadow); line-height: 0;
+}
+.demo-play:hover { border-color: var(--accent); }
+.demo-play img { display: block; width: 100%; height: auto; }
+.demo-badge {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  background: rgba(16, 24, 40, .82); color: #fff; font-size: 13px;
+  font-weight: 600; padding: 8px 15px; border-radius: 999px;
+  line-height: 1.2; white-space: nowrap; letter-spacing: .2px;
+}
+.demo-play.playing .demo-badge {
+  left: auto; top: auto; right: 8px; bottom: 8px; transform: none;
+  font-size: 11.5px; padding: 5px 10px; opacity: .78;
+}
+.demo figcaption {
+  font-size: 12.5px; color: var(--muted); margin-top: 6px; line-height: 1.45;
+}
+.demo-fake { opacity: .75; font-style: italic; }
+@media print { .demo { display: none; } }

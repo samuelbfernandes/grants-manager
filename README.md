@@ -71,13 +71,18 @@ way to use it is: **download a report from Workday, import the file here.**
 8. First time only: match Workday's grant codes and object classes to your
    grants and categories. It won't ask again.
 
+If a file can't be read, the app says what it actually was — a PDF, the older
+`.xls` format, a CSV — and nothing is imported until one reads cleanly. The
+⇅ Workday panel also offers an **example workbook** with fake data in exactly
+the columns expected, to compare your export against.
+
 Repeat whenever you want fresh numbers. Re-importing never creates
 duplicates.
 
 ### Connecting directly (optional, advanced)
 
 Workday can serve a report at a private URL that the app pulls automatically,
-configured under **⚙ Settings → Direct connection (RaaS)**. This needs
+configured under **⚙ Settings → Advanced → Direct connection (RaaS)**. This needs
 permissions ordinary faculty accounts usually don't have — rights to create
 custom reports (*Report Writer*), rights to tick **Enable As Web Service**,
 and an account that accepts a username and password rather than SSO-only
@@ -85,6 +90,28 @@ and an account that accepts a username and password rather than SSO-only
 SSO and MFA). The Instructions tab in the app lists the exact access levels to
 ask for. **If it doesn't work, nothing is wrong** — the import steps above
 give you the same numbers.
+
+---
+
+## The monthly expense report
+
+At the start of each month the app offers to email you last month's expenses —
+and you can send one any time from **⚙ Settings → Send a report now**. It goes
+to *you*, not to your accountant: you check it, then forward it.
+
+The email itself is one line. Attached is an **Excel workbook** with a row per
+expense (Date, Amount, Spend Category, Business Purpose, Grant/Worktag, Award,
+Cost Center, Fund, Person, Receipt) and, for anything bought on a purchasing
+card, the cardholder details reconciliation asks for. **Each receipt is
+attached separately, named exactly as the workbook's Receipt column names it**,
+so a row can be matched to its file by eye.
+
+Tick **💳 P-card** when you add a card purchase and it carries those details
+automatically; set the cardholder once under **⚙ Settings → 💳 P-card**.
+
+Sending uses **Microsoft Outlook** on Mac or Windows, which is what lets the
+receipts ride along as attachments. On a Mac the first send asks permission
+for Grants Manager to control Outlook — click OK once.
 
 ---
 
