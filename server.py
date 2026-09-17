@@ -1970,7 +1970,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -3146,8 +3146,13 @@ There is nothing else to install: the app uses only what ships with Python.
 
 ## Install & run
 
-1. Unzip this folder anywhere (Documents, OneDrive, Desktop...). Keep the
-   folder together — your database will live inside it.
+1. **Extract the zip to a real folder first.** On Windows, right-click
+   `GrantsManager.zip` — **Extract All...**; on Mac, double-click the zip.
+   Do NOT run the starter straight from inside the zip preview — Windows
+   runs it from a temporary place where the app files aren't, and it fails
+   with a "server.py: No such file" error. Put the extracted folder anywhere
+   (Documents, OneDrive, Desktop...) and keep it together — your database
+   lives inside it.
 2. Start the app:
    - **Mac**: double-click **Start Grants Manager (Mac).command**.
    - **Windows**: double-click **Start Grants Manager (Windows).bat**.
@@ -3245,28 +3250,70 @@ backup from the Settings panel.
 - **Stop the app** — close the terminal window.
 """
 
-WIN_BAT = ("@echo off\r\n"
-           "cd /d \"%~dp0\"\r\n"
-           "py -3 server.py --launch\r\n"
-           "if %errorlevel%==0 goto :eof\r\n"
-           "python server.py --launch\r\n"
-           "if %errorlevel%==0 goto :eof\r\n"
-           "echo.\r\n"
-           "echo   Couldn't start Python - see any error above this message.\r\n"
-           "echo.\r\n"
-           "echo   If Python isn't installed yet, that's a free, one-time\r\n"
-           "echo   install - no admin rights needed. Opening the Microsoft\r\n"
-           "echo   Store: click \"Get\", wait for it to finish, then\r\n"
-           "echo   double-click this file again.\r\n"
-           "echo.\r\n"
-           "echo   If Python IS already installed and you still see this,\r\n"
-           "echo   email samuelbf@uark.edu with a screenshot of this window.\r\n"
-           "echo.\r\n"
-           "start \"\" \"ms-windows-store://search/?query=Python 3\"\r\n"
-           "pause\r\n")
+WIN_BAT = "\r\n".join([
+    "@echo off",
+    "setlocal",
+    'cd /d "%~dp0"',
+    "",
+    "rem If server.py isn't beside us, this was launched from INSIDE the .zip.",
+    'if not exist "server.py" goto notextracted',
+    "",
+    "rem Find a working Python 3 without tripping the Store alias.",
+    'set "PY="',
+    'py -3 --version >nul 2>&1 && set "PY=py -3"',
+    'if not defined PY ( python --version >nul 2>&1 && set "PY=python" )',
+    'if not defined PY ( python3 --version >nul 2>&1 && set "PY=python3" )',
+    "if not defined PY goto nopython",
+    "",
+    "%PY% server.py --launch",
+    "if %errorlevel%==0 goto :eof",
+    "goto startfailed",
+    "",
+    ":notextracted",
+    "echo.",
+    "echo   It looks like you opened this from INSIDE the .zip file.",
+    "echo   Windows cannot run the app from there.",
+    "echo.",
+    "echo   Do this instead:",
+    "echo     1. Close this window.",
+    'echo     2. Right-click GrantsManager.zip and choose "Extract All...".',
+    "echo     3. Open the extracted folder.",
+    "echo     4. Double-click this file again.",
+    "echo.",
+    "pause",
+    "goto :eof",
+    "",
+    ":nopython",
+    "echo.",
+    "echo   Python 3 isn't installed yet. It's a free, one-time install -",
+    "echo   no admin rights needed. Opening the Microsoft Store: click",
+    'echo   "Get", wait for it to finish, then double-click this file again.',
+    "echo.",
+    'start "" "ms-windows-store://search/?query=Python 3"',
+    "pause",
+    "goto :eof",
+    "",
+    ":startfailed",
+    "echo.",
+    "echo   Python is installed, but the app did not start - see the error",
+    "echo   above. If it mentions a missing file, make sure you EXTRACTED the",
+    "echo   whole folder rather than running from inside the .zip.",
+    "echo   Still stuck? Email samuelbf@uark.edu with a screenshot.",
+    "echo.",
+    "pause",
+]) + "\r\n"
 
 MAC_COMMAND = ("#!/bin/bash\n"
                "cd \"$(dirname \"$0\")\"\n"
+               "if [ ! -f server.py ]; then\n"
+               "  echo\n"
+               "  echo \"  This looks like it was opened from inside the .zip.\"\n"
+               "  echo \"  Double-click GrantsManager.zip to extract it first,\"\n"
+               "  echo \"  open the extracted folder, then double-click this again.\"\n"
+               "  echo\n"
+               "  read -n 1 -s -r -p \"Press any key to close...\"\n"
+               "  echo; exit 1\n"
+               "fi\n"
                "python3 server.py --launch\n"
                "if [ $? -eq 0 ]; then exit; fi\n"
                "echo\n"

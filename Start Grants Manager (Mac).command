@@ -1,5 +1,14 @@
 #!/bin/bash
 cd "$(dirname "$0")"
+if [ ! -f server.py ]; then
+  echo
+  echo "  This looks like it was opened from inside the .zip."
+  echo "  Double-click GrantsManager.zip to extract it first,"
+  echo "  open the extracted folder, then double-click this again."
+  echo
+  read -n 1 -s -r -p "Press any key to close..."
+  echo; exit 1
+fi
 python3 server.py --launch
 if [ $? -eq 0 ]; then exit; fi
 echo
