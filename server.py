@@ -13,6 +13,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import sys
@@ -42,6 +43,7 @@ TRASH_RETENTION_DAYS = 30
 # restoring a backup can't hand someone an old key.
 ACCESS_KEY_PATH = os.path.join(DATA_DIR, "access_key.txt")
 ACCESS_KEY = None
+SERVER = None   # the running ThreadingHTTPServer, for graceful self-shutdown
 
 
 def _load_key(path):
@@ -2016,7 +2018,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -2382,6 +2384,12 @@ class Handler(BaseHTTPRequestHandler):
             body = f.read()
         self.send_response(200)
         self.send_header("Content-Type", ctypes.get(ext, "application/octet-stream"))
+        # The app's own code (HTML/JS/CSS) must never be served stale, or after
+        # someone unzips a new version their browser keeps showing the old UI
+        # from cache until a manual hard-refresh. Force a re-fetch for these;
+        # images and receipts can still cache normally.
+        if ext in (".html", ".js", ".css"):
+            self.send_header("Cache-Control", "no-store, must-revalidate")
         if download_name:
             self.send_header("Content-Disposition",
                              f'attachment; filename="{download_name}"')
@@ -2398,7 +2406,11 @@ class Handler(BaseHTTPRequestHandler):
         # second launch can tell "Grants Manager is already running here" from
         # "some unrelated program owns this port" without needing the key.
         if path == "/api/ping":
-            self.send_json({"app": "grants-manager"})
+            out = {"app": "grants-manager", "version": APP_VERSION}
+            if self.is_local():   # only a program on THIS machine gets these
+                out["dir"] = BASE_DIR
+                out["pid"] = os.getpid()
+            self.send_json(out)
             return
         if not self.check_access():
             return
@@ -2854,6 +2866,17 @@ class Handler(BaseHTTPRequestHandler):
                     "WHERE id=? AND status='pending'", (int(m.group(1)),))
                 conn.commit()
                 self.send_json({"ok": True})
+                return
+            if path == "/api/shutdown":
+                # Used by a newer copy taking over the port. Loopback only —
+                # a program already on this machine could stop us anyway; the
+                # CSRF gate above already blocks any web page from reaching it.
+                if not self.is_local():
+                    self.send_json({"error": "not found"}, 404)
+                    return
+                self.send_json({"ok": True})
+                if SERVER is not None:
+                    threading.Thread(target=SERVER.shutdown, daemon=True).start()
                 return
             if path == "/api/export_clean":
                 self.send_json({"path": make_clean_copy()})
@@ -3426,17 +3449,97 @@ def port_in_use(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def is_our_server(port):
-    """True only if the thing listening on `port` is actually Grants Manager
-    (not some unrelated process a user happens to have running there)."""
+def our_server_info(port):
+    """Ask whatever is on `port` to identify itself. Returns the ping dict
+    (app/version/dir/pid) if it's Grants Manager, else None."""
     import urllib.request
     try:
         with urllib.request.urlopen(
                 f"http://127.0.0.1:{port}/api/ping", timeout=1.5) as resp:
             data = json.loads(resp.read())
-        return isinstance(data, dict) and data.get("app") == "grants-manager"
+        if isinstance(data, dict) and data.get("app") == "grants-manager":
+            return data
     except Exception:  # noqa: BLE001 — any failure means "not us"
-        return False
+        pass
+    return None
+
+
+def is_our_server(port):
+    return our_server_info(port) is not None
+
+
+def _pids_on_port(port):
+    """PIDs listening on `port`, via lsof (mac/linux) or netstat (windows).
+    Best-effort; returns [] if the tools aren't available."""
+    import subprocess
+    pids = set()
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["netstat", "-ano", "-p", "tcp"],
+                                 capture_output=True, text=True, timeout=8).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and parts[3].upper() == "LISTENING" \
+                        and parts[1].endswith(":%d" % port):
+                    if parts[-1].isdigit():
+                        pids.add(int(parts[-1]))
+        else:
+            out = subprocess.run(["lsof", "-ti", "tcp:%d" % port,
+                                  "-sTCP:LISTEN"], capture_output=True,
+                                 text=True, timeout=8).stdout
+            pids.update(int(x) for x in out.split() if x.isdigit())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    pids.discard(os.getpid())
+    return list(pids)
+
+
+def _kill_pid(pid):
+    import subprocess
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=8)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def takeover_port(port):
+    """Free `port` from an existing Grants Manager instance so this (newer)
+    copy can run the current code. Ask it to quit gracefully first; if it's an
+    older build that can't, or it doesn't let go, kill the process on the port.
+    Returns True if the port is free afterwards."""
+    import urllib.request
+    info = our_server_info(port) or {}
+    # 1. graceful: newer builds honour /api/shutdown
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:%d/api/shutdown" % port, data=b"{}",
+            headers={"Content-Type": "application/json", "X-Grants-App": "1"},
+            method="POST")
+        urllib.request.urlopen(req, timeout=3).read()
+    except Exception:  # noqa: BLE001 — older build or already gone
+        pass
+    if _wait_port_free(port, 4):
+        return True
+    # 2. force: kill the process holding the port (we've confirmed it's ours)
+    pids = _pids_on_port(port)
+    if info.get("pid") and info["pid"] not in pids:
+        pids.append(info["pid"])
+    for pid in pids:
+        _kill_pid(pid)
+    return _wait_port_free(port, 5)
+
+
+def _wait_port_free(port, seconds):
+    end = time.time() + seconds
+    while time.time() < end:
+        if not port_in_use(port):
+            return True
+        time.sleep(0.25)
+    return not port_in_use(port)
 
 
 def find_free_port(start, tries=50):
@@ -3461,17 +3564,29 @@ def main():
     global PORT
     launch = "--launch" in sys.argv
     if port_in_use(PORT):
-        if is_our_server(PORT):
-            url = f"http://127.0.0.1:{PORT}"
-            if launch:
-                webbrowser.open(url)
+        info = our_server_info(PORT)
+        if info is not None:
+            same_install = (info.get("dir") == BASE_DIR
+                            and info.get("version") == APP_VERSION)
+            if same_install:
+                # this exact copy is already running — just show it
+                url = f"http://127.0.0.1:{PORT}"
+                if launch:
+                    webbrowser.open(url)
+                    return
+                print(f"Already running at {url}")
                 return
-            print(f"Already running at {url}")
-            return
-        # Something else — unrelated to this app — is using our usual port.
-        # Never silently open the browser to a stranger's server; find our
-        # own free port instead.
-        PORT = find_free_port(PORT + 1)
+            # A different or older copy is running. The user opened THIS one to
+            # use it, so take the port over and run the current code.
+            print("A different Grants Manager is running on port %d — "
+                  "switching to this version..." % PORT)
+            if not takeover_port(PORT):
+                # couldn't free it; run beside it rather than not at all
+                PORT = find_free_port(PORT + 1)
+        else:
+            # Something unrelated owns the port. Never open the browser to a
+            # stranger's server; use our own free port instead.
+            PORT = find_free_port(PORT + 1)
     url = f"http://127.0.0.1:{PORT}"
     try:
         init_db()
@@ -3516,7 +3631,9 @@ def main():
         pass
     load_access_key()
     # bind all interfaces so the app is reachable from a phone on the same Wi-Fi
+    global SERVER
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    SERVER = server
     print(f"Grants Manager running at {url}  (Ctrl+C to stop)")
     ip = lan_ip()
     if ip:

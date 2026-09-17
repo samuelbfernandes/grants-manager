@@ -1396,8 +1396,11 @@ async function settingsModal() {
             `<option value="${g.id}" ${i === 0 ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select></label>
         <div id="wt-panel"></div>` : `<div class="empty">No active grants yet.</div>`}
     </details>
+    <p class="sub" style="text-align:center;margin:18px 0 -6px;font-size:12px;opacity:.7">Grants Manager v${esc(S.version || "?")}${(S.update && S.update.available) ? ` — <a href="#" id="set-update" style="color:var(--accent)">a newer version is available</a>` : " — up to date"}</p>
     <div class="actions"><button class="btn secondary" id="m-cancel">Close</button></div>
   `, (el, close) => {
+    const up = $("#set-update", el);
+    if (up) up.onclick = (e) => { e.preventDefault(); close(); if (typeof notifPanel === "function") notifPanel(); };
     $("#m-cancel", el).onclick = close;
     const restoreInput = $("#restore-file-input", el);
     $("#btn-pick-restore", el).onclick = () => restoreInput.click();
