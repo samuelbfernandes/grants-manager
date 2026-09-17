@@ -367,18 +367,6 @@ function renderDashboard() {
 
     ${firstRunCard()}
 
-    ${active.length ? `<div class="stats" style="margin-bottom:18px">
-      <div class="stat"><div class="label">Available (all active)</div><div class="value">${money(totalAvail)}</div></div>
-      <div class="stat"><div class="label">Total awarded (active)</div><div class="value">${money(totalAward)}</div></div>
-      <div class="stat"><div class="label">Spent this year</div><div class="value">${money(ytd)}</div></div>
-      <div class="stat"><div class="label">People funded</div><div class="value">${S.people.length}</div></div>
-    </div>` : ""}
-
-    ${alerts.length ? `<div class="alerts">${alerts.map((a) =>
-      `<div class="alert ${a.level}" data-goto-grant="${a.grantId}">⚠️ <span>${esc(a.text)}</span>
-        <button class="alert-x" data-dismiss-alert="${esc(a.id)}" title="Hide until you next open Grants Manager" aria-label="Hide this warning">✕</button>
-      </div>`).join("")}</div>` : ""}
-
     ${!active.length ? "" : `<div class="card no-print">
       <h2>Quick add expense</h2>
       <div class="quick">
@@ -405,6 +393,11 @@ function renderDashboard() {
       </div>
     </div>`}
 
+    ${alerts.length ? `<div class="alerts">${alerts.map((a) =>
+      `<div class="alert ${a.level}" data-goto-grant="${a.grantId}">⚠️ <span>${esc(a.text)}</span>
+        <button class="alert-x" data-dismiss-alert="${esc(a.id)}" title="Hide until you next open Grants Manager" aria-label="Hide this warning">✕</button>
+      </div>`).join("")}</div>` : ""}
+
     ${wdDashCards()}
 
     <div class="grid cols-3">
@@ -416,6 +409,13 @@ function renderDashboard() {
         <h2>Spending by month — all grants</h2>
         <div class="chart-wrap" style="height:210px"><canvas id="dash-month-chart"></canvas></div>
       </div>` : ""}
+
+    ${active.length ? `<div class="stats" style="margin-top:22px">
+      <div class="stat"><div class="label">Available (all active)</div><div class="value">${money(totalAvail)}</div></div>
+      <div class="stat"><div class="label">Total awarded (active)</div><div class="value">${money(totalAward)}</div></div>
+      <div class="stat"><div class="label">Spent this year</div><div class="value">${money(ytd)}</div></div>
+      <div class="stat"><div class="label">People funded</div><div class="value">${S.people.length}</div></div>
+    </div>` : ""}
 
     ${closed.length ? `
       <div class="section-head" style="margin-top:8px">
@@ -1461,6 +1461,20 @@ async function settingsModal() {
 }
 
 /* dashboard cards: unmapped-code prompts + the to-enter queue */
+/* Workday writes worker names "Last, First Middle"; flip that to the natural
+   order for the person we create. Only touches a single leading comma, so a
+   name that is already natural (or oddly punctuated) is left as-is — and the
+   worker->person map bridges any remaining spelling gap anyway. */
+function nameFromWorker(w) {
+  const s = String(w || "").trim();
+  const i = s.indexOf(",");
+  if (i > 0 && s.indexOf(",", i + 1) === -1) {
+    const last = s.slice(0, i).trim(), rest = s.slice(i + 1).trim();
+    if (last && rest) return `${rest} ${last}`;
+  }
+  return s;
+}
+
 function wdDashCards() {
   if (!WD) return "";
   const gById = (id) => S.grants.find((g) => g.id === id);
@@ -1485,6 +1499,24 @@ function wdDashCards() {
           <label class="field"><span>Workday object class</span>
             <div style="font-size:12px">${esc(wdShortOC(oc))}</div></label>
           <label class="field"><span>→ maps to</span><select data-wd-map-cat="${esc(oc)}">${catOpts()}</select></label>
+        </div>`).join("")}
+    </div>`;
+  }
+  if ((WD.unmatched_workers || []).length) {
+    html += `<div class="card" style="border-left:4px solid #b97a08">
+      <h2>👥 Match people from Workday payroll</h2>
+      <p class="sub" style="margin-bottom:10px">These names appear on salary or fringe charges in your import but don't match anyone in <strong>People</strong> yet — so those charges have a dollar amount but no person attached. Tell the app who each one is and it links their charges (past and future). <strong>Add</strong> also creates the person, ready for you to give them an appointment on the <strong>People</strong> tab for salary projections.</p>
+      ${WD.unmatched_workers.map((w) => `
+        <div class="form-row" style="align-items:center">
+          <label class="field"><span>Workday worker</span>
+            <div style="font-size:12px">${esc(w.worker)} <span style="color:var(--muted)">· ${w.lines} charge${w.lines === 1 ? "" : "s"}${w.amount ? `, ${money2(w.amount)}` : ""}</span></div></label>
+          <label class="field"><span>→ who is this?</span>
+            <select data-wd-map-worker="${esc(w.worker)}" data-wd-worker-name="${esc(nameFromWorker(w.worker))}">
+              <option value="">— pick —</option>
+              <option value="add">➕ Add “${esc(nameFromWorker(w.worker))}” as a new person</option>
+              ${S.people.map((p) => `<option value="${p.id}">This is ${esc(p.name)}</option>`).join("")}
+              <option value="ignore">Not a person / already handled</option>
+            </select></label>
         </div>`).join("")}
     </div>`;
   }
@@ -1570,6 +1602,25 @@ function wireWorkdayBits(m) {
   };
   $$("[data-wd-map-grant]", m).forEach((sel) => sel.onchange = () => saveMap("grant", sel.dataset.wdMapGrant, sel.value));
   $$("[data-wd-map-cat]", m).forEach((sel) => sel.onchange = () => saveMap("category", sel.dataset.wdMapCat, sel.value));
+  $$("[data-wd-map-worker]", m).forEach((sel) => sel.onchange = async () => {
+    const key = sel.dataset.wdMapWorker, val = sel.value;
+    if (!val) return;
+    try {
+      if (val === "add") {
+        const name = sel.dataset.wdWorkerName || key;
+        const r = await api("/api/people", "POST", { name, role: "Other" });
+        await api("/api/workday/map", "POST", { kind: "worker", wd_key: key, target_id: r.id });
+        toast(`Added ${name} and linked their charges`);
+      } else if (val === "ignore") {
+        await api("/api/workday/map", "POST", { kind: "worker", wd_key: key, target_id: null });
+        toast("Won't ask about this name again");
+      } else {
+        await api("/api/workday/map", "POST", { kind: "worker", wd_key: key, target_id: +val });
+        toast("Linked their charges");
+      }
+      await wdRefresh();
+    } catch (e) { toast("Couldn't save: " + e.message); }
+  });
   $$("[data-wd-entry]", m).forEach((sel) => sel.onchange = async () => {
     await api(`/api/expenses/${sel.dataset.wdEntry}`, "POST", { wd_entry: sel.value });
     toast(sel.value === "na" ? "Hidden — doesn't go to Workday" : "Status saved");
@@ -1642,6 +1693,8 @@ function renderInstructions() {
     `)}
 
     ${sec("👥 People & projections", `
+      <p><strong>How to add a person.</strong> Open the <strong>People</strong> tab (top bar) and click <strong>+ Add person</strong>. Type their <strong>name</strong> and pick a <strong>role</strong> — that alone is enough to create them. The same box then offers optional <strong>funding</strong>: their total yearly salary, fringe %, start and end dates, and which grant (or two) pays, with a % each. Fill that in and the app creates their <strong>appointment(s)</strong> for you; leave it blank and you can add appointments later. Click <strong>Add</strong>.</p>
+      <p><strong>Names must match Workday.</strong> When you import a Workday payroll file, the app links each salary charge to a person by matching the <em>Worker</em> name. If a name on the import doesn't match anyone yet, the dashboard shows a <strong>“👥 Match people from Workday payroll”</strong> card — pick <strong>Add</strong> to create that person (their charges link automatically, past and future), pick an existing person if it's just a spelling difference, or <strong>Not a person</strong> to dismiss it. You never have to type these names yourself; the card is the quickest way to build your People list.</p>
       <p>Each person can have <strong>appointments</strong>: grant + monthly salary + fringe % + annual tuition + start/end dates (the length). These drive all projections — the app counts months not yet charged (starting after the person's last real paycheck on that grant) through the appointment or grant end, whichever comes first.</p>
       <p><strong>Splitting a person across grants:</strong> when you add a person, the form lets you enter their total salary and pick which grant pays — and optionally a second source with a percentage for each. A person paid from two sources shows <em>two rows</em> in their table, one per grant, with a <strong>%</strong> column (e.g., a postdoc paid 50% by one grant + 50% by “Other”). Pick <strong>“Other”</strong> as the source for salary shares paid outside your grants (department, college, another PI) — it appears on the People tab but never counts against your budgets.</p>
       <p>The <strong>auto-generate monthly charges</strong> switch on an appointment makes the <strong>↻ Update Salaries</strong> button (top bar) create the actual monthly salary + fringe expenses, prorated and never duplicated. Leave it OFF if your actual numbers come from DBR imports — projections work either way.</p>

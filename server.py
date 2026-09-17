@@ -1151,6 +1151,11 @@ def wd_match(conn):
         "SELECT id, name FROM categories")}
     people = {r["name"].strip().lower(): r["id"] for r in conn.execute(
         "SELECT id, name FROM people")}
+    # Workers whose Workday name doesn't match a person by name, but that the
+    # user has since resolved: mapped to a person id, or to NULL meaning
+    # "not a person / already handled — stop asking".
+    wmap = {r["wd_key"].strip().lower(): r["target_id"] for r in conn.execute(
+        "SELECT wd_key, target_id FROM workday_map WHERE kind='worker'")}
     linked = {r[0] for r in conn.execute(
         "SELECT expense_id FROM workday_lines WHERE expense_id IS NOT NULL")}
     out = {"matched": 0, "created": 0, "ignored": 0, "pending": 0}
@@ -1173,11 +1178,29 @@ def wd_match(conn):
         cid = _wd_category_on_grant(conn, cid, gid)
         worker = (ln["worker"] or "").strip()
         person_id = people.get(worker.lower())
+        if person_id is None and worker.lower() in wmap:
+            person_id = wmap[worker.lower()]  # resolved earlier (or ignored)
         # payroll buckets by pay period (Budget Date): adjustments often post
         # months after the month they pay for
         month = ((ln["budget_date"] or ln["date"]))[:7]
         is_payroll = bool(worker) and cat_names.get(cid) in ("Personnel", "Fringe")
-        if is_payroll:
+        if is_payroll and person_id is None:
+            # Worker not yet tied to a person. Keep each such line as its own
+            # expense: bucketing by (grant, category, month, person_id) would
+            # merge two DIFFERENT unnamed workers into one row (they share a
+            # NULL person), and naming one would then grab the other's money.
+            # Once the user matches the worker, the map endpoint relinks these.
+            pd = ln["budget_date"] or ln["date"]
+            label = cat_names.get(cid, "Salary")
+            cur = conn.execute(
+                "INSERT INTO expenses (grant_id, category_id, year, date, "
+                "amount, description, person_id, source, salary_month) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (gid, cid, budget_year_for(grant, pd), pd, ln["amount"],
+                 "%s — %s (%s)" % (label, worker, month),
+                 None, "workday", month))
+            eid, st = cur.lastrowid, "created"
+        elif is_payroll:
             # projected charge for this person/grant/month -> replace with actual;
             # further same-month lines (semi-monthly pay) accumulate onto it
             pd = ln["budget_date"] or ln["date"]  # date within the pay month
@@ -1898,6 +1921,31 @@ def wd_state(conn):
         "UNION SELECT DISTINCT object_class FROM workday_balances "
         "WHERE object_class!=''")]
     unmapped_cats = [k for k in ocs if k not in mapped_c]
+    # Workers on already-mapped payroll lines that we couldn't tie to a person.
+    # Only surfaced once their object class is mapped to Personnel/Fringe — the
+    # point at which a name would actually attach to a charge.
+    cmap = {m["wd_key"]: m["target_id"] for m in mappings if m["kind"] == "category"}
+    catname = {r["id"]: r["name"] for r in conn.execute(
+        "SELECT id, name FROM categories")}
+    payroll_ocs = [oc for oc, tid in cmap.items()
+                   if tid is not None and catname.get(tid) in ("Personnel", "Fringe")]
+    person_names = {r["name"].strip().lower() for r in conn.execute(
+        "SELECT name FROM people")}
+    worker_seen = {m["wd_key"].strip().lower() for m in mappings
+                   if m["kind"] == "worker"}
+    unmatched_workers = []
+    if payroll_ocs:
+        qm = ",".join("?" * len(payroll_ocs))
+        for r in conn.execute(
+                "SELECT TRIM(worker) AS worker, COUNT(*) AS n, "
+                "ROUND(SUM(amount),2) AS total FROM workday_lines "
+                "WHERE TRIM(worker)!='' AND object_class IN (%s) "
+                "GROUP BY LOWER(TRIM(worker)) ORDER BY total DESC" % qm,
+                payroll_ocs):
+            if (r["worker"].lower() not in person_names
+                    and r["worker"].lower() not in worker_seen):
+                unmatched_workers.append(
+                    {"worker": r["worker"], "lines": r["n"], "amount": r["total"]})
     return {
         "import_dir": WD_IMPORT_DIR,
         "raas": get_setting(conn, "workday_raas", {}) or {},
@@ -1910,6 +1958,7 @@ def wd_state(conn):
         "mappings": mappings,
         "unmapped_grants": unmapped_grants,
         "unmapped_categories": unmapped_cats,
+        "unmatched_workers": unmatched_workers,
         "balances": rows_to_list(conn.execute(
             "SELECT * FROM workday_balances ORDER BY grant_code, object_class")),
         "lines": rows_to_list(conn.execute(
@@ -1921,7 +1970,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -2740,6 +2789,15 @@ class Handler(BaseHTTPRequestHandler):
                     "VALUES (?,?,?) ON CONFLICT(kind, wd_key) "
                     "DO UPDATE SET target_id=excluded.target_id",
                     (data["kind"], data["wd_key"], data.get("target_id")))
+                # Linking a worker to a person attaches the charges already
+                # imported under that name, not just future ones.
+                if data.get("kind") == "worker" and data.get("target_id"):
+                    conn.execute(
+                        "UPDATE expenses SET person_id=? WHERE id IN "
+                        "(SELECT expense_id FROM workday_lines WHERE "
+                        "expense_id IS NOT NULL AND "
+                        "LOWER(TRIM(worker))=LOWER(TRIM(?)))",
+                        (data["target_id"], data["wd_key"]))
                 conn.commit()
                 self.send_json(wd_match(conn))
                 return

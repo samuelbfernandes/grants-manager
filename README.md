@@ -70,6 +70,9 @@ way to use it is: **download a report from Workday, import the file here.**
    any folder yourself.
 8. First time only: match Workday's grant codes and object classes to your
    grants and categories. It won't ask again.
+9. If a salary charge names someone who isn't in **People** yet, the dashboard
+   asks who they are — one click adds the person and links their charges. You
+   never have to type payroll names yourself.
 
 If a file can't be read, the app says what it actually was — a PDF, the older
 `.xls` format, a CSV — and nothing is imported until one reads cleanly. The

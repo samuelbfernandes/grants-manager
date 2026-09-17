@@ -314,8 +314,8 @@ a.receipt-link:hover { text-decoration: underline; }
   main { padding: 14px 12px 60px; }
   h1 { font-size: 20px; }
   .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
-  /* Two by two, not one per row: the KPI tiles now lead the dashboard, and
-     stacking all four pushed the alerts and grant cards off a phone screen. */
+  /* Two by two rather than one per row, so the four totals stay compact
+     instead of forming a tall stack on a phone. */
   .stats { flex-direction: row; flex-wrap: wrap; gap: 8px; }
   .stat { flex: 1 1 calc(50% - 12px); min-width: 0; padding: 11px 13px; }
   .stat .label { font-size: 10.5px; letter-spacing: .3px; }
