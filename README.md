@@ -21,13 +21,43 @@ Built by **Sam Fernandes** — <samuelbf@uark.edu>
    Keep the folder together; your data will live inside it.
 3. **Start it**
    - **Mac** — double-click **`Start Grants Manager (Mac).command`**
-     *(first time only: if macOS says it can't verify the developer,
-     right-click the file → **Open** → **Open**)*
    - **Windows** — double-click **`Start Grants Manager (Windows).bat`**
-     *(first time only: if a blue "Windows protected your PC" box appears,
-     click **More info** → **Run anyway**)*
+
+   The **first time only**, your Mac or Windows will likely warn that it
+   can't verify the app — this is normal for any program not sold through
+   Apple's or Microsoft's store, and it doesn't mean anything is wrong. See
+   **[If your Mac or Windows blocks it](#if-your-mac-or-windows-blocks-it)**
+   just below for the one-time click that lets it through.
 4. Your browser opens the app. **Leave the small black window open** while you
    use it — that's the app running. Closing it quits the app.
+
+### If your Mac or Windows blocks it
+
+Because the app isn't code-signed with a paid Apple/Microsoft certificate,
+the operating system asks you to confirm the first launch. You only do this
+**once** per computer; after that it opens normally on a double-click. Nothing
+here is a real error.
+
+**Mac** — you may see *"Apple could not verify 'Start Grants Manager
+(Mac).command' is free of malware."* Click **Done**, then:
+
+1. Open **System Settings → Privacy & Security**.
+2. Scroll down to the **Security** section — you'll see a line saying the
+   starter *"was blocked to protect your Mac"* with an **Open Anyway** button.
+3. Click **Open Anyway**, confirm with your password or Touch ID, and click
+   **Open Anyway** once more in the final dialog.
+
+   *(On older macOS the button isn't there — instead **right-click** the
+   starter → **Open** → **Open**. If neither works, open the built-in
+   **Terminal** app, type `xattr -dr com.apple.quarantine ` then drag the
+   unzipped folder onto the window and press Return — that clears the flag on
+   the whole folder at once.)*
+
+**Windows** — you may see a blue *"Windows protected your PC"* (SmartScreen)
+box. Click **More info**, then **Run anyway**. If your browser flagged the
+download instead, choose **Keep** on the download.
+
+Neither step needs an administrator; a standard account can do it.
 
 ### If it says Python isn't installed
 
