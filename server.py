@@ -74,7 +74,8 @@ def load_access_key():
 
 STANDARD_CATEGORIES = [
     "Personnel", "Fringe", "Tuition", "Travel",
-    "Equipment", "Supplies", "Publication", "Other",
+    "Equipment", "Supplies", "Publication",
+    "Facilities & Administration", "Other",
 ]
 
 SCHEMA = """
@@ -252,6 +253,16 @@ def init_db():
             conn.execute(
                 "INSERT INTO categories (name, grant_id, sort) VALUES (?, NULL, ?)",
                 (name, i))
+    else:
+        # Add any standard category introduced after this database was seeded
+        # (e.g. "Facilities & Administration"), so imports can auto-map to it.
+        have = {r[0] for r in conn.execute(
+            "SELECT name FROM categories WHERE grant_id IS NULL")}
+        for i, name in enumerate(STANDARD_CATEGORIES):
+            if name not in have:
+                conn.execute(
+                    "INSERT INTO categories (name, grant_id, sort) "
+                    "VALUES (?, NULL, ?)", (name, i))
     conn.commit()
     conn.close()
 
@@ -827,6 +838,27 @@ def _wd_grant_code(grant_str):
     return m.group(1) if m else str(grant_str).strip()
 
 
+def _wd_is_total(grant_str, object_class=""):
+    """True for a report's total/subtotal line, which names no real grant and
+    must never be ingested as one (Workday appends 'Total' rows that would
+    otherwise show up as a phantom grant asking to be matched)."""
+    g = str(grant_str).strip().lower()
+    oc = str(object_class).strip().lower()
+    if not g:
+        return True
+    if g.startswith("total") or g.startswith("grand total") or g in (
+            "total", "totals", "subtotal", "grand total"):
+        return True
+    return oc in ("total", "totals", "subtotal", "grand total")
+
+
+def _wd_norm_name(s):
+    """Compact a grant name/code for fuzzy matching: drop any leading GR code,
+    then keep only lowercase letters and digits."""
+    s = re.sub(r"^\s*GR\w+\s*[-—|:]*\s*", "", str(s), flags=re.I)
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
 def _wd_worktag(worktags, label):
     m = re.search(r"^%s:\s*(.+)$" % re.escape(label), str(worktags), re.M)
     return m.group(1).strip() if m else ""
@@ -838,7 +870,10 @@ WD_CAT_HINTS = [
     ("tuition", "Tuition"), ("foreign travel", "Foreign Travel"),
     ("travel", "Travel"), ("equipment", "Equipment"), ("suppl", "Supplies"),
     ("materials", "Supplies"), ("public", "Publication"),
-    ("indirect", "Indirect (F&A)"), ("f&a", "Indirect (F&A)"),
+    ("facilit", "Facilities & Administration"),
+    ("administrat", "Facilities & Administration"),
+    ("indirect", "Facilities & Administration"),
+    ("f&a", "Facilities & Administration"),
 ]
 
 
@@ -901,6 +936,8 @@ WD_EXAMPLE_SUMMARY_ROWS = [
      "UA System Sponsored Programs: 04_Travel", 12000, 0, 0, 3100, 8900],
     ["AWD-000123", "GR000123 Example Grant — Soil Microbiome", "2025-07-01", "2027-06-30",
      "UA System Sponsored Programs: 05_Supplies", 20000, 1500, 0, 6200, 12300],
+    ["AWD-000123", "GR000123 Example Grant — Soil Microbiome", "2025-07-01", "2027-06-30",
+     "UA System Sponsored Programs: 09_Facilities & Administration", 60000, 0, 0, 19200, 40800],
     ["AWD-000456", "GR000456 Example Grant — Field Trial", "2026-01-01", "2028-08-31",
      "UA System Sponsored Programs: 05_Supplies", 8000, 0, 0, 900, 7100],
     ["AWD-000456", "GR000456 Example Grant — Field Trial", "2026-01-01", "2028-08-31",
@@ -1097,7 +1134,7 @@ def wd_ingest_rows(conn, headers, rows):
             bd = excel_date(r.get("Budget Date"))
             grant_full = str(r.get("Grant", "")).strip()
             amount = _wd_num(r.get("Transaction Amount"))
-            if not grant_full or not d:
+            if not grant_full or not d or _wd_is_total(grant_full):
                 continue
             worktags = r.get("Worktags", "")
             _wd_note_grant(conn, grant_full,
@@ -1133,7 +1170,7 @@ def wd_ingest_rows(conn, headers, rows):
         n = 0
         for r in rows:
             grant_full = str(r.get("Grant", "")).strip()
-            if not grant_full:  # the Total row
+            if _wd_is_total(grant_full, r.get("Object Class")):  # Total row
                 continue
             _wd_note_grant(conn, grant_full,
                            award=str(r.get("Award", "")).strip(),
@@ -1174,6 +1211,62 @@ def wd_seed_category_maps(conn):
         if guess:
             conn.execute("INSERT OR IGNORE INTO workday_map (kind, wd_key, "
                          "target_id) VALUES ('category', ?, ?)", (k, guess))
+
+
+def wd_autolink_grants(conn):
+    """Resolve every Workday grant code an import brought in, so the user isn't
+    asked to map grants the app can figure out itself.
+
+    For each unmapped code: if its name matches exactly one existing grant, link
+    to it; if it matches none, CREATE the grant from the name/dates the report
+    carries and link that. Only a name that matches more than one grant (truly
+    ambiguous) is left for the user to resolve. Returns {"matched","created"}.
+    """
+    out = {"matched": 0, "created": 0}
+    mapped = {r[0] for r in conn.execute(
+        "SELECT wd_key FROM workday_map WHERE kind='grant'")}
+    known = rows_to_list(conn.execute(
+        "SELECT grant_code, grant_name FROM workday_lines WHERE grant_code!='' "
+        "UNION SELECT grant_code, grant_name FROM workday_balances "
+        "WHERE grant_code!=''"))
+    ginfo = get_setting(conn, "wd_grant_info", {}) or {}
+    by_norm = {}
+    for g in rows_to_list(conn.execute("SELECT id, name FROM grants")):
+        by_norm.setdefault(_wd_norm_name(g["name"]), []).append(g["id"])
+    for k in known:
+        code = k["grant_code"]
+        if code in mapped or _wd_is_total(code):
+            continue
+        info = ginfo.get(code, {})
+        full = (info.get("grant_name") or k["grant_name"] or code).strip()
+        friendly = (info.get("name") or "").strip()
+        cand = {_wd_norm_name(full)}
+        if friendly:
+            cand.add(_wd_norm_name(friendly))
+        cand.discard("")
+        hits = set()
+        for c in cand:
+            for norm, ids in by_norm.items():
+                if norm and (norm == c or norm in c or c in norm):
+                    hits.update(ids)
+        if len(hits) > 1:
+            continue  # ambiguous -> let the user pick
+        if len(hits) == 1:
+            gid = next(iter(hits))
+            out["matched"] += 1
+        else:
+            name = friendly or full or code
+            notes = ("Workday award %s" % info["award"]) if info.get("award") else ""
+            gid = conn.execute(
+                "INSERT INTO grants (name, start_date, end_date, status, notes) "
+                "VALUES (?,?,?, 'active', ?)",
+                (name, info.get("start", ""), info.get("end", ""), notes)).lastrowid
+            by_norm.setdefault(_wd_norm_name(name), []).append(gid)
+            out["created"] += 1
+        conn.execute("INSERT OR REPLACE INTO workday_map (kind, wd_key, target_id) "
+                     "VALUES ('grant', ?, ?)", (code, gid))
+        mapped.add(code)
+    return out
 
 
 def wd_match(conn):
@@ -1372,10 +1465,13 @@ def wd_import(conn):
         elif kind == "summary":
             balance_rows += n
     wd_seed_category_maps(conn)
+    link = wd_autolink_grants(conn)
     conn.commit()
     res = wd_match(conn)
     res.update({"files": files, "new_lines": new_lines,
-                "balance_rows": balance_rows})
+                "balance_rows": balance_rows,
+                "grants_created": link["created"],
+                "grants_matched": link["matched"]})
     return res
 
 
@@ -1441,9 +1537,12 @@ def wd_fetch_raas(conn, password):
             files[-1]["error"] = ("Response didn't look like the expected "
                                   "report (missing the standard columns).")
     wd_seed_category_maps(conn)
+    link = wd_autolink_grants(conn)
     conn.commit()
     res = wd_match(conn)
     res["files"] = files
+    res["grants_created"] = link["created"]
+    res["grants_matched"] = link["matched"]
     res["new_lines"] = sum(f["rows"] for f in files if f["kind"] == "detail")
     res["balance_rows"] = sum(f["rows"] for f in files if f["kind"] == "summary")
     set_setting(conn, "workday_last_sync", {
@@ -2018,7 +2117,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.4.5"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")

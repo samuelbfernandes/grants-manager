@@ -1129,14 +1129,18 @@ function wdReportImportResult(r) {
   const good = r.files.filter((f) => f.kind === "detail" || f.kind === "summary");
   const balanceRows = r.balance_rows || 0;
   const nTxn = r.new_lines || 0, nMatched = r.matched || 0, nAdded = r.created || 0;
-  const anythingNew = balanceRows + nTxn + nMatched + nAdded > 0;
+  const anythingNew = balanceRows + nTxn + nMatched + nAdded
+    + (r.grants_created || 0) + (r.grants_matched || 0) > 0;
   // what still needs the user's attention after this import
   const ug = (WD?.unmapped_grants || []).length;
   const uc = (WD?.unmapped_categories || []).length;
   const uw = (WD?.unmatched_workers || []).length;
 
   // what came in, in plain words
+  const gCreated = r.grants_created || 0, gMatched = r.grants_matched || 0;
   const wins = [];
+  if (gCreated) wins.push(`${gCreated} grant${gCreated === 1 ? "" : "s"} created from the report.`);
+  if (gMatched) wins.push(`${gMatched} grant${gMatched === 1 ? "" : "s"} matched to grants you already had.`);
   if (balanceRows) wins.push(`Budget &amp; balance figures updated (${balanceRows} row${balanceRows === 1 ? "" : "s"}).`);
   if (nTxn) wins.push(`${nTxn} new transaction${nTxn === 1 ? "" : "s"} read.`);
   if (nMatched) wins.push(`${nMatched} matched to entries you already had.`);
