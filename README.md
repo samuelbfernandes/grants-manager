@@ -17,8 +17,13 @@ Built by **Sam Fernandes** — <samuelbf@uark.edu>
 
 1. **Download** — [Latest release](../../releases/latest) → download
    `GrantsManager.zip`.
-2. **Unzip it** anywhere you like (Documents, Desktop, OneDrive — all fine).
-   Keep the folder together; your data will live inside it.
+2. **Extract it to a real folder first.** On **Windows**, right-click
+   `GrantsManager.zip` → **Extract All…** — don't just double-click into the
+   zip and run the starter from there, or Windows runs it from a temporary
+   place without the app files and it fails with *"server.py: No such file."*
+   On **Mac**, double-click the zip to unpack it. Put the extracted folder
+   anywhere (Documents, Desktop, OneDrive — all fine); keep it together, your
+   data lives inside it.
 3. **Start it**
    - **Mac** — double-click **`Start Grants Manager (Mac).command`**
    - **Windows** — double-click **`Start Grants Manager (Windows).bat`**
