@@ -632,8 +632,11 @@ WD_SUMMARY_KEYS = {"Object Class", "Budget", "Available Balance"}
 WD_DETAIL_COLUMNS = ["Accounting Date", "Budget Date", "Operational Transaction",
                      "Award", "Grant", "Worker", "Supplier", "Ledger Account",
                      "Transaction Amount", "Object Class", "Spend Category"]
-WD_SUMMARY_COLUMNS = ["Grant", "Award", "Object Class", "Budget", "Commitment",
-                      "Obligation", "Actuals", "Available Balance"]
+# Column order matches UARK Workday's "Grant Budget vs Actuals" export exactly,
+# so the example workbook is a faithful stand-in for a real one.
+WD_SUMMARY_COLUMNS = ["Award", "Grant", "Grant Start Date", "Grant End Date",
+                      "Object Class", "Budget", "Commitment", "Obligation",
+                      "Actuals", "Available Balance"]
 # an .xlsx is a zip; refuse one that expands to more than this (zip bomb)
 XLSX_MAX_UNPACKED = 400 * 1024 * 1024
 
@@ -888,16 +891,18 @@ WD_EXAMPLE_DETAIL_ROWS = [
 ]
 
 WD_EXAMPLE_SUMMARY_ROWS = [
-    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Personnel",
-     150000, 0, 0, 4166.67, 145833.33],
-    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Fringe",
-     41250, 0, 0, 1145.83, 40104.17],
-    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Supplies",
-     20000, 1500, 0, 412.75, 18087.25],
-    ["GR000123 Example Grant — Soil Microbiome", "AWD-000123", "Travel",
-     12000, 0, 0, 1284.10, 10715.90],
-    ["GR000456 Example Grant — Field Trial", "AWD-000456", "Supplies",
-     8000, 0, 0, 87.40, 7912.60],
+    ["AWD-000123", "GR000123 Example Grant — Soil Microbiome", "2025-07-01", "2027-06-30",
+     "UA System Sponsored Programs: 01_Personnel", 150000, 0, 0, 48000, 102000],
+    ["AWD-000123", "GR000123 Example Grant — Soil Microbiome", "2025-07-01", "2027-06-30",
+     "UA System Sponsored Programs: 02_Fringe", 41250, 0, 0, 13200, 28050],
+    ["AWD-000123", "GR000123 Example Grant — Soil Microbiome", "2025-07-01", "2027-06-30",
+     "UA System Sponsored Programs: 04_Travel", 12000, 0, 0, 3100, 8900],
+    ["AWD-000123", "GR000123 Example Grant — Soil Microbiome", "2025-07-01", "2027-06-30",
+     "UA System Sponsored Programs: 05_Supplies", 20000, 1500, 0, 6200, 12300],
+    ["AWD-000456", "GR000456 Example Grant — Field Trial", "2026-01-01", "2028-08-31",
+     "UA System Sponsored Programs: 05_Supplies", 8000, 0, 0, 900, 7100],
+    ["AWD-000456", "GR000456 Example Grant — Field Trial", "2026-01-01", "2028-08-31",
+     "UA System Sponsored Programs: 06_Equipment", 15000, 0, 0, 0, 15000],
 ]
 
 
@@ -1026,10 +1031,12 @@ def write_xlsx(path, sheets):
 
 
 def wd_example_workbook(path):
-    """The example .xlsx (sheet 1 = transactions, sheet 2 = balances)."""
+    """The example .xlsx. Sheet 1 = Balances (the "Grant Budget vs Actuals"
+    export most people run, matching its columns exactly); sheet 2 =
+    Transactions (the optional drill-down export)."""
     return write_xlsx(path, [
-        ("Transactions", WD_DETAIL_COLUMNS, WD_EXAMPLE_DETAIL_ROWS),
-        ("Balances", WD_SUMMARY_COLUMNS, WD_EXAMPLE_SUMMARY_ROWS)])
+        ("Balances", WD_SUMMARY_COLUMNS, WD_EXAMPLE_SUMMARY_ROWS),
+        ("Transactions", WD_DETAIL_COLUMNS, WD_EXAMPLE_DETAIL_ROWS)])
 
 
 def wd_ingest_file(conn, path):
@@ -1051,6 +1058,32 @@ def wd_ingest_csv(conn, text):
     return wd_ingest_rows(conn, headers, rows)
 
 
+def _wd_note_grant(conn, grant_full, award="", start="", end=""):
+    """Stash the name/award/dates a report carries for a grant code, so the
+    dashboard can offer to CREATE that grant (already named and dated) instead
+    of only mapping it to one that exists. Never overwrites a good value with
+    a blank, so a later dateless transaction report can't wipe the dates a
+    balances report gave us."""
+    code = _wd_grant_code(grant_full)
+    if not code:
+        return
+    info = get_setting(conn, "wd_grant_info", {}) or {}
+    cur = info.get(code, {})
+    # the friendly part after the code, if the report spells one out
+    rest = grant_full[len(code):].lstrip(" -\u2014|:").strip()
+    merged = {
+        "code": code,
+        "grant_name": grant_full,
+        "name": rest or cur.get("name", ""),
+        "award": award or cur.get("award", ""),
+        "start": start or cur.get("start", ""),
+        "end": end or cur.get("end", ""),
+    }
+    if merged != cur:
+        info[code] = merged
+        set_setting(conn, "wd_grant_info", info)
+
+
 def wd_ingest_rows(conn, headers, rows):
     """Ingest parsed report rows; returns ('detail'|'summary'|'unknown', count)."""
     import hashlib
@@ -1065,6 +1098,8 @@ def wd_ingest_rows(conn, headers, rows):
             if not grant_full or not d:
                 continue
             worktags = r.get("Worktags", "")
+            _wd_note_grant(conn, grant_full,
+                           award=str(r.get("Award", "")).strip())
             key = "|".join([d, bd, _wd_grant_code(grant_full),
                             str(r.get("Ledger Account", "")).strip(),
                             "%.2f" % amount,
@@ -1098,6 +1133,10 @@ def wd_ingest_rows(conn, headers, rows):
             grant_full = str(r.get("Grant", "")).strip()
             if not grant_full:  # the Total row
                 continue
+            _wd_note_grant(conn, grant_full,
+                           award=str(r.get("Award", "")).strip(),
+                           start=excel_date(r.get("Grant Start Date")),
+                           end=excel_date(r.get("Grant End Date")))
             def num(k):
                 return _wd_num(r.get(k))
             conn.execute(
@@ -1915,7 +1954,14 @@ def wd_state(conn):
     known = rows_to_list(conn.execute(
         "SELECT grant_code, grant_name FROM workday_lines WHERE grant_code!='' "
         "UNION SELECT grant_code, grant_name FROM workday_balances"))
-    unmapped_grants = [k for k in known if k["grant_code"] not in mapped_g]
+    ginfo = get_setting(conn, "wd_grant_info", {}) or {}
+    unmapped_grants = []
+    for k in known:
+        if k["grant_code"] in mapped_g:
+            continue
+        entry = dict(k)
+        entry.update(ginfo.get(k["grant_code"], {}))  # name/award/start/end
+        unmapped_grants.append(entry)
     ocs = [r[0] for r in conn.execute(
         "SELECT DISTINCT object_class FROM workday_lines WHERE object_class!='' "
         "UNION SELECT DISTINCT object_class FROM workday_balances "
@@ -1970,7 +2016,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")

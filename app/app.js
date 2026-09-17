@@ -1127,30 +1127,64 @@ function wdReportImportResult(r) {
     return i > 0 ? { name: e.slice(0, i), why: e.slice(i + 2) } : { name: "", why: e };
   })];
   const good = r.files.filter((f) => f.kind === "detail" || f.kind === "summary");
-  if (!bad.length) {
-    toast(`${good.length} file${good.length === 1 ? "" : "s"} read · ${r.new_lines} new transactions · ${r.matched} matched · ${r.created} added` +
-          (r.pending ? ` · ${r.pending} awaiting mapping` : ""));
-    return;
-  }
+  const balanceRows = r.balance_rows || 0;
+  const nTxn = r.new_lines || 0, nMatched = r.matched || 0, nAdded = r.created || 0;
+  const anythingNew = balanceRows + nTxn + nMatched + nAdded > 0;
+  // what still needs the user's attention after this import
+  const ug = (WD?.unmapped_grants || []).length;
+  const uc = (WD?.unmapped_categories || []).length;
+  const uw = (WD?.unmatched_workers || []).length;
+
+  // what came in, in plain words
+  const wins = [];
+  if (balanceRows) wins.push(`Budget &amp; balance figures updated (${balanceRows} row${balanceRows === 1 ? "" : "s"}).`);
+  if (nTxn) wins.push(`${nTxn} new transaction${nTxn === 1 ? "" : "s"} read.`);
+  if (nMatched) wins.push(`${nMatched} matched to entries you already had.`);
+  if (nAdded) wins.push(`${nAdded} added as new expense${nAdded === 1 ? "" : "s"}.`);
+  const winsHtml = wins.length
+    ? `<ul style="margin:0 0 4px 0;padding-left:20px">${wins.map((w) => `<li style="margin:3px 0">${w}</li>`).join("")}</ul>`
+    : (good.length && !bad.length
+        ? `<p class="sub" style="margin:0 0 8px">These files held no new data — everything in them was already imported (or the sheet was empty). Nothing was lost.</p>`
+        : "");
+
+  const need = [];
+  if (ug) need.push(`${ug} grant${ug === 1 ? "" : "s"}`);
+  if (uc) need.push(`${uc} spend categor${uc === 1 ? "y" : "ies"}`);
+  if (uw) need.push(`${uw} ${uw === 1 ? "person" : "people"}`);
+  const needHtml = need.length
+    ? `<div style="background:var(--amber-soft);border-left:3px solid #b97a08;padding:10px 12px;border-radius:8px;margin:12px 0 4px;font-size:13.5px">
+        <strong>One more step:</strong> ${need.join(", ")} from Workday still need${(ug + uc + uw) === 1 ? "s" : ""} matching to this app.
+        Close this and use the highlighted card at the top of the Dashboard.</div>`
+    : (good.length && !bad.length
+        ? `<p class="sub" style="margin:12px 0 0">Everything matched up — nothing else to do.</p>` : "");
+
+  const errHtml = bad.length
+    ? `<h3 style="font-size:14px;margin:16px 0 6px;color:var(--red,#b3261e)">${bad.length} file${bad.length === 1 ? "" : "s"} couldn't be read</h3>
+       ${bad.map((b) => `<div style="border-left:3px solid var(--red,#b3261e);padding:6px 0 6px 12px;margin-bottom:10px">
+         ${b.name ? `<div style="font-weight:600;font-size:13px;word-break:break-all">${esc(b.name)}</div>` : ""}
+         <div class="sub" style="margin:3px 0 0">${esc(b.why)}</div></div>`).join("")}
+       <p class="sub" style="margin:8px 0">Compare your export against the example workbook (same columns, fake data). Unreadable files were moved to <code>workday_imports/not-readable/</code> — nothing was deleted.</p>
+       <div class="toolbar" style="margin-bottom:4px">${EXAMPLE_LINK}</div>`
+    : "";
+
+  const title = bad.length
+    ? (anythingNew ? "Import finished — with some problems" : "Import couldn't read your file")
+    : "Import complete";
+
   modal(`
-    <h2>${bad.length} file${bad.length === 1 ? "" : "s"} couldn't be read</h2>
-    ${good.length ? `<p class="sub" style="margin-bottom:12px">${good.length} other file${good.length === 1 ? "" : "s"} imported fine — ${r.new_lines} new transactions, ${r.matched} matched, ${r.created} added.</p>`
-      : `<p class="sub" style="margin-bottom:12px">Nothing was imported. Your existing data is untouched.</p>`}
-    ${bad.map((b) => `<div style="border-left:3px solid var(--red,#b3261e);padding:8px 0 8px 12px;margin-bottom:12px">
-      ${b.name ? `<div style="font-weight:600;font-size:13px;word-break:break-all">${esc(b.name)}</div>` : ""}
-      <div class="sub" style="margin:4px 0 0">${esc(b.why)}</div>
-    </div>`).join("")}
-    <p class="sub" style="margin:14px 0 8px">The example workbook below has the exact columns Grants Manager expects, filled with obviously fake data — open it beside your export and compare the heading row. Files that couldn't be read have been moved to <code>workday_imports/not-readable/</code> so they don't come up again; nothing was deleted.</p>
-    <div class="toolbar">${EXAMPLE_LINK}</div>
-    <div class="actions"><button class="btn" id="m-cancel">Close</button></div>`,
+    <h2>${anythingNew ? "✓ " : ""}${title}</h2>
+    ${winsHtml}
+    ${needHtml}
+    ${errHtml}
+    <div class="actions"><button class="btn" id="m-cancel">Done</button></div>`,
     (el, close) => { $("#m-cancel", el).onclick = close; });
 }
 
 async function wdImportFiles() {
   try {
     const r = await api("/api/workday/import", "POST", {});
-    wdReportImportResult(r);
     await wdRefresh();
+    wdReportImportResult(r);
   } catch (e) { toast("Import failed: " + e.message); }
 }
 
@@ -1184,8 +1218,8 @@ async function wdUploadFiles(fileList) {
   try {
     const payloads = await Promise.all(files.map(fileToPayload));
     const r = await api("/api/workday/upload_import", "POST", { files: payloads });
-    wdReportImportResult(r);
     await wdRefresh();
+    wdReportImportResult(r);
   } catch (e) { toast("Import failed: " + e.message); }
 }
 
@@ -1479,6 +1513,7 @@ function wdDashCards() {
   if (!WD) return "";
   const gById = (id) => S.grants.find((g) => g.id === id);
   const grantOpts = () => `<option value="">— pick a grant —</option>` +
+    `<option value="__create">➕ Create this as a new grant</option>` +
     S.grants.map((g) => `<option value="${g.id}">${esc(g.name)}</option>`).join("") +
     `<option value="ignore">Ignore this grant</option>`;
   const catOpts = () => `<option value="">— pick a category —</option>` +
@@ -1491,8 +1526,8 @@ function wdDashCards() {
       ${WD.unmapped_grants.map((u) => `
         <div class="form-row" style="align-items:center">
           <label class="field"><span>Workday grant ${esc(u.grant_code)}</span>
-            <div style="font-size:12px;color:var(--muted)">${esc(u.grant_name)}</div></label>
-          <label class="field"><span>→ maps to</span><select data-wd-map-grant="${esc(u.grant_code)}">${grantOpts()}</select></label>
+            <div style="font-size:12px;color:var(--muted)">${esc(u.name || u.grant_name || "")}${u.start ? ` · ${esc(u.start)} → ${esc(u.end || "?")}` : ""}</div></label>
+          <label class="field"><span>→</span><select data-wd-map-grant="${esc(u.grant_code)}">${grantOpts()}</select></label>
         </div>`).join("")}
       ${WD.unmapped_categories.map((oc) => `
         <div class="form-row" style="align-items:center">
@@ -1600,7 +1635,25 @@ function wireWorkdayBits(m) {
     toast("Mapping saved");
     await wdRefresh();
   };
-  $$("[data-wd-map-grant]", m).forEach((sel) => sel.onchange = () => saveMap("grant", sel.dataset.wdMapGrant, sel.value));
+  const createGrantFromWd = (code) => {
+    const u = (WD?.unmapped_grants || []).find((x) => x.grant_code === code) || {};
+    grantModal(null, {
+      prefill: {
+        name: u.name || u.grant_name || code,
+        start_date: u.start || "", end_date: u.end || "",
+      },
+      onCreated: async (newId) => {
+        await api("/api/workday/map", "POST",
+                  { kind: "grant", wd_key: code, target_id: newId });
+        toast("Grant created and its Workday balances linked");
+        await wdRefresh();
+      },
+    });
+  };
+  $$("[data-wd-map-grant]", m).forEach((sel) => sel.onchange = () => {
+    if (sel.value === "__create") { createGrantFromWd(sel.dataset.wdMapGrant); sel.value = ""; return; }
+    saveMap("grant", sel.dataset.wdMapGrant, sel.value);
+  });
   $$("[data-wd-map-cat]", m).forEach((sel) => sel.onchange = () => saveMap("category", sel.dataset.wdMapCat, sel.value));
   $$("[data-wd-map-worker]", m).forEach((sel) => sel.onchange = async () => {
     const key = sel.dataset.wdMapWorker, val = sel.value;
@@ -2923,17 +2976,20 @@ function modal(html, onMount) {
   onMount($(".modal", root), close);
 }
 
-function grantModal(g) {
+function grantModal(g, opts) {
+  opts = opts || {};
+  const pf = opts.prefill || {};
   modal(`
     <h2>${g ? "Edit grant" : "New grant"}</h2>
-    <label class="field"><span>Name</span><input id="m-name" value="${esc(g?.name || "")}" placeholder="e.g. NSF CAREER"></label>
+    ${!g && (pf.name || pf.start_date) ? `<p class="sub" style="margin:-4px 0 12px">Prefilled from your Workday report — adjust anything, then Create.</p>` : ""}
+    <label class="field"><span>Name</span><input id="m-name" value="${esc(g?.name || pf.name || "")}" placeholder="e.g. NSF CAREER"></label>
     <div class="form-row">
-      <label class="field"><span>Agency</span><input id="m-agency" value="${esc(g?.agency || "")}" placeholder="USDA, NSF, FFAR…"></label>
-      <label class="field"><span>Total award ($)</span><input id="m-amount" type="number" step="0.01" value="${g?.initial_amount || ""}"></label>
+      <label class="field"><span>Agency</span><input id="m-agency" value="${esc(g?.agency || pf.agency || "")}" placeholder="USDA, NSF, FFAR…"></label>
+      <label class="field"><span>Total award ($)</span><input id="m-amount" type="number" step="0.01" value="${g?.initial_amount || pf.initial_amount || ""}"></label>
     </div>
     <div class="form-row">
-      <label class="field"><span>Start date</span><input id="m-start" type="date" value="${g?.start_date || ""}"></label>
-      <label class="field"><span>End date</span><input id="m-end" type="date" value="${g?.end_date || ""}"></label>
+      <label class="field"><span>Start date</span><input id="m-start" type="date" value="${g?.start_date || pf.start_date || ""}"></label>
+      <label class="field"><span>End date</span><input id="m-end" type="date" value="${g?.end_date || pf.end_date || ""}"></label>
     </div>
     <div class="form-row">
       <label class="field"><span>Status</span><select id="m-status">
@@ -2972,7 +3028,8 @@ function grantModal(g) {
       if (g) await api(`/api/grants/${g.id}`, "POST", body);
       else {
         const r = await api("/api/grants", "POST", body);
-        view = { name: "grant", grantId: r.id };
+        if (opts.onCreated) { await opts.onCreated(r.id); }
+        else { view = { name: "grant", grantId: r.id }; }
       }
       close();
       toast(g ? "Grant updated" : "Grant created — now click budget numbers to set the category × year budget");
