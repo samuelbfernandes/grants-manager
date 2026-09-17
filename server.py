@@ -1970,7 +1970,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -3150,12 +3150,34 @@ There is nothing else to install: the app uses only what ships with Python.
    folder together — your database will live inside it.
 2. Start the app:
    - **Mac**: double-click **Start Grants Manager (Mac).command**.
-     First time: if macOS blocks it, right-click it → Open → Open.
-     Alternative: in Terminal, `python3 server.py --launch`
    - **Windows**: double-click **Start Grants Manager (Windows).bat**.
-     Alternative: in Command Prompt, `py server.py --launch`
+
+   The **first time only**, your Mac or Windows will probably warn that it
+   can't verify the app. That is normal for any program not sold through
+   Apple's or Microsoft's store \u2014 nothing is wrong. Let it through once
+   (see "If your Mac or Windows blocks it" below) and it opens normally after
+   that. If you prefer the command line: Mac `python3 server.py --launch`,
+   Windows `py server.py --launch`.
 3. Your browser opens at <http://127.0.0.1:8765> with an **empty
    database**. Leave the terminal window open while you use the app.
+
+## If your Mac or Windows blocks it
+
+The app isn't code-signed with a paid Apple/Microsoft certificate, so the
+system asks you to confirm the first launch. You do this **once** per
+computer; it is not a real error, and it needs no administrator.
+
+**Mac** \u2014 if you see "Apple could not verify ... is free of malware",
+click Done, then open **System Settings \u2192 Privacy & Security**, scroll to
+the **Security** section, and click **Open Anyway** next to the blocked
+starter (confirm with your password/Touch ID). On older macOS instead
+**right-click** the starter \u2192 **Open** \u2192 **Open**. Last resort: in
+the **Terminal** app type `xattr -dr com.apple.quarantine ` and drag this
+folder onto the window, then press Return.
+
+**Windows** \u2014 if you see the blue "Windows protected your PC"
+(SmartScreen) box, click **More info**, then **Run anyway**. If the browser
+flagged the download, choose **Keep**.
 
 ## First steps
 
