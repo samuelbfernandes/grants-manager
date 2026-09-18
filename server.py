@@ -874,6 +874,8 @@ WD_CAT_HINTS = [
     ("administrat", "Facilities & Administration"),
     ("indirect", "Facilities & Administration"),
     ("f&a", "Facilities & Administration"),
+    ("professional", "Other"), ("direct cost", "Other"),
+    ("other", "Other"),  # keep last: least specific catch-all
 ]
 
 
@@ -1269,6 +1271,51 @@ def wd_autolink_grants(conn):
     return out
 
 
+def wd_apply_balances(conn):
+    """Reflect an imported Budget-vs-Actuals report in the app's own model, so
+    grant cards show real numbers with no manual work.
+
+    For each mapped grant that has balance rows: set its total award from the
+    summed Budget column, and write one budget line per category (year 1 — the
+    report is a cumulative whole-grant snapshot, not per-year). Actuals stay in
+    workday_balances; the dashboard surfaces them as 'spent'. Available then
+    reproduces the report: award - actuals - obligations. Returns #grants set.
+    """
+    gmap = {r["wd_key"]: r["target_id"] for r in conn.execute(
+        "SELECT wd_key, target_id FROM workday_map WHERE kind='grant' "
+        "AND target_id IS NOT NULL")}
+    cmap = {r["wd_key"]: r["target_id"] for r in conn.execute(
+        "SELECT wd_key, target_id FROM workday_map WHERE kind='category' "
+        "AND target_id IS NOT NULL")}
+    per_grant = {}
+    for b in rows_to_list(conn.execute("SELECT * FROM workday_balances")):
+        per_grant.setdefault(b["grant_code"], []).append(b)
+    updated = 0
+    for code, brows in per_grant.items():
+        gid = gmap.get(code)
+        if not gid or not conn.execute(
+                "SELECT 1 FROM grants WHERE id=?", (gid,)).fetchone():
+            continue
+        total_budget = sum(b["budget"] or 0 for b in brows)
+        cat_budget = {}
+        for b in brows:
+            cid = cmap.get(b["object_class"])
+            if cid is None:
+                continue
+            cid = _wd_category_on_grant(conn, cid, gid)
+            if cid is not None:
+                cat_budget[cid] = cat_budget.get(cid, 0) + (b["budget"] or 0)
+        for cid, amt in cat_budget.items():
+            conn.execute(
+                "INSERT INTO budget_lines (grant_id, category_id, year, amount) "
+                "VALUES (?,?,1,?) ON CONFLICT(grant_id, category_id, year) "
+                "DO UPDATE SET amount=excluded.amount", (gid, cid, amt))
+        conn.execute("UPDATE grants SET initial_amount=? WHERE id=?",
+                     (total_budget, gid))
+        updated += 1
+    return updated
+
+
 def wd_match(conn):
     """Reconcile pending Workday lines with the ledger.
 
@@ -1466,6 +1513,7 @@ def wd_import(conn):
             balance_rows += n
     wd_seed_category_maps(conn)
     link = wd_autolink_grants(conn)
+    wd_apply_balances(conn)
     conn.commit()
     res = wd_match(conn)
     res.update({"files": files, "new_lines": new_lines,
@@ -1538,6 +1586,7 @@ def wd_fetch_raas(conn, password):
                                   "report (missing the standard columns).")
     wd_seed_category_maps(conn)
     link = wd_autolink_grants(conn)
+    wd_apply_balances(conn)
     conn.commit()
     res = wd_match(conn)
     res["files"] = files
@@ -2117,7 +2166,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.4.6"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")

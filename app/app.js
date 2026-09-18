@@ -91,12 +91,41 @@ function budgetFor(gid, cid, year) {
   const b = S.budget_lines.find((b) => b.grant_id === gid && b.category_id === cid && b.year === year);
   return b ? b.amount : 0;
 }
+// Workday codes mapped to an app grant
+function wdCodesFor(gid) {
+  if (!WD || !WD.mappings) return [];
+  return WD.mappings.filter((m) => m.kind === "grant" && m.target_id === gid).map((m) => m.wd_key);
+}
+// A grant is "balance-driven" once a Budget-vs-Actuals report is imported for
+// it: budget and spent then come from Workday's figures, not manual expenses.
+function grantHasBalances(gid) {
+  if (!WD || !WD.balances) return false;
+  const codes = wdCodesFor(gid);
+  return codes.length > 0 && WD.balances.some((b) => codes.includes(b.grant_code));
+}
+function grantActuals(gid) {
+  const codes = wdCodesFor(gid);
+  if (!codes.length || !WD.balances) return 0;
+  return WD.balances.filter((b) => codes.includes(b.grant_code)).reduce((s, b) => s + (b.actuals || 0), 0);
+}
+function catActuals(gid, cid) {
+  const codes = wdCodesFor(gid);
+  if (!codes.length || !WD.balances) return 0;
+  const cm = {};
+  WD.mappings.filter((m) => m.kind === "category").forEach((m) => { cm[m.wd_key] = m.target_id; });
+  return WD.balances
+    .filter((b) => codes.includes(b.grant_code) && cm[b.object_class] === cid)
+    .reduce((s, b) => s + (b.actuals || 0), 0);
+}
 function spentFor(gid, cid, year) {
+  // Balance-driven grant: actuals are a whole-grant snapshot -> show in year 1.
+  if (grantHasBalances(gid)) return (year == null || year === 1) ? catActuals(gid, cid) : 0;
   return S.expenses
     .filter((e) => e.grant_id === gid && e.category_id === cid && (year == null || (e.year || 1) === year))
     .reduce((s, e) => s + e.amount, 0);
 }
 function grantSpent(gid) {
+  if (grantHasBalances(gid)) return grantActuals(gid);
   return S.expenses.filter((e) => e.grant_id === gid).reduce((s, e) => s + e.amount, 0);
 }
 function grantBudgeted(gid) {
@@ -1304,7 +1333,10 @@ function wdSettingsModal() {
     $("#wd-import-btn", el).onclick = () => { close(); wdImportFiles(); };
     const zone = $("#wd-pick-zone", el), fileInput = $("#wd-file-input", el);
     zone.onclick = () => fileInput.click();
-    fileInput.onchange = () => { const fs = fileInput.files; fileInput.value = ""; if (fs.length) { close(); wdUploadFiles(fs); } };
+    // Copy the FileList out BEFORE resetting .value — clearing the input
+    // empties the live FileList, so reading it afterwards found nothing
+    // (browse appeared to do nothing; drag worked via its own file list).
+    fileInput.onchange = () => { const fs = [...fileInput.files]; fileInput.value = ""; if (fs.length) { close(); wdUploadFiles(fs); } };
     zone.ondragover = (e) => { e.preventDefault(); zone.classList.add("drag"); };
     zone.ondragleave = () => zone.classList.remove("drag");
     zone.ondrop = (e) => {

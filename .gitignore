@@ -1,10 +1,11 @@
 # This repo is CODE ONLY. Never commit anyone's grant data.
+*.db
+*.pdf
+*.xlsx
+.DS_Store
+GrantsManagerTest.iso
+__pycache__/
+backups/
 data/
 receipts/
-backups/
 workday_imports/
-__pycache__/
-*.db
-*.xlsx
-*.pdf
-.DS_Store
