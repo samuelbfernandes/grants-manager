@@ -112,12 +112,24 @@ function wdCodesFor(gid) {
   if (!WD || !WD.mappings) return [];
   return WD.mappings.filter((m) => m.kind === "grant" && m.target_id === gid).map((m) => m.wd_key);
 }
-// A grant is "balance-driven" once a Budget-vs-Actuals report is imported for
-// it: budget and spent then come from Workday's figures, not manual expenses.
+// A grant is "balance-driven" only when the IMPORT wrote its award and budget
+// (and you haven't changed them since): Workday's actuals are then its ledger.
+// A grant you built or edited yourself keeps your own expenses as its ledger —
+// imported balances never replace the numbers you keep by hand.
 function grantHasBalances(gid) {
-  if (!WD || !WD.balances) return false;
+  if (!WD || !WD.balances || !WD.balance_driven) return false;
+  if (!(String(gid) in WD.balance_driven)) return false;
   const codes = wdCodesFor(gid);
   return codes.length > 0 && WD.balances.some((b) => codes.includes(b.grant_code));
+}
+// Charges you entered AFTER the import: Workday hasn't posted them yet, so
+// they count on top of Workday's actuals rather than vanishing.
+function pendingManual(gid, cid, year) {
+  const wm = (WD && WD.balance_driven && WD.balance_driven[String(gid)]) || 0;
+  return S.expenses
+    .filter((e) => e.grant_id === gid && e.source === "manual" && e.id > wm &&
+      (cid == null || e.category_id === cid) && (year == null || (e.year || 1) === year))
+    .reduce((s, e) => s + e.amount, 0);
 }
 function grantActuals(gid) {
   const codes = wdCodesFor(gid);
@@ -134,14 +146,16 @@ function catActuals(gid, cid) {
     .reduce((s, b) => s + (b.actuals || 0), 0);
 }
 function spentFor(gid, cid, year) {
-  // Balance-driven grant: actuals are a whole-grant snapshot -> show in year 1.
-  if (grantHasBalances(gid)) return (year == null || year === 1) ? catActuals(gid, cid) : 0;
+  // import-driven grant: Workday's whole-grant snapshot lands in year 1
+  if (grantHasBalances(gid)) {
+    return ((year == null || year === 1) ? catActuals(gid, cid) : 0) + pendingManual(gid, cid, year);
+  }
   return S.expenses
     .filter((e) => e.grant_id === gid && e.category_id === cid && (year == null || (e.year || 1) === year))
     .reduce((s, e) => s + e.amount, 0);
 }
 function grantSpent(gid) {
-  if (grantHasBalances(gid)) return grantActuals(gid);
+  if (grantHasBalances(gid)) return grantActuals(gid) + pendingManual(gid);
   return S.expenses.filter((e) => e.grant_id === gid).reduce((s, e) => s + e.amount, 0);
 }
 function grantBudgeted(gid) {

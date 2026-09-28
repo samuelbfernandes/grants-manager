@@ -1433,6 +1433,7 @@ def wd_apply_balances(conn):
         if gid:
             per_gid.setdefault(gid, []).append(b)
     applied = get_setting(conn, "wd_applied", {}) or {}
+    wm = conn.execute("SELECT COALESCE(MAX(id), 0) FROM expenses").fetchone()[0]
     for gid, brows in per_gid.items():
         g = conn.execute("SELECT * FROM grants WHERE id=?", (gid,)).fetchone()
         if not g:
@@ -1442,8 +1443,10 @@ def wd_apply_balances(conn):
         has_lines = conn.execute("SELECT 1 FROM budget_lines WHERE grant_id=? "
                                  "LIMIT 1", (gid,)).fetchone() is not None
         fresh = mine == 0 and not has_lines
-        untouched = (str(gid) in applied
-                     and abs(applied[str(gid)] - mine) < 0.005)
+        prev = applied.get(str(gid))
+        prev_total = prev.get("total") if isinstance(prev, dict) else prev
+        untouched = (prev_total is not None
+                     and abs(prev_total - mine) < 0.005)
         if not (fresh or untouched):
             if abs(total_budget - mine) >= 1:
                 out["conflicts"].append({"grant": g["name"], "yours": mine,
@@ -1463,7 +1466,10 @@ def wd_apply_balances(conn):
                          "amount) VALUES (?,?,1,?)", (gid, cid, amt))
         conn.execute("UPDATE grants SET initial_amount=? WHERE id=?",
                      (total_budget, gid))
-        applied[str(gid)] = total_budget
+        # "wm" = the newest expense id at import time. Anything you add
+        # afterwards is a charge Workday hasn't posted yet, so the dashboard
+        # adds it on top of Workday's actuals instead of ignoring it.
+        applied[str(gid)] = {"total": total_budget, "wm": wm}
         out["updated"] += 1
     set_setting(conn, "wd_applied", applied, commit=False)
     return out
@@ -2425,7 +2431,19 @@ def wd_state(conn):
                     and r["worker"].lower() not in worker_seen):
                 unmatched_workers.append(
                     {"worker": r["worker"], "lines": r["n"], "amount": r["total"]})
+    # Grants whose award/budget the IMPORT wrote and the user hasn't since
+    # changed: for these Workday's actuals are the ledger. Any grant the user
+    # built or edited by hand keeps the app's own expenses as its ledger.
+    driven = {}
+    applied = get_setting(conn, "wd_applied", {}) or {}
+    for gid_s, a in applied.items():
+        g = conn.execute("SELECT initial_amount FROM grants WHERE id=?",
+                         (int(gid_s),)).fetchone()
+        tot = a.get("total") if isinstance(a, dict) else a
+        if g and tot is not None and abs(tot - (g["initial_amount"] or 0)) < 0.005:
+            driven[gid_s] = a.get("wm", 0) if isinstance(a, dict) else 0
     return {
+        "balance_driven": driven,
         "import_dir": WD_IMPORT_DIR,
         "raas": get_setting(conn, "workday_raas", {}) or {},
         "push_cfg": get_setting(conn, "workday_push", {}) or {},
