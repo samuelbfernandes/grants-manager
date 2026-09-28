@@ -141,8 +141,10 @@ The email itself is one line. Attached is an **Excel workbook** with a row per
 expense (Date, Amount, Spend Category, Business Purpose, Grant/Worktag, Award,
 Cost Center, Fund, Person, Receipt) and, for anything bought on a purchasing
 card, the cardholder details reconciliation asks for. **Each receipt is
-attached separately, named exactly as the workbook's Receipt column names it**,
-so a row can be matched to its file by eye.
+attached separately and renamed so your accountant can tell which row it
+belongs to** — e.g. `03 - 2026-09-15 - 412.75 - Lab supplies.pdf` (line number
+in the table, date, amount, purpose). The Receipt cell on that row shows the
+same name, so a row and its file always match.
 
 Tick **💳 P-card** when you add a card purchase and it carries those details
 automatically; set the cardholder once under **⚙ Settings → 💳 P-card**.
@@ -151,26 +153,22 @@ Sending uses **Microsoft Outlook** on Mac or Windows, which is what lets the
 receipts ride along as attachments. On a Mac the first send asks permission
 for Grants Manager to control Outlook — click OK once.
 
+**No Outlook, or only the "new Outlook"?** Other programs can't control the new
+Outlook, so the app can't press Send. It instead puts the workbook, the renamed
+receipts and the email text in one folder, opens it, and offers an *Open email
+draft* button that starts a message already addressed and worded — drag the
+files in and send. The same happens if a month's receipts are too big for one
+email. Nothing is marked as sent until you send it yourself.
+
 ---
 
-## Using it on your phone
+## Showing your numbers to someone else
 
-With the app running on your computer and your phone on the **same Wi-Fi**,
-open the `http://192.168.x.x:8765/?k=…` address the app prints at startup. On
-iPhone, Safari → Share → **Add to Home Screen** installs it like an app.
-
-**That link ends in an access key — treat it like a password.** Anything on
-your network that has it can read and change your grants; anything without it
-is refused. The key is created on first run and kept in
-`data/access_key.txt`. On the computer running the app you never need it —
-`http://127.0.0.1:8765` just works.
-
-### Showing your numbers to someone else
-
-Anyone with that link and key has full access, so to share figures with a
-co-PI or department admin use **🖨 Print report** on a grant (a clean page
-with the charts, ready to print or save as PDF) or **⬇ Export CSV**. Both are
-a snapshot they can keep, with nothing connected back to your app.
+Grants Manager listens on your computer only — nothing else on your network
+can reach it. To show figures to a co-PI or department admin, use
+**🖨 Print report** on a grant (a clean page with the charts, ready to print
+or save as PDF) or **⬇ Export CSV**. Both are a snapshot they can keep, with
+nothing connected back to your app.
 
 ---
 

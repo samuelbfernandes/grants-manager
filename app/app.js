@@ -19,32 +19,48 @@ const todayISO = () => {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
 
-/* ---------------------------------------------------------------- API */
-// Access key for reaching this app from another device (phone on the same
-// Wi-Fi). Arrives once in the URL as ?k=…, then lives in this browser so the
-// link doesn't have to carry it around. Requests from the computer running
-// the app never need it.
-const ACCESS_KEY = (() => {
-  const fromUrl = new URLSearchParams(location.search).get("k");
-  if (fromUrl) { try { localStorage.setItem("gm-key", fromUrl); } catch { /* private mode */ } return fromUrl; }
-  try { return localStorage.getItem("gm-key") || ""; } catch { return ""; }
-})();
-
-function withKey(url) {
-  if (!ACCESS_KEY) return url;
-  return url + (url.includes("?") ? "&" : "?") + "k=" + encodeURIComponent(ACCESS_KEY);
+/* Browser storage that can never throw. Some browsers/policies block
+   localStorage/sessionStorage entirely (private mode, enterprise Edge); the app
+   must still start, so fall back to memory for the session. */
+function safeStore(kind) {
+  try {
+    const st = window[kind];
+    const k = "__gm_probe__";
+    st.setItem(k, "1"); st.removeItem(k);
+    return st;
+  } catch (e) {
+    const mem = {};
+    return {
+      getItem: (k) => (k in mem ? mem[k] : null),
+      setItem: (k, v) => { mem[k] = String(v); },
+      removeItem: (k) => { delete mem[k]; },
+    };
+  }
 }
+const store = safeStore("localStorage");
+const sstore = safeStore("sessionStorage");
 
+/* ---------------------------------------------------------------- API */
 async function api(path, method = "GET", body = null) {
   const opts = { method, headers: { "Content-Type": "application/json" } };
   // custom header a cross-origin page can't set without a preflight we never
   // answer — this is what stops another website driving the app
   opts.headers["X-Grants-App"] = "1";
-  if (ACCESS_KEY) opts.headers["X-Grants-Key"] = ACCESS_KEY;
   if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(path, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "Request failed");
+  let res;
+  try {
+    res = await fetch(path, opts);
+  } catch (e) {
+    throw new Error("Couldn't reach Grants Manager — is it still running? " +
+      "Start it again from its folder, then reload this page.");
+  }
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* not JSON */ }
+  if (!res.ok) {
+    throw new Error((data && data.error) ||
+      `Grants Manager returned an unexpected reply (HTTP ${res.status}).`);
+  }
+  if (data === null) throw new Error("Grants Manager sent a reply that couldn't be read.");
   return data;
 }
 async function reload() {
@@ -277,7 +293,7 @@ function grantProjection(gid) {
 function dismissedAlerts() {
   if (!S.run_id) return [];
   try {
-    const all = JSON.parse(localStorage.getItem("gm-dismissed-alerts") || "{}");
+    const all = JSON.parse(store.getItem("gm-dismissed-alerts") || "{}");
     return all[S.run_id] || [];
   } catch { return []; }
 }
@@ -287,7 +303,7 @@ function dismissAlert(id) {
   const list = [...new Set([...dismissedAlerts(), id])];
   // only this run's entries are kept — yesterday's ids mean nothing now
   try {
-    localStorage.setItem("gm-dismissed-alerts",
+    store.setItem("gm-dismissed-alerts",
                          JSON.stringify({ [S.run_id]: list }));
   } catch { /* private browsing: the alert just comes back on reload */ }
 }
@@ -389,7 +405,7 @@ function renderDashboard() {
   const ytd = S.expenses.filter((e) => e.date.startsWith(S.today.slice(0, 4)) && e.source !== "adjust").reduce((s, e) => s + e.amount, 0);
   const alerts = visibleAlerts();
 
-  const hideClosed = localStorage.getItem("gm-hide-closed") === "1";
+  const hideClosed = store.getItem("gm-hide-closed") === "1";
   return `
     <h1>Dashboard</h1>
     <p class="sub">${active.length} active grant${active.length === 1 ? "" : "s"} · updated ${S.today}</p>
@@ -530,7 +546,7 @@ function renderGrant() {
       </div>
       <div class="toolbar no-print">
         <button class="btn secondary small" id="btn-edit-grant">Edit grant</button>
-        <a href="${withKey(`/api/export/grant/${g.id}.csv`)}"><button class="btn secondary small">⬇ Export CSV</button></a>
+        <a href="${`/api/export/grant/${g.id}.csv`}"><button class="btn secondary small">⬇ Export CSV</button></a>
         <button class="btn secondary small" onclick="window.print()">🖨 Print report</button>
         <button class="btn secondary small" id="btn-closeout">📄 Close-out report</button>
       </div>
@@ -625,7 +641,7 @@ function expRow(e) {
     <td>${esc(e.description)} ${e.source === "salary" ? '<span class="badge gray">auto</span>' : e.source === "adjust" ? '<span class="badge blue">rollover</span>' : e.source === "workday" ? '<span class="badge green">workday</span>' : ""}</td>
     <td>${esc(personName(e.person_id))}</td>
     <td class="num">${money2(e.amount)}</td>
-    <td>${e.receipt_path ? `<a class="receipt-link" href="${withKey(`/receipts/${encodeURIComponent(e.receipt_path).replaceAll("%2F", "/")}`)}" target="_blank">📎 view</a>` : ""}</td>
+    <td>${e.receipt_path ? `<a class="receipt-link" href="${`/receipts/${encodeURIComponent(e.receipt_path).replaceAll("%2F", "/")}`}" target="_blank">📎 view</a>` : ""}</td>
     <td class="no-print" style="white-space:nowrap">
       <button class="icon-btn" data-edit-exp="${e.id}" title="Edit">✏️</button>
       <button class="icon-btn" data-del-exp="${e.id}" title="Delete">🗑</button>
@@ -986,7 +1002,7 @@ function wdShortOC(oc) {
   return i >= 0 ? oc.slice(i + 2) : oc;
 }
 
-function wdOffline() { return sessionStorage.getItem("wd-offline") === "1"; }
+function wdOffline() { return sstore.getItem("wd-offline") === "1"; }
 
 function wdTopbarUpdate() {
   const b = $("#btn-workday");
@@ -1082,16 +1098,17 @@ function wdPushModal(p) {
       const btn = $("#m-send", el);
       btn.disabled = true; btn.textContent = "Sending…";
       try {
-        await api("/api/workday/send_email", "POST", {
+        const r = await api("/api/workday/send_email", "POST", {
           to, subject, body: bodyText,
           receipt_path: p.receipt_path, expense_ids: p.expense_ids,
         });
         close();
+        if (r.fallback) { outboxModal(r, "Your email to the financial team"); return; }
         toast(`Sent to ${to} — marked “Sent, waiting”`);
         await wdRefresh();
       } catch (e) {
         btn.disabled = false; btn.textContent = "✉ Send email";
-        toast("Send failed: " + e.message);
+        showProblem("Send failed: " + e.message);
       }
     };
   });
@@ -1132,7 +1149,7 @@ async function wdSync(creds) {
   toast("Syncing from Workday…");
   try {
     const r = await api("/api/workday/sync", "POST", creds || {});
-    sessionStorage.removeItem("wd-offline");
+    sstore.removeItem("wd-offline");
     toast(`Workday sync: ${r.new_lines} new transactions · ${r.matched} matched · ${r.created} added` +
           (r.pending ? ` · ${r.pending} awaiting mapping` : ""));
     await wdRefresh();
@@ -1143,7 +1160,7 @@ async function wdSync(creds) {
   }
 }
 
-const EXAMPLE_LINK = `<a href="${withKey("/api/workday/example.xlsx")}"><button class="btn secondary small">⬇ Download example file</button></a>`;
+const EXAMPLE_LINK = `<a href="${"/api/workday/example.xlsx"}"><button class="btn secondary small">⬇ Download example file</button></a>`;
 
 /* A wrong export used to disappear into "1 file read · 0 new transactions",
    leaving the person to guess. Anything that failed now gets its own line
@@ -1191,6 +1208,14 @@ function wdReportImportResult(r) {
     : (good.length && !bad.length
         ? `<p class="sub" style="margin:12px 0 0">Everything matched up — nothing else to do.</p>` : "");
 
+  const conflicts = r.budget_conflicts || [];
+  const conflictHtml = conflicts.length
+    ? `<div style="background:var(--amber-soft);border-left:3px solid #b97a08;padding:10px 12px;border-radius:8px;margin:12px 0 4px;font-size:13.5px">
+        <strong>Kept your own award amounts.</strong> For ${conflicts.length === 1 ? "this grant" : "these grants"} you'd already set a total award, so the import left it alone instead of overwriting it:
+        <ul style="margin:6px 0 0;padding-left:20px">${conflicts.map((c) => `<li>${esc(c.grant)} — yours ${money(c.yours)}, Workday says ${money(c.workday)}</li>`).join("")}</ul>
+        <span class="sub">To use Workday's figure, edit the grant and enter it.</span></div>`
+    : "";
+
   const errHtml = bad.length
     ? `<h3 style="font-size:14px;margin:16px 0 6px;color:var(--red,#b3261e)">${bad.length} file${bad.length === 1 ? "" : "s"} couldn't be read</h3>
        ${bad.map((b) => `<div style="border-left:3px solid var(--red,#b3261e);padding:6px 0 6px 12px;margin-bottom:10px">
@@ -1207,6 +1232,7 @@ function wdReportImportResult(r) {
   modal(`
     <h2>${anythingNew ? "✓ " : ""}${title}</h2>
     ${winsHtml}
+    ${conflictHtml}
     ${needHtml}
     ${errHtml}
     <div class="actions"><button class="btn" id="m-cancel">Done</button></div>`,
@@ -1268,11 +1294,11 @@ function wdConnectModal() {
         <button class="btn" id="m-connect">Connect</button>
       </div>`, (el, close) => {
       $("#m-offline", el).onclick = () => {
-        sessionStorage.setItem("wd-offline", "1");
+        sstore.setItem("wd-offline", "1");
         close(); wdTopbarUpdate();
         toast("Working offline — click ⇅ Workday (top bar) whenever you want to connect");
       };
-      $("#m-connect", el).onclick = () => { close(); sessionStorage.removeItem("wd-offline"); wdSettingsModal(); };
+      $("#m-connect", el).onclick = () => { close(); sstore.removeItem("wd-offline"); wdSettingsModal(); };
     });
     return;
   }
@@ -1286,14 +1312,14 @@ function wdConnectModal() {
       <button class="btn" id="m-connect">Connect</button>
     </div>`, (el, close) => {
     $("#m-offline", el).onclick = () => {
-      sessionStorage.setItem("wd-offline", "1");
+      sstore.setItem("wd-offline", "1");
       close(); wdTopbarUpdate();
       toast("Working offline — click ⇅ Workday (top bar) whenever you want to connect");
     };
     const go = () => {
       const u = $("#wd-login-user", el).value.trim(), p = $("#wd-login-pass", el).value;
       if (!u || !p) { toast("Enter email and password"); return; }
-      close(); sessionStorage.removeItem("wd-offline");
+      close(); sstore.removeItem("wd-offline");
       wdSync({ username: u, password: p });
     };
     $("#m-connect", el).onclick = go;
@@ -1367,7 +1393,7 @@ async function settingsModal() {
     <h2 style="font-size:14px;margin-top:6px">Backups &amp; data safety</h2>
     <p class="sub" style="margin-bottom:8px">A dated copy is made automatically once a day (kept 30 days) in <code>data/backups/</code>. Download one now for an extra copy outside OneDrive, or restore from a backup file if something goes wrong.</p>
     <div class="toolbar" style="margin-bottom:16px">
-      <a href="${withKey("/api/backup/download")}"><button class="btn secondary small">⬇ Download backup now</button></a>
+      <a href="${"/api/backup/download"}"><button class="btn secondary small">⬇ Download backup now</button></a>
       <button class="btn ghost small" id="btn-pick-restore">📤 Restore from a backup file…</button>
       <input type="file" id="restore-file-input" accept=".db" hidden>
     </div>
@@ -1599,7 +1625,7 @@ function wdDashCards() {
     html += `<div class="card">
       <div class="section-head">
         <h2>→ To enter in Workday (${queue.length})</h2>
-        <a href="${withKey("/api/workday/entry_sheet.csv")}" class="no-print"><button class="btn secondary small">⬇ Entry sheet (CSV)</button></a>
+        <a href="${"/api/workday/entry_sheet.csv"}" class="no-print"><button class="btn secondary small">⬇ Entry sheet (CSV)</button></a>
       </div>
       <p class="sub" style="margin-bottom:8px">Expenses added here that haven't shown up in Workday yet. 📤 reopens the send-to-Workday box; a row clears itself once the posted charge syncs back in.</p>
       <table>
@@ -1796,7 +1822,7 @@ function renderInstructions() {
     ${sec("📧 Monthly expense report", `
       <p>At the start of each month the app offers to email you <strong>last month's expenses</strong> — and you can send one any time from <strong>⚙ Settings → Send a report now</strong> or the 🔔 notification.</p>
       <p><strong>It goes to you, not to your accountant.</strong> You read it, check it's right, and forward it on. That's deliberate: the app never emails anyone on your behalf, so there's no accountant address to keep configured, and nothing goes out that you haven't seen.</p>
-      <p><strong>What's in it.</strong> The email body is a single line — <em>“Jane Doe's expense report for the month of September 2026”</em> — and everything else is attached. The attachment is a real <strong>Excel workbook</strong> with up to three sheets: <em>Expenses</em> (one row per expense — Date, Amount, Spend Category, Business Purpose, Grant/Worktag, Award, Cost Center, Fund, Person, Receipt, then P-card, Print cardholder's name, Name on the P-card and Purchased by), <em>P-card purchases</em> (the same columns filtered to just the card transactions), and <em>Changes this month</em> (anything you added, edited or deleted in the app). Headings are frozen and columns are pre-sized, so it opens ready to read. <strong>Each receipt is attached separately, named exactly as the Receipt column names it</strong>, so you can match a row to its file by eye.</p><p class="sub" style="margin-top:6px">If a month's receipts add up to more than about 18 MB they arrive as one zip instead — too many megabytes and the email would simply bounce. The names inside still match the Receipt column.</p><p><strong>Set your name once</strong> under <strong>⚙ Settings → Your name on the report</strong>, or the email just says “Expense report for the month of …”.</p>
+      <p><strong>What's in it.</strong> The email body is a single line — <em>“Jane Doe's expense report for the month of September 2026”</em> — and everything else is attached. The attachment is a real <strong>Excel workbook</strong> with up to three sheets: <em>Expenses</em> (one row per expense — Date, Amount, Spend Category, Business Purpose, Grant/Worktag, Award, Cost Center, Fund, Person, Receipt, then P-card, Print cardholder's name, Name on the P-card and Purchased by), <em>P-card purchases</em> (the same columns filtered to just the card transactions), and <em>Changes this month</em> (anything you added, edited or deleted in the app). Headings are frozen and columns are pre-sized, so it opens ready to read. <strong>Each receipt is attached separately and renamed so your accountant can tell which row it belongs to</strong> — for example <code>03 - 2026-09-15 - 412.75 - Lab supplies.pdf</code>: the line number in the table, the date, the amount and the purpose. The Receipt cell on that row shows exactly the same name, so a row and its file always match.</p><p class="sub" style="margin-top:6px">If a month's receipts add up to more than about 13 MB they arrive as one zip instead (the names inside still match), and if even that is too big for one email the app prepares a ready-to-send folder for you.</p><p style="border-left:3px solid #b97a08;padding-left:10px;margin-top:8px"><strong>No Outlook, or only the “new Outlook”?</strong> Other programs can't control the new Outlook, so the app can't press Send for you. Instead it puts the workbook, the renamed receipts and the email text into one folder, opens it on your screen, and offers an <em>Open email draft</em> button that starts a message already addressed and worded. Drag the files in and send. Nothing is marked as sent until you do it yourself.</p><p><strong>Set your name once</strong> under <strong>⚙ Settings → Your name on the report</strong>, or the email just says “Expense report for the month of …”.</p>
       ${demo('monthly-report', 'Sending a report: ⚙ Settings → Send a report now, check the table, then send it to yourself.')}
     `)}
 
@@ -1825,16 +1851,11 @@ function renderInstructions() {
     ${sec("🔍 Search, 🌙 dark mode, 📤 sharing", `
       <p>The <strong>search box</strong> (top bar) finds grants, people, and expenses as you type — click a result to jump to it. The <strong>moon/sun button</strong> toggles dark mode.</p>
       <p><strong>Sharing the app (empty copy):</strong> the file <strong>“Grants Manager (shareable).zip”</strong> in your grants_management folder is a ready-to-email copy of the app containing <em>no data at all</em> — no grants, people, expenses, or receipts. It's refreshed automatically every time the app starts. Attach it to an email; the recipient unzips it and double-clicks <strong>Start Grants Manager (Mac).command</strong> or <strong>(Windows).bat</strong> — no admin rights needed.</p>
-      <p><strong>Sharing your numbers:</strong> anyone you give your startup link and access key to has full access, so for a co-PI or department admin the safer route is <strong>🖨 Print report</strong> on a grant (a clean PDF-able page with the charts) or <strong>⬇ Export CSV</strong>. Both are a snapshot they can keep, with nothing connected back to your app.</p>
+      <p><strong>Sharing your numbers:</strong> to show figures to a co-PI or department admin, use <strong>🖨 Print report</strong> on a grant (a clean PDF-able page with the charts) or <strong>⬇ Export CSV</strong>. Both are a snapshot they can keep, with nothing connected back to your app.</p>
       ${demo('search-dark', 'Search finds expenses, grants and people as you type. The 🌙 button switches to dark mode.')}
     `)}
 
-    ${sec("📱 iPhone", `
-      <p>Three ways to use it on your phone:</p>
-      <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>⚠️ The startup address ends in an access key — treat it like a password.</strong> It looks like <code>http://192.168.1.x:8765/?k=…</code>. Anything on your network holding that key can read <em>and change</em> your grants; anything without it is refused. On this computer you never need it — <code>http://127.0.0.1:8765</code> works on its own.</p>
-      <p>1. <strong>Install it like an app (recommended):</strong> with your Mac running Grants Manager and the iPhone on the same Wi-Fi, open the full address the server prints at startup (including the <code>?k=…</code> part) in Safari, tap the <strong>Share</strong> button, then <strong>Add to Home Screen</strong>. You get a Grants icon on your home screen that opens full-screen like a native app, fully editable.</p>
-      <p>2. <strong>Read-only snapshot (works anywhere):</strong> the app automatically keeps <strong>“Grants Snapshot.html”</strong> up to date in your grants_management OneDrive folder. Open it from the OneDrive app on your iPhone — no Mac needed, shows availability, projections, and category balances.</p>
-      <p>3. <strong>Just Safari:</strong> browse to the same Wi-Fi address without installing anything.</p>`)}
+
 
     ${sec("🔄 Workday — the app works offline by default", `
       <p><strong>You do not need a Workday connection to use this app.</strong> It opens straight into your own data and never asks you to sign in to anything. Most people can't connect directly anyway — university sign-in (SSO) plus the Duo prompt blocks the kind of automatic connection Workday would need — so the normal way to use this app is:</p>
@@ -1892,7 +1913,7 @@ function renderInstructions() {
       <p>Everything lives in one file: <code>GrantsApp/data/grants.db</code>. Older actuals were imported from scanned Workday DBRs; new actuals come from the ⇅ Workday panel.</p>
       <p><strong>Automatic backups.</strong> Every time the app starts, it saves a dated copy of your data into <code>GrantsApp/data/backups/</code> (one per day, kept for 30 days). You don't have to do anything. Under <strong>⚙ Settings → Backups &amp; data safety</strong> you can also <em>Download backup now</em> — do that before anything risky, and keep the file somewhere other than OneDrive. The same panel restores from a backup file if you ever need to roll back.</p>
       <p><strong>Undo.</strong> Deleting a grant, person, appointment, or expense no longer loses it immediately — it goes to <strong>⚙ Settings → 🗑 Recently deleted</strong> for 30 days. Restoring a grant brings back its expenses, budget lines, and appointments too. After 30 days it's cleared for good, so if a deletion was a mistake, restore it sooner rather than later.</p>
-      <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>⚠️ Important — OneDrive and this app.</strong> This folder is synced by OneDrive, which is great for having your data on other devices, but there's one real risk to know about: <strong>never run Grants Manager on two computers at the same time</strong>, and let OneDrive finish syncing (its icon stops spinning) before you open the app on a different machine. Databases don't merge like documents — if two copies are open at once, OneDrive can't combine them and will either overwrite one or leave a file named something like <em>"grants-DESKTOP-ABC123.db"</em> next to the real one. If you ever see a "conflicted copy" file appear, don't delete it: it may hold work that's missing from the main file — check both, or restore from a backup in ⚙ Settings. For the same reason, don't edit from your phone and your Mac simultaneously.</p>
+      <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>⚠️ Important — OneDrive and this app.</strong> This folder is synced by OneDrive, which is great for having your data on other devices, but there's one real risk to know about: <strong>never run Grants Manager on two computers at the same time</strong>, and let OneDrive finish syncing (its icon stops spinning) before you open the app on a different machine. Databases don't merge like documents — if two copies are open at once, OneDrive can't combine them and will either overwrite one or leave a file named something like <em>"grants-DESKTOP-ABC123.db"</em> next to the real one. If you ever see a "conflicted copy" file appear, don't delete it: it may hold work that's missing from the main file — check both, or restore from a backup in ⚙ Settings.</p>
       ${demo('backups-undo', '⚙ Settings holds the backup download and the 30-day Recently deleted list.')}
     `)}
   `;
@@ -1913,11 +1934,11 @@ function monthLabel(k) {
 }
 
 function seenNotifs() {
-  try { return JSON.parse(localStorage.getItem("gm-seen-notifs") || "[]"); }
+  try { return JSON.parse(store.getItem("gm-seen-notifs") || "[]"); }
   catch { return []; }
 }
 function markNotifsSeen(ids) {
-  localStorage.setItem("gm-seen-notifs", JSON.stringify([...new Set(ids)].slice(-200)));
+  store.setItem("gm-seen-notifs", JSON.stringify([...new Set(ids)].slice(-200)));
 }
 
 /* "What's new" for an available release. The notes come from GitHub, i.e.
@@ -1975,7 +1996,15 @@ function updateModal(u) {
           const j = await (await fetch("/api/ping", { cache: "no-store" })).json();
           if (j && j.version === r.version) { location.reload(); return; }
         } catch (e) { /* server is between versions — keep waiting */ }
-        if (Date.now() - t0 > 60000) {
+        try {
+          const st = await (await fetch("/api/update/status", { cache: "no-store" })).json();
+          if (st && st.state === "rolled_back") {
+            say(`<strong>The update didn't take.</strong> ${esc(st.message)}`);
+            actions.style.display = ""; go.remove();
+            return;
+          }
+        } catch (e) { /* still restarting */ }
+        if (Date.now() - t0 > 90000) {
           say(`<strong>Version ${esc(r.version)} is installed</strong>, but the app hasn't come back on its own. Close this tab and open Grants Manager the way you normally do — your data is safe.`);
           actions.style.display = ""; go.remove();
           return;
@@ -2159,7 +2188,7 @@ async function reportModal(month) {
   modal(`
     <h2>📧 Expense report — ${esc(d.label)}</h2>
     <p class="sub" style="margin-bottom:12px">${d.rows.length} expense${d.rows.length === 1 ? "" : "s"} · <strong>${money2(d.total)}</strong>.
-      This goes to <strong>you</strong> — check it, then forward to your accountant. The email itself is one line; this table arrives as an attached <strong>Excel workbook</strong>${d.rows.some((r) => r.Receipt) ? ", with each receipt attached under the name shown in its Receipt column" : ""}.</p>
+      This goes to <strong>you</strong> — check it, then forward to your accountant. The email itself is one line; this table arrives as an attached <strong>Excel workbook</strong>${d.rows.some((r) => r.Receipt) ? ", with each receipt attached under the numbered name shown in its Receipt column" : ""}.</p>
     ${d.missing_receipts ? `<p class="sub" style="background:var(--amber-soft);color:var(--amber);padding:9px 12px;border-radius:8px;margin-bottom:12px"><strong>${d.missing_receipts}</strong> hand-entered expense${d.missing_receipts === 1 ? "" : "s"} ${d.missing_receipts === 1 ? "has" : "have"} no receipt attached.</p>` : ""}
     ${rowsHtml}
     ${d.changes.length ? `<p class="sub" style="margin:12px 0 4px"><strong>${d.changes.length}</strong> change${d.changes.length === 1 ? "" : "s"} made in the app this month will be listed too, so you can verify them.</p>` : ""}
@@ -2184,13 +2213,14 @@ async function reportModal(month) {
       try {
         const r = await api("/api/report/send", "POST", { month: d.month, to });
         close();
+        if (r.fallback) { outboxModal(r, `Your ${d.label} report`); return; }
         toast(`Report for ${d.label} sent to ${r.to} — check it, then forward to your accountant`);
         markNotifsSeen([...seenNotifs(), `report:${d.month}`]);
         WD = await api("/api/workday/state");
         refreshNotifBadge();
       } catch (e) {
         btn.disabled = false; btn.textContent = "✉ Send report to me";
-        toast("Send failed: " + e.message);
+        showProblem("Send failed: " + e.message);
       }
     };
   });
@@ -2414,7 +2444,7 @@ function renderAllExpenses() {
             <td>${esc(e.description)}</td><td>${esc(personName(e.person_id))}</td>
             <td class="num">${money2(e.amount)}</td>
             <td>${e.receipt_path
-                ? `<a class="receipt-link" href="${withKey(`/receipts/${encodeURIComponent(e.receipt_path).replaceAll("%2F", "/")}`)}" target="_blank">📎</a>`
+                ? `<a class="receipt-link" href="${`/receipts/${encodeURIComponent(e.receipt_path).replaceAll("%2F", "/")}`}" target="_blank">📎</a>`
                 : `<span style="color:var(--muted)" title="No receipt attached">—</span>`}</td>
             <td class="no-print" style="white-space:nowrap">
               <button class="icon-btn" data-edit-exp="${e.id}" title="Edit / attach receipt">✏️</button>
@@ -2450,8 +2480,8 @@ function wireUp(m) {
   // hide/show closed grants
   const tc = $("#btn-toggle-closed", m);
   if (tc) tc.onclick = () => {
-    const now = localStorage.getItem("gm-hide-closed") === "1";
-    localStorage.setItem("gm-hide-closed", now ? "0" : "1");
+    const now = store.getItem("gm-hide-closed") === "1";
+    store.setItem("gm-hide-closed", now ? "0" : "1");
     render();
   };
 
@@ -2525,18 +2555,22 @@ function wireAllExpenses(m) {
                   "Description", "Person", "Receipt", "Source"];
     // quote every field, and neutralise anything a spreadsheet would treat as
     // a formula (=, +, -, @) so an exported ledger can't execute on open
-    const cell = (v) => {
+    const cell = (v, guard = true) => {
       let s = String(v ?? "");
-      if (/^[=+\-@]/.test(s)) s = "'" + s;
+      // Excel skips leading tabs/spaces/CRs to find a formula, so look past them
+      if (guard && /^[\t\r ]*[=+\-@]/.test(s)) s = "'" + s;
       return `"${s.replace(/"/g, '""')}"`;
     };
     const csv = [head.map(cell).join(",")].concat(rows.map((e) => {
       const g = S.grants.find((g) => g.id === e.grant_id);
-      return [e.date, g ? g.name : "", catName(e.category_id), e.year || 1,
-              e.amount.toFixed(2), e.description, personName(e.person_id),
-              e.receipt_path || "", e.source || "manual"].map(cell).join(",");
+      return [cell(e.date, false), cell(g ? g.name : ""), cell(catName(e.category_id)),
+              cell(e.year || 1, false), cell(e.amount.toFixed(2), false),
+              cell(e.description), cell(personName(e.person_id)),
+              cell(e.receipt_path || ""), cell(e.source || "manual")].join(",");
     })).join("\r\n");
-    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    // BOM: without it Excel on Windows reads the file as ANSI and garbles
+    // accented names (José -> JosÃ©)
+    const url = URL.createObjectURL(new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" }));
     const a = document.createElement("a");
     a.href = url; a.download = "expenses_filtered.csv"; a.click();
     URL.revokeObjectURL(url);
@@ -2721,8 +2755,8 @@ function wireQuickAdd(m) {
   gSel.onchange = () => { fillCatSelect(cSel, gSel.value); syncExtUI(); };
   let file = null;
   wireDropzone($("#q-drop", m), $("#q-file", m), (f) => file = f);
-  wdBox.checked = localStorage.getItem("gm-wd-push") !== "0";
-  wdBox.onchange = () => localStorage.setItem("gm-wd-push", wdBox.checked ? "1" : "0");
+  wdBox.checked = store.getItem("gm-wd-push") !== "0";
+  wdBox.onchange = () => store.setItem("gm-wd-push", wdBox.checked ? "1" : "0");
   syncExtUI();
   // split fields stay hidden until "Split across worktags" is ticked
   const splitOn = $("#q-split-on", m);
@@ -2737,7 +2771,21 @@ function wireQuickAdd(m) {
     $("#q-split-cc", m).value = gid ? ((push.profiles[String(gid)] || {}).cost_center || "") : "";
     $("#q-split-wt", m).value = gid ? ((push.codes[gid] || {}).grant_code || "") : "";
   };
-  $("#q-save", m).onclick = async () => {
+  const saveBtn = $("#q-save", m);
+  saveBtn.onclick = async () => {
+    if (saveBtn.disabled) return;          // ignore a double-click
+    saveBtn.disabled = true;
+    const label = saveBtn.textContent;
+    saveBtn.textContent = "Saving…";
+    try {
+      await quickAddSave();
+    } catch (err) {
+      showProblem(err && err.message);     // never a silent failure
+    } finally {
+      if (saveBtn.isConnected) { saveBtn.disabled = false; saveBtn.textContent = label; }
+    }
+  };
+  const quickAddSave = async () => {
     const amount = parseFloat($("#q-amount", m).value);
     if (!amount) { toast("Enter an amount"); return; }
     const g = S.grants.find((g) => g.id === +gSel.value);
@@ -2828,23 +2876,26 @@ async function saveExpenseSplit(body, splitGrantId, pct, receiptPayload) {
     `${body.description || "Expense"} [${p}% of ${money2(body.amount)} split with ${other.name}]`;
   const bodyA = { ...body, amount: shareA, description: tag(gB, 100 - pct) };
   if (receiptPayload) bodyA.receipt = receiptPayload;
-  const rA = await api("/api/expenses", "POST", bodyA);
-  const rB = await api("/api/expenses", "POST", {
+  // one request, one database transaction: a failure on the second half can no
+  // longer leave the first half saved alone (and a retry double-counting it)
+  bodyA.also = {
     ...body, grant_id: gB.id, amount: shareB,
     category_id: categoryOnGrant(body.category_id, gB.id),
     year: budgetYearOf(gB, body.date), description: tag(gA, pct),
-  });
+  };
+  const rA = await api("/api/expenses", "POST", bodyA);
+  const rB = { id: rA.also_id };
   return { shareA, shareB, idA: rA.id, idB: rB.id };
 }
 
 function budgetYearOf(g, dateStr) {
   if (!g || !g.start_date) return 1;
-  const s = new Date(g.start_date), d = new Date(dateStr);
-  if (d < s) return 1;
-  let y = d.getFullYear() - s.getFullYear();
-  const anniv = new Date(d.getFullYear(), s.getMonth(), s.getDate());
-  if (d < anniv) y -= 1;
-  return Math.max(1, y + 1);
+  const [sy, sm, sd] = String(g.start_date).slice(0, 10).split("-").map(Number);
+  const [y, m, d] = String(dateStr).slice(0, 10).split("-").map(Number);
+  if (!y || !sy) return 1;
+  const before = (m < sm) || (m === sm && d < sd);   // before the anniversary?
+  if (y < sy || (y === sy && before)) return 1;
+  return Math.max(1, (y - sy) - (before ? 1 : 0) + 1);
 }
 
 function wireGrantView(m) {
@@ -2973,11 +3024,11 @@ function drawBurnChart(g) {
   const start = g.start_date || (exp[0] ? exp[0].date : S.today);
   const end = g.end_date || S.today;
   const months = [];
-  let d = new Date(start.slice(0, 7) + "-01");
-  const endD = new Date(end.slice(0, 7) + "-01");
-  while (d <= endD && months.length < 120) {
-    months.push(d.toISOString().slice(0, 7));
-    d = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+  let cy = +start.slice(0, 4), cm = +start.slice(5, 7);
+  const ey = +end.slice(0, 4), em = +end.slice(5, 7);
+  while ((cy < ey || (cy === ey && cm <= em)) && months.length < 120) {
+    months.push(`${cy}-${String(cm).padStart(2, "0")}`);
+    if (++cm > 12) { cm = 1; cy++; }
   }
   let cum = 0;
   const nowKey = S.today.slice(0, 7);
@@ -3043,6 +3094,68 @@ function wirePeopleView(m) {
 }
 
 /* -------------------------------------------------------------- modals */
+/* Safety net: an action that fails must never look like "nothing happened".
+   Any failure that isn't handled where it happened lands here and is shown
+   in a dialog that stays until dismissed (a toast fades before it's read). */
+function showProblem(message) {
+  const root = $("#modal-root");
+  const msg = String(message || "Something went wrong.");
+  if (root && root.querySelector("[data-problem]")) {
+    root.querySelector("[data-problem-msg]").textContent = msg;
+    return;
+  }
+  modal(`
+    <div data-problem>
+      <h2>⚠️ That didn't work</h2>
+      <p data-problem-msg style="margin:8px 0 4px;white-space:pre-wrap"></p>
+      <p class="sub" style="margin-top:10px">Nothing was lost. You can fix the problem and try again.</p>
+    </div>
+    <div class="actions"><button class="btn" id="m-cancel">OK</button></div>`,
+    (el, close) => {
+      el.querySelector("[data-problem-msg]").textContent = msg;
+      $("#m-cancel", el).onclick = close;
+    });
+}
+window.addEventListener("unhandledrejection", (ev) => {
+  ev.preventDefault();
+  showProblem((ev.reason && ev.reason.message) || String(ev.reason || ""));
+});
+// ...and a plain (non-async) error thrown from one of the app's own scripts
+window.addEventListener("error", (ev) => {
+  const src = String(ev.filename || "");
+  if (!src.includes("/app/app.js")) return;            // not ours (extensions etc.)
+  if (/ResizeObserver/i.test(ev.message || "")) return; // harmless browser notice
+  showProblem("Something unexpected happened (" + (ev.message || "error") +
+    "). If it keeps happening, reload the page.");
+});
+
+/* Outlook can't be driven here (the "new Outlook" has no automation, or it's
+   not installed), or the message is too big to email. The server has already
+   put everything in a folder and opened it; this walks through the last step. */
+function outboxModal(r, what) {
+  const n = (r.attachments || []).length;
+  const why = r.reason === "size"
+    ? "it's too large to go in one email"
+    : "Outlook can't be controlled by other programs on this computer (the “new Outlook” doesn't allow it)";
+  modal(`
+    <h2>📬 ${esc(what)} is ready — one step left</h2>
+    <p class="sub" style="margin:4px 0 10px">Grants Manager couldn't send it for you because ${why}, so it prepared everything instead. Nothing has been sent yet.</p>
+    <ol style="margin:8px 0 6px;padding-left:20px;line-height:1.6">
+      <li>A folder just opened on your screen with the <strong>${n} file${n === 1 ? "" : "s"}</strong> and the email text. <span class="sub">(${esc(r.folder)})</span></li>
+      <li>Click <strong>Open email draft</strong> — your email program opens a message already addressed to <strong>${esc(r.to)}</strong>, with the subject and text filled in.</li>
+      <li>Drag the files from that folder into the message, then press Send.</li>
+    </ol>
+    <div class="actions">
+      <button class="btn secondary" id="ob-folder">Open folder again</button>
+      <a href="${esc(r.mailto)}"><button class="btn">✉ Open email draft</button></a>
+      <button class="btn secondary" id="m-cancel">Done</button>
+    </div>`, (el, close) => {
+    $("#m-cancel", el).onclick = close;
+    $("#ob-folder", el).onclick = () =>
+      api("/api/outbox/open", "POST", { name: r.folder_name }).catch((e) => showProblem(e.message));
+  });
+}
+
 function modal(html, onMount) {
   const root = $("#modal-root");
   root.innerHTML = `<div class="modal-back"><div class="modal">${html}</div></div>`;
@@ -3379,10 +3492,10 @@ function applyDark(on) {
     Chart.defaults.borderColor = on ? "rgba(148,160,180,.15)" : "rgba(0,0,0,.1)";
   }
 }
-applyDark(localStorage.getItem("gm-dark") === "1");
+applyDark(store.getItem("gm-dark") === "1");
 $("#btn-dark").onclick = () => {
   const on = !document.body.classList.contains("dark");
-  localStorage.setItem("gm-dark", on ? "1" : "0");
+  store.setItem("gm-dark", on ? "1" : "0");
   applyDark(on);
   render();
 };
@@ -3453,8 +3566,8 @@ reload().then(async () => {
     const syncedToday = WD.last_sync && WD.last_sync.date === S.today;
     const wdConfigured = WD.raas && (WD.raas.summary_url || WD.raas.detail_url);
     if (wdConfigured && !syncedToday && !wdOffline()
-        && !sessionStorage.getItem("wd-connect-prompted")) {
-      sessionStorage.setItem("wd-connect-prompted", "1");
+        && !sstore.getItem("wd-connect-prompted")) {
+      sstore.setItem("wd-connect-prompted", "1");
       wdConnectModal();
     }
     // Start of a new month: offer last month's report once, and only if
@@ -3462,8 +3575,8 @@ reload().then(async () => {
     const prev = prevMonthKey();
     const due = !(WD.reports_sent || {})[prev] &&
                 S.expenses.some((e) => e.date.slice(0, 7) === prev);
-    if (due && !sessionStorage.getItem("report-prompted-" + prev)) {
-      sessionStorage.setItem("report-prompted-" + prev, "1");
+    if (due && !sstore.getItem("report-prompted-" + prev)) {
+      sstore.setItem("report-prompted-" + prev, "1");
       setTimeout(() => {
         if (!$(".modal")) reportModal(prev);
       }, 1400);

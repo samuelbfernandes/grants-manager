@@ -36,41 +36,7 @@ DB_PATH = os.path.join(DATA_DIR, "grants.db")
 BACKUP_RETENTION_DAYS = 30
 TRASH_RETENTION_DAYS = 30
 
-# The server listens on every interface so a phone on the same Wi-Fi can reach
-# it. That also means anyone else on that network can, so requests arriving
-# from off-machine must carry an access key; requests from this computer
-# (loopback) never need one. The key lives beside the database, not in it, so
-# restoring a backup can't hand someone an old key.
-ACCESS_KEY_PATH = os.path.join(DATA_DIR, "access_key.txt")
-ACCESS_KEY = None
 SERVER = None   # the running ThreadingHTTPServer, for graceful self-shutdown
-
-
-def _load_key(path):
-    """Read a key file, creating one on first run. 160 bits of urandom."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    try:
-        with open(path) as f:
-            k = f.read().strip()
-        if k:
-            return k
-    except OSError:
-        pass
-    k = base64.urlsafe_b64encode(os.urandom(20)).decode().rstrip("=")
-    with open(path, "w") as f:
-        f.write(k)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    return k
-
-
-def load_access_key():
-    """Load the key that guards access from other devices."""
-    global ACCESS_KEY
-    ACCESS_KEY = _load_key(ACCESS_KEY_PATH)
-    return ACCESS_KEY
 
 STANDARD_CATEGORIES = [
     "Personnel", "Fringe", "Tuition", "Travel",
@@ -198,8 +164,8 @@ CREATE TABLE IF NOT EXISTS trash (
 
 
 def db():
-    # Requests are served on threads, so two writes can collide (e.g. the phone
-    # and the Mac saving at once). Wait politely instead of failing instantly.
+    # Requests are served on threads, so two writes can collide (e.g. two
+    # browser tabs saving at once). Wait politely instead of failing instantly.
     # Deliberately NOT using WAL: it adds -wal/-shm side files, which in a
     # OneDrive-synced folder are a sync-conflict hazard rather than a help.
     conn = sqlite3.connect(DB_PATH, timeout=15)
@@ -274,6 +240,22 @@ def init_db():
 # safety net independent of OneDrive — protects against sync conflicts,
 # accidental bulk edits, or a corrupted live file.
 
+def sqlite_snapshot(src_path, dest_path):
+    """Copy a database with SQLite's backup API. A plain file copy can catch
+    the file halfway through another request's write (a torn, unusable
+    backup); this always yields a consistent snapshot, even while the app is
+    saving something."""
+    src = sqlite3.connect(src_path, timeout=15)
+    try:
+        dst = sqlite3.connect(dest_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
 def make_backup(force=False):
     """Copy the live db into data/backups/. Returns the path, or None if a
     backup already exists for today and force=False."""
@@ -286,7 +268,7 @@ def make_backup(force=False):
         return None
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     dest = os.path.join(BACKUP_DIR, f"grants_{stamp}.db")
-    shutil.copyfile(DB_PATH, dest)
+    sqlite_snapshot(DB_PATH, dest)
     return dest
 
 
@@ -359,6 +341,7 @@ def trash_restore(conn, batch_id):
                     data[col] = id_remap[key]
         taken = conn.execute(f"SELECT 1 FROM {table} WHERE id=?",
                              (data["id"],)).fetchone()
+        r_old_id = data["id"]
         if taken:
             old_id = data.pop("id")
             cols = list(data.keys())
@@ -373,6 +356,11 @@ def trash_restore(conn, batch_id):
                 f"INSERT INTO {table} ({','.join(cols)}) "
                 f"VALUES ({','.join('?' * len(cols))})",
                 [data[c] for c in cols])
+        if table == "expenses":
+            new_id = id_remap.get(("expenses", r_old_id)) if taken else data["id"]
+            conn.execute("UPDATE workday_lines SET status='imported', "
+                         "expense_id=? WHERE expense_id=? AND status='deleted'",
+                         (new_id, r_old_id))
 
     for r in unlinks:
         table, col, row_id = r["table_name"], r["column_name"], r["row_id"]
@@ -512,15 +500,34 @@ def get_setting(conn, key, default=None):
     return json.loads(r["value"]) if r else default
 
 
-def set_setting(conn, key, value):
+def set_setting(conn, key, value, commit=True):
     conn.execute("INSERT INTO settings (key, value) VALUES (?,?) "
                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                  (key, json.dumps(value)))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def slugify(name):
-    return re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "grant"
+WIN_RESERVED = {"con", "prn", "aux", "nul"} | {"com%d" % i for i in range(1, 10)} \
+    | {"lpt%d" % i for i in range(1, 10)}
+
+
+def _win_safe(stem):
+    """A file/folder name Windows will accept: not a device name (CON, AUX,
+    NUL, COM1...) even with an extension, and no trailing dot or space."""
+    stem = stem.strip(" .")
+    if stem.split(".")[0].lower() in WIN_RESERVED:
+        stem = "_" + stem
+    return stem
+
+
+def slugify(name, limit=40):
+    """Folder-safe form of a grant name. Kept short on purpose: OneDrive
+    folders are already deep, and Windows refuses any path over ~260
+    characters — a 75-character folder name was enough to make saving a
+    receipt fail there."""
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_")[:limit].strip("_-")
+    return _win_safe(s or "grant")
 
 
 def budget_year_for(grant, d):
@@ -651,7 +658,7 @@ WD_SUMMARY_COLUMNS = ["Award", "Grant", "Grant Start Date", "Grant End Date",
                       "Object Class", "Budget", "Commitment", "Obligation",
                       "Actuals", "Available Balance"]
 # an .xlsx is a zip; refuse one that expands to more than this (zip bomb)
-XLSX_MAX_UNPACKED = 400 * 1024 * 1024
+XLSX_MAX_UNPACKED = 100 * 1024 * 1024   # a real Workday export is a few MB
 
 
 def sniff_spreadsheet(path):
@@ -731,52 +738,139 @@ def wd_describe_bad_headers(headers):
                kind, ", ".join(cols), found))
 
 
-def parse_xlsx(path):
-    """Minimal stdlib .xlsx reader -> (headers, rows-as-dicts). Sheet 1 only."""
-    import zipfile
+def _xlsx_shared_strings(z):
     import xml.etree.ElementTree as ET
+    shared = []
+    if "xl/sharedStrings.xml" not in z.namelist():
+        return shared
+    with z.open("xl/sharedStrings.xml") as f:
+        for _ev, el in ET.iterparse(f):
+            if el.tag == _XLSX_NS + "si":
+                parts = []
+                for ch in el:                       # plain <t> or rich <r><t>;
+                    if ch.tag == _XLSX_NS + "t":    # phonetic <rPh> is skipped
+                        parts.append(ch.text or "")
+                    elif ch.tag == _XLSX_NS + "r":
+                        t = ch.find(_XLSX_NS + "t")
+                        parts.append(t.text or "" if t is not None else "")
+                shared.append("".join(parts))
+                el.clear()
+    return shared
+
+
+def _xlsx_grid(z, member, shared, max_rows=None):
+    """Rows of one worksheet as lists of strings, streamed so a very large
+    sheet never has to sit in memory as one XML tree."""
+    import xml.etree.ElementTree as ET
+    grid = []
+    with z.open(member) as f:
+        for _ev, row in ET.iterparse(f):
+            if row.tag != _XLSX_NS + "row":
+                continue
+            cells = {}
+            nxt = 0
+            for c in row.iter(_XLSX_NS + "c"):
+                ref = c.get("r") or ""
+                col = re.match(r"[A-Z]+", ref)
+                if col:
+                    idx = 0
+                    for ch in col.group(0):     # column letters -> 0-based index
+                        idx = idx * 26 + (ord(ch) - 64)
+                    idx -= 1
+                else:
+                    idx = nxt
+                nxt = idx + 1
+                t = c.get("t")
+                if t == "inlineStr":
+                    val = "".join(x.text or "" for x in c.iter(_XLSX_NS + "t"))
+                else:
+                    v = c.find(_XLSX_NS + "v")
+                    val = v.text if v is not None and v.text is not None else ""
+                    if t == "s" and val != "":
+                        try:
+                            val = shared[int(val)]
+                        except (ValueError, IndexError):
+                            val = ""
+                cells[idx] = val
+            row.clear()
+            if cells:
+                grid.append([cells.get(i, "") for i in range(max(cells) + 1)])
+            if max_rows and len(grid) >= max_rows:
+                break
+    return grid
+
+
+def _xlsx_sheets(z):
+    """[(name, member_path, visible)] in workbook order, plus whether the
+    workbook uses Excel's 1904 date system. Falls back to sheet1 if the
+    workbook part can't be read."""
+    import xml.etree.ElementTree as ET
+    ns_main = _XLSX_NS
+    rid_attr = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    try:
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        target = {r.get("Id"): r.get("Target") for r in rels}
+        pr = wb.find(ns_main + "workbookPr")
+        d1904 = (pr is not None and str(pr.get("date1904", "")).lower()
+                 in ("1", "true"))
+        out = []
+        for sh in wb.iter(ns_main + "sheet"):
+            tgt = target.get(sh.get(rid_attr)) or ""
+            tgt = tgt.lstrip("/")
+            member = tgt if tgt.startswith("xl/") else "xl/" + tgt
+            if member in z.namelist():
+                out.append((sh.get("name") or "", member,
+                            sh.get("state", "visible") == "visible"))
+        if out:
+            return out, d1904
+    except (KeyError, ET.ParseError):
+        pass
+    return [("Sheet1", "xl/worksheets/sheet1.xml", True)], False
+
+
+def parse_xlsx(path):
+    """Minimal stdlib .xlsx reader -> (headers, rows-as-dicts).
+
+    Uses the first VISIBLE sheet whose column headings look like a Workday
+    report (a hidden cover sheet, or the report on sheet 2, no longer makes a
+    good export look unrecognised); if none looks right, the first visible
+    sheet is used so the error can name what's actually in it."""
+    import zipfile
     bad = sniff_spreadsheet(path)
     if bad:
         raise ValueError(bad)
     z = zipfile.ZipFile(path)
-    shared = []
-    if "xl/sharedStrings.xml" in z.namelist():
-        for si in ET.fromstring(z.read("xl/sharedStrings.xml")):
-            shared.append("".join(t.text or "" for t in si.iter(_XLSX_NS + "t")))
-    root = ET.fromstring(z.read("xl/worksheets/sheet1.xml"))
-    grid = []
-    for row in root.iter(_XLSX_NS + "row"):
-        cells = {}
-        for c in row.iter(_XLSX_NS + "c"):
-            ref = c.get("r") or ""
-            col = re.match(r"[A-Z]+", ref)
-            if not col:
-                continue
-            # column letters -> 0-based index
-            idx = 0
-            for ch in col.group(0):
-                idx = idx * 26 + (ord(ch) - 64)
-            idx -= 1
-            t = c.get("t")
-            if t == "inlineStr":
-                val = "".join(x.text or "" for x in c.iter(_XLSX_NS + "t"))
-            else:
-                v = c.find(_XLSX_NS + "v")
-                val = v.text if v is not None else ""
-                if t == "s" and val != "":
-                    val = shared[int(val)]
-            cells[idx] = val
-        if cells:
-            width = max(cells) + 1
-            grid.append([cells.get(i, "") for i in range(width)])
+    shared = _xlsx_shared_strings(z)
+    sheets, d1904 = _xlsx_sheets(z)
+    visible = [x for x in sheets if x[2]] or sheets
+    chosen = None
+    for _name, member, _vis in visible:
+        head = _xlsx_grid(z, member, shared, max_rows=8)
+        if head:
+            hrow = find_header_row(head)
+            known = WD_DETAIL_KEYS | WD_SUMMARY_KEYS | set(WD_DETAIL_COLUMNS) \
+                | set(WD_SUMMARY_COLUMNS)
+            if sum(1 for c in head[hrow] if str(c).strip() in known) >= 2:
+                chosen = member
+                break
+    if chosen is None:
+        chosen = visible[0][1]
+    grid = _xlsx_grid(z, chosen, shared)
     if not grid:
         raise ValueError("The first sheet of that workbook is empty.")
     hrow = find_header_row(grid)
     headers = [str(h).strip() for h in grid[hrow]]
+    date_cols = {h for h in headers if "date" in h.lower()}
     rows = []
     for raw in grid[hrow + 1:]:
         d = {headers[i]: raw[i] if i < len(raw) else ""
              for i in range(len(headers)) if headers[i]}
+        if d1904:   # Excel's Mac-era epoch is 1,462 days later than the default
+            for h in date_cols:
+                v = str(d.get(h, "")).strip()
+                if re.match(r"^\d+(\.\d+)?$", v):
+                    d[h] = str(int(float(v)) + 1462)
         rows.append(d)
     return headers, rows
 
@@ -823,14 +917,36 @@ def excel_date(v):
 
 
 def _wd_num(v):
-    """'$1,500.00', '(102.00)', 1500.0 -> float (0.0 if unparseable)."""
-    s = str(v).replace(",", "").replace("$", "").strip()
+    """'$1,500.00', '(102.00)', '1.234,56', '12,5', 1500.0 -> float (0.0 if
+    unparseable). Understands both US (1,234.56) and European (1.234,56)
+    thousands/decimal conventions: whichever of . or , comes LAST is the
+    decimal point; a lone comma is a decimal only when 1-2 digits follow."""
+    s = str(v).replace("$", "").replace("\u00a0", "").replace(" ", "").strip()
+    neg = False
     if s.startswith("(") and s.endswith(")"):
-        s = "-" + s[1:-1]
+        neg, s = True, s[1:-1]
+    if s.startswith("-"):
+        neg, s = True, s[1:]
+    elif s.endswith("-"):
+        neg, s = True, s[:-1]
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):       # 1.234,56
+            s = s.replace(".", "").replace(",", ".")
+        else:                                 # 1,234.56
+            s = s.replace(",", "")
+    elif "," in s:
+        head, _, tail = s.rpartition(",")
+        if len(tail) in (1, 2) and "," not in head:
+            s = head + "." + tail             # 12,5 / 1234,56
+        else:
+            s = s.replace(",", "")            # 1,234 / 1,234,567
     try:
-        return float(s or 0)
+        n = float(s or 0)
     except ValueError:
         return 0.0
+    if n != n or n in (float("inf"), float("-inf")):
+        return 0.0
+    return -n if neg else n
 
 
 def _wd_grant_code(grant_str):
@@ -1122,7 +1238,7 @@ def _wd_note_grant(conn, grant_full, award="", start="", end=""):
     }
     if merged != cur:
         info[code] = merged
-        set_setting(conn, "wd_grant_info", info)
+        set_setting(conn, "wd_grant_info", info, commit=False)
 
 
 def wd_ingest_rows(conn, headers, rows):
@@ -1170,6 +1286,7 @@ def wd_ingest_rows(conn, headers, rows):
         return "detail", new
     if {"Object Class", "Budget", "Available Balance"} <= hset:
         n = 0
+        seen = {}   # grant code -> object classes this report carries
         for r in rows:
             grant_full = str(r.get("Grant", "")).strip()
             if _wd_is_total(grant_full, r.get("Object Class")):  # Total row
@@ -1195,7 +1312,17 @@ def wd_ingest_rows(conn, headers, rows):
                  num("Budget"), num("Commitment"), num("Obligation"),
                  num("Actuals"), num("Available Balance"),
                  date.today().isoformat()))
+            seen.setdefault(_wd_grant_code(grant_full), set()).add(
+                str(r.get("Object Class", "")).strip())
             n += 1
+        # This report is the newer snapshot of every grant it names: a spend
+        # category it no longer lists (reclassified away, or zeroed out) must
+        # not linger and keep being added to the totals.
+        for code, ocs in seen.items():
+            conn.execute(
+                "DELETE FROM workday_balances WHERE grant_code=? AND "
+                "object_class NOT IN (%s)" % ",".join("?" * len(ocs)),
+                [code] + sorted(ocs))
         return "summary", n
     raise ValueError(wd_describe_bad_headers(headers))
 
@@ -1219,10 +1346,13 @@ def wd_autolink_grants(conn):
     """Resolve every Workday grant code an import brought in, so the user isn't
     asked to map grants the app can figure out itself.
 
-    For each unmapped code: if its name matches exactly one existing grant, link
-    to it; if it matches none, CREATE the grant from the name/dates the report
-    carries and link that. Only a name that matches more than one grant (truly
-    ambiguous) is left for the user to resolve. Returns {"matched","created"}.
+    A code is linked to an existing grant only when its name matches exactly
+    (ignoring case/punctuation/the GR code), or the grant's own name appears in
+    the Workday name as a WHOLE WORD and is at least 4 letters long — so a
+    grant called "FFAR" is found inside a long Workday title, but one called
+    "AI" can't swallow every name containing those letters. Exactly one such
+    grant -> link; none -> CREATE the grant from the report's name/dates;
+    several -> leave it for the user to choose. Returns {"matched","created"}.
     """
     out = {"matched": 0, "created": 0}
     mapped = {r[0] for r in conn.execute(
@@ -1232,9 +1362,8 @@ def wd_autolink_grants(conn):
         "UNION SELECT grant_code, grant_name FROM workday_balances "
         "WHERE grant_code!=''"))
     ginfo = get_setting(conn, "wd_grant_info", {}) or {}
-    by_norm = {}
-    for g in rows_to_list(conn.execute("SELECT id, name FROM grants")):
-        by_norm.setdefault(_wd_norm_name(g["name"]), []).append(g["id"])
+    grants = [g for g in rows_to_list(conn.execute("SELECT id, name FROM grants"))
+              if g["name"].strip().lower() != "other"]   # "Other" = external bucket
     for k in known:
         code = k["grant_code"]
         if code in mapped or _wd_is_total(code):
@@ -1246,11 +1375,18 @@ def wd_autolink_grants(conn):
         if friendly:
             cand.add(_wd_norm_name(friendly))
         cand.discard("")
+        raw = (full + " " + friendly).lower()
         hits = set()
-        for c in cand:
-            for norm, ids in by_norm.items():
-                if norm and (norm == c or norm in c or c in norm):
-                    hits.update(ids)
+        for g in grants:
+            n = _wd_norm_name(g["name"])
+            if not n:
+                continue
+            if n in cand:
+                hits.add(g["id"])
+            elif len(n) >= 4 and re.search(
+                    r"(?<![a-z0-9])%s(?![a-z0-9])" % re.escape(g["name"].strip().lower()),
+                    raw):
+                hits.add(g["id"])
         if len(hits) > 1:
             continue  # ambiguous -> let the user pick
         if len(hits) == 1:
@@ -1263,7 +1399,7 @@ def wd_autolink_grants(conn):
                 "INSERT INTO grants (name, start_date, end_date, status, notes) "
                 "VALUES (?,?,?, 'active', ?)",
                 (name, info.get("start", ""), info.get("end", ""), notes)).lastrowid
-            by_norm.setdefault(_wd_norm_name(name), []).append(gid)
+            grants.append({"id": gid, "name": name})
             out["created"] += 1
         conn.execute("INSERT OR REPLACE INTO workday_map (kind, wd_key, target_id) "
                      "VALUES ('grant', ?, ?)", (code, gid))
@@ -1275,28 +1411,44 @@ def wd_apply_balances(conn):
     """Reflect an imported Budget-vs-Actuals report in the app's own model, so
     grant cards show real numbers with no manual work.
 
-    For each mapped grant that has balance rows: set its total award from the
-    summed Budget column, and write one budget line per category (year 1 — the
-    report is a cumulative whole-grant snapshot, not per-year). Actuals stay in
-    workday_balances; the dashboard surfaces them as 'spent'. Available then
-    reproduces the report: award - actuals - obligations. Returns #grants set.
+    A grant's award and budget lines are written from the report (award = the
+    summed Budget column, one line per category in year 1 — the report is a
+    cumulative whole-grant snapshot) ONLY when they're the app's to write:
+    the grant is brand new, or still holds exactly what the last import wrote.
+    If you've set or edited the award yourself, it's left alone and reported
+    back as a difference to look at — an import must never overwrite work you
+    did by hand. Actuals stay in workday_balances; the dashboard shows them as
+    'spent'. Returns {"updated": n, "conflicts": [{grant, yours, workday}]}.
     """
+    out = {"updated": 0, "conflicts": []}
     gmap = {r["wd_key"]: r["target_id"] for r in conn.execute(
         "SELECT wd_key, target_id FROM workday_map WHERE kind='grant' "
         "AND target_id IS NOT NULL")}
     cmap = {r["wd_key"]: r["target_id"] for r in conn.execute(
         "SELECT wd_key, target_id FROM workday_map WHERE kind='category' "
         "AND target_id IS NOT NULL")}
-    per_grant = {}
+    per_gid = {}
     for b in rows_to_list(conn.execute("SELECT * FROM workday_balances")):
-        per_grant.setdefault(b["grant_code"], []).append(b)
-    updated = 0
-    for code, brows in per_grant.items():
-        gid = gmap.get(code)
-        if not gid or not conn.execute(
-                "SELECT 1 FROM grants WHERE id=?", (gid,)).fetchone():
+        gid = gmap.get(b["grant_code"])
+        if gid:
+            per_gid.setdefault(gid, []).append(b)
+    applied = get_setting(conn, "wd_applied", {}) or {}
+    for gid, brows in per_gid.items():
+        g = conn.execute("SELECT * FROM grants WHERE id=?", (gid,)).fetchone()
+        if not g:
             continue
-        total_budget = sum(b["budget"] or 0 for b in brows)
+        total_budget = round(sum(b["budget"] or 0 for b in brows), 2)
+        mine = g["initial_amount"] or 0
+        has_lines = conn.execute("SELECT 1 FROM budget_lines WHERE grant_id=? "
+                                 "LIMIT 1", (gid,)).fetchone() is not None
+        fresh = mine == 0 and not has_lines
+        untouched = (str(gid) in applied
+                     and abs(applied[str(gid)] - mine) < 0.005)
+        if not (fresh or untouched):
+            if abs(total_budget - mine) >= 1:
+                out["conflicts"].append({"grant": g["name"], "yours": mine,
+                                         "workday": total_budget})
+            continue
         cat_budget = {}
         for b in brows:
             cid = cmap.get(b["object_class"])
@@ -1305,15 +1457,16 @@ def wd_apply_balances(conn):
             cid = _wd_category_on_grant(conn, cid, gid)
             if cid is not None:
                 cat_budget[cid] = cat_budget.get(cid, 0) + (b["budget"] or 0)
+        conn.execute("DELETE FROM budget_lines WHERE grant_id=?", (gid,))
         for cid, amt in cat_budget.items():
-            conn.execute(
-                "INSERT INTO budget_lines (grant_id, category_id, year, amount) "
-                "VALUES (?,?,1,?) ON CONFLICT(grant_id, category_id, year) "
-                "DO UPDATE SET amount=excluded.amount", (gid, cid, amt))
+            conn.execute("INSERT INTO budget_lines (grant_id, category_id, year, "
+                         "amount) VALUES (?,?,1,?)", (gid, cid, amt))
         conn.execute("UPDATE grants SET initial_amount=? WHERE id=?",
                      (total_budget, gid))
-        updated += 1
-    return updated
+        applied[str(gid)] = total_budget
+        out["updated"] += 1
+    set_setting(conn, "wd_applied", applied, commit=False)
+    return out
 
 
 def wd_match(conn):
@@ -1416,12 +1569,15 @@ def wd_match(conn):
                 eid, st = cur.lastrowid, "created"
         else:
             match = None
+            # same grant + same amount + same spend category + within 45 days.
+            # Category matters: a $100 airfare and a $100 supplies charge a
+            # few weeks apart are two different purchases.
             for ex in conn.execute(
                     "SELECT * FROM expenses WHERE grant_id=? AND source='manual' "
+                    "AND (category_id=? OR category_id IS NULL) "
                     "AND ABS(amount-?)<0.01 AND ABS(julianday(date)-julianday(?))<=45 "
-                    "ORDER BY category_id IS ? DESC, "
-                    "ABS(julianday(date)-julianday(?))",
-                    (gid, ln["amount"], ln["date"], cid, ln["date"])):
+                    "ORDER BY ABS(julianday(date)-julianday(?))",
+                    (gid, cid, ln["amount"], ln["date"], ln["date"])):
                 if ex["id"] not in linked:
                     match = ex
                     break
@@ -1490,9 +1646,13 @@ def wd_import(conn):
         if not name.lower().endswith(".xlsx") or name.startswith("~"):
             continue
         path = os.path.join(WD_IMPORT_DIR, name)
+        conn.execute("SAVEPOINT wd_file")
         try:
             kind, n = wd_ingest_file(conn, path)
+            conn.execute("RELEASE wd_file")
         except Exception as e:  # noqa: BLE001 — one bad file shouldn't stop the rest
+            conn.execute("ROLLBACK TO wd_file")   # drop whatever it half-added
+            conn.execute("RELEASE wd_file")
             files.append({"file": name, "kind": "error", "rows": 0,
                           "error": str(e)})
             # Every import rescans this whole folder, so a file left here
@@ -1513,13 +1673,14 @@ def wd_import(conn):
             balance_rows += n
     wd_seed_category_maps(conn)
     link = wd_autolink_grants(conn)
-    wd_apply_balances(conn)
+    bal = wd_apply_balances(conn)
     conn.commit()
     res = wd_match(conn)
     res.update({"files": files, "new_lines": new_lines,
                 "balance_rows": balance_rows,
                 "grants_created": link["created"],
-                "grants_matched": link["matched"]})
+                "grants_matched": link["matched"],
+                "budget_conflicts": bal["conflicts"]})
     return res
 
 
@@ -1531,6 +1692,25 @@ WD_SESSION = {"password": None}
 
 class WDAuthError(RuntimeError):
     pass
+
+
+WD_HOST_SUFFIXES = (".workday.com", ".myworkday.com", ".workdaysuv.com")
+WD_MAX_RESPONSE = 60 * 1024 * 1024
+
+
+def wd_check_raas_url(url):
+    """The Workday password is sent to this URL, so it must be an https
+    address on a Workday domain — never plain http, never an arbitrary host
+    someone pasted from an email. Returns '' if fine, else the reason."""
+    u = urlparse(str(url).strip())
+    host = (u.hostname or "").lower()
+    if u.scheme != "https" or not host:
+        return "A Workday report link must start with https://"
+    if not any(host.endswith(x) for x in WD_HOST_SUFFIXES):
+        return ("%s isn't a Workday address (expected something ending in "
+                "myworkday.com or workday.com), so your password won't be "
+                "sent there." % host)
+    return ""
 
 
 def wd_fetch_raas(conn, password):
@@ -1555,11 +1735,22 @@ def wd_fetch_raas(conn, password):
             continue
         if "format=" not in url:
             url += ("&" if "?" in url else "?") + "format=csv"
+        bad = wd_check_raas_url(url)
+        if bad:
+            raise RuntimeError(bad)
         req = urllib.request.Request(url)
         req.add_header("Authorization", "Basic " + cred)
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):   # never forward the password
+                return None
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                body = resp.read()
+            with urllib.request.build_opener(_NoRedirect).open(
+                    req, timeout=120) as resp:
+                body = resp.read(WD_MAX_RESPONSE + 1)
+                if len(body) > WD_MAX_RESPONSE:
+                    raise RuntimeError("The %s report is far larger than a "
+                                       "grant report should be." % label)
                 ctype = resp.headers.get("Content-Type", "")
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -1568,6 +1759,11 @@ def wd_fetch_raas(conn, password):
                     "Check the password; if it keeps failing, UARK may only "
                     "allow SSO logins for your account, which blocks RaaS."
                     % (e.code, label))
+            if 300 <= e.code < 400:
+                raise WDAuthError(
+                    "Workday redirected the %s request (probably to a "
+                    "single-sign-on page), which blocks direct connection. "
+                    "Use the file import instead." % label)
             raise RuntimeError("Workday returned HTTP %d for the %s report."
                                % (e.code, label))
         except urllib.error.URLError as e:
@@ -1586,10 +1782,11 @@ def wd_fetch_raas(conn, password):
                                   "report (missing the standard columns).")
     wd_seed_category_maps(conn)
     link = wd_autolink_grants(conn)
-    wd_apply_balances(conn)
+    bal = wd_apply_balances(conn)
     conn.commit()
     res = wd_match(conn)
     res["files"] = files
+    res["budget_conflicts"] = bal["conflicts"]
     res["grants_created"] = link["created"]
     res["grants_matched"] = link["matched"]
     res["new_lines"] = sum(f["rows"] for f in files if f["kind"] == "detail")
@@ -1767,6 +1964,56 @@ def run_applescript_as_app(lines, timeout=90):
     raise RuntimeError("Outlook did not respond in time")
 
 
+class OutlookUnavailable(RuntimeError):
+    """Outlook can't be driven here (the new Outlook has no automation, or it
+    isn't installed). Not a failure: the caller prepares an outbox instead."""
+
+
+OUTBOX_DIR = os.path.join(DATA_DIR, "outbox")
+
+
+def reveal_folder(path):
+    """Show a folder in Explorer / Finder. Best effort."""
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)  # noqa: S606 — a folder we just created
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", path])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", path])
+    except OSError:
+        pass
+
+
+def prepare_outbox(to, subject, body, files, label):
+    """When the email can't be sent for the person, do everything except press
+    Send: one folder holding the attachments (already named for the
+    accountant) and the email text, opened on screen, plus a mailto: draft.
+    Returns (folder, mailto_url)."""
+    from urllib.parse import quote
+    os.makedirs(OUTBOX_DIR, exist_ok=True)
+    folder = os.path.join(OUTBOX_DIR, "%s_%s" % (
+        datetime.now().strftime("%Y%m%d_%H%M%S"), slugify(label, 24)))
+    os.makedirs(folder, exist_ok=True)
+    for f in files:
+        if f and os.path.isfile(f):
+            shutil.copy2(f, os.path.join(folder, os.path.basename(f)))
+    with open(os.path.join(folder, "0 - email text.txt"), "w",
+              encoding="utf-8-sig", newline="\r\n") as f:
+        f.write("To: %s\nSubject: %s\n\n%s\n" % (to, subject, body))
+    # keep only the most recent few outboxes
+    olds = sorted(d for d in os.listdir(OUTBOX_DIR)
+                  if os.path.isdir(os.path.join(OUTBOX_DIR, d)))
+    for d in olds[:-20]:
+        shutil.rmtree(os.path.join(OUTBOX_DIR, d), ignore_errors=True)
+    reveal_folder(folder)
+    mailto = "mailto:%s?subject=%s&body=%s" % (
+        quote(to, safe="@,"), quote(subject), quote(body[:1500]))
+    return folder, mailto
+
+
 def wd_send_mail(to, cc, subject, body, attachment=None):
     """Compose and send through Microsoft Outlook — macOS (AppleScript) or
     Windows (Outlook COM via PowerShell). Outlook lets us attach the receipt
@@ -1816,32 +2063,49 @@ def wd_send_mail(to, cc, subject, body, attachment=None):
         for ln in lines:
             args += ["-e", ln]
     elif sys.platform == "win32":
-        def q(s):  # PowerShell single-quoted literal escaping
-            return str(s).replace("'", "''")
-        ps = ["$o = New-Object -ComObject Outlook.Application",
-              "$m = $o.CreateItem(0)",
-              "$m.To = '%s'" % q(to)]
-        if cc:
-            ps.append("$m.CC = '%s'" % q(cc))
-        ps.append("$m.Subject = '%s'" % q(subject))
-        # single-quoted PS strings keep literal newlines as-is
-        ps.append("$m.Body = '%s'" % q(body.replace("\r", "")))
-        for a in attachments:
-            ps.append("$null = $m.Attachments.Add('%s')" % q(a))
-        ps.append("$m.Send()")
-        args = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                "; ".join(ps)]
+        # Everything variable travels in a JSON file (pure ASCII, \\u escapes),
+        # so a long body or hundreds of attachments can't hit Windows'
+        # command-line limit, and no user text is ever spliced into script code.
+        import tempfile
+        tmpd = tempfile.mkdtemp(prefix="gm_mail_")
+        pj = os.path.join(tmpd, "mail.json")
+        with open(pj, "w", encoding="ascii") as f:
+            json.dump({"to": to, "cc": cc or "", "subject": subject,
+                       "body": body.replace("\r", ""),
+                       "attachments": attachments}, f)
+        script = ("$ErrorActionPreference='Stop'; "
+                  "$d = Get-Content -Raw -Encoding UTF8 -LiteralPath '%s' | "
+                  "ConvertFrom-Json; "
+                  "$o = New-Object -ComObject Outlook.Application; "
+                  "$m = $o.CreateItem(0); $m.To = [string]$d.to; "
+                  "if ($d.cc) { $m.CC = [string]$d.cc }; "
+                  "$m.Subject = [string]$d.subject; $m.Body = [string]$d.body; "
+                  "foreach ($a in @($d.attachments)) { if ($a) { "
+                  "$null = $m.Attachments.Add([string]$a) } }; $m.Send()"
+                  % pj.replace("'", "''"))
+        args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
         hint = "Check that Microsoft Outlook (desktop) is installed and signed in."
     else:
-        raise RuntimeError("Sending needs Microsoft Outlook on macOS or Windows.")
+        raise OutlookUnavailable("Sending needs Microsoft Outlook on macOS or "
+                                 "Windows.")
+    else_kw = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
     try:
-        r = subprocess.run(args, capture_output=True, timeout=90)
+        r = subprocess.run(args, capture_output=True, timeout=90, **else_kw)
     except FileNotFoundError:
-        raise RuntimeError("Could not talk to Outlook on this system. " + hint)
+        raise OutlookUnavailable("Could not talk to Outlook on this system. "
+                                 + hint)
     except subprocess.TimeoutExpired:
         raise RuntimeError("Outlook did not respond. " + hint)
+    finally:
+        if sys.platform == "win32":
+            shutil.rmtree(tmpd, ignore_errors=True)
     if r.returncode != 0:
         err = (r.stderr or b"").decode("utf-8", "replace").strip()
+        if sys.platform == "win32" and any(
+                m in err for m in ("80040154", "Class not registered",
+                                   "COM class factory", "Outlook.Application")):
+            # "New Outlook" (and Outlook-less PCs) have no automation object
+            raise OutlookUnavailable("Classic Outlook isn't installed.")
         raise RuntimeError("Outlook could not send: %s. %s"
                            % (err or "unknown error", hint))
 
@@ -1876,6 +2140,17 @@ def month_bounds(month):
     first = date(y, mo, 1)
     last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
     return first.isoformat(), last.isoformat()
+
+
+def receipt_export_name(n, width, row):
+    ext = os.path.splitext(row["_receipt_path"])[1].lower()
+    purpose = re.sub(r"[^A-Za-z0-9 ._()-]+", " ",
+                     row["Business Purpose"] or row["Spend Category"]
+                     or row["_grant"] or "")
+    purpose = re.sub(r"\s+", " ", purpose).strip(" .-")[:40].strip(" .-") \
+        or "receipt"
+    amt = "%.2f" % abs(row["_amount"]) + (" credit" if row["_amount"] < 0 else "")
+    return "%0*d - %s - %s - %s%s" % (width, n, row["Date"], amt, purpose, ext)
 
 
 def report_rows(conn, month):
@@ -1921,6 +2196,15 @@ def report_rows(conn, month):
             "_pcard": bool(e["pcard"]),
             "_manual": e["source"] == "manual",
         })
+    # Name each receipt so the accountant can tell which row it belongs to
+    # without opening it: "<line> - <date> - <amount> - <purpose>.pdf". The
+    # line number is the row's position in the table (1 = first expense), and
+    # the Receipt cell shows this same name, so the file and the row always
+    # match — in the preview, the workbook and the attachments alike.
+    width = max(2, len(str(len(out))))
+    for n, r in enumerate(out, 1):
+        if r["_receipt_path"]:
+            r["Receipt"] = receipt_export_name(n, width, r)
     return out
 
 
@@ -2001,42 +2285,39 @@ def report_xlsx_path(data):
     return write_xlsx(path, sheets)
 
 
-# Outlook and most mail servers reject a message much past 25 MB; stop well
-# short and fall back to one zip rather than have the send fail outright.
-RECEIPT_ATTACH_LIMIT = 18 * 1024 * 1024
+# A message is roughly a third bigger once encoded for email, and most servers
+# refuse anything past ~25 MB — so budget the RAW attachments (workbook included)
+# well under that, and fall back to a zip, then to a ready-to-send folder.
+RECEIPT_ATTACH_LIMIT = 13 * 1024 * 1024
 
 
-def report_receipt_attachments(data):
+def report_receipt_attachments(data, reserve=1024 * 1024):
     """Each receipt as its own attachment, named exactly as the Receipt column
-    names it, so a row in the table can be matched to a file by eye.
-
-    Receipts live in per-grant folders, so two of them can share a basename;
-    where that happens both the file and the cell get a numbered suffix, and
-    they stay in step. Returns (paths, note) — note is a line for the email
-    when something had to be zipped or skipped instead.
+    names it (see receipt_export_name), so a row in the table can be matched to
+    a file by eye. Returns (attach, note, staged): `attach` is what to email
+    (the individual files, or one zip if they'd be too big together), `staged`
+    always the individual renamed files, and `note` a line for the email when
+    something was zipped or missing. `reserve` is room kept for the workbook.
     """
-    import shutil
     rows = [r for r in data["rows"] if r["_receipt_path"]]
     if not rows:
-        return [], ""
+        return [], "", []
     stage = os.path.join(REPORTS_DIR, "receipts_%s" % data["month"])
     if os.path.isdir(stage):
         shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage, exist_ok=True)
-    used, staged, total, missing = {}, [], 0, 0
+    used, staged, total, missing = set(), [], 0, 0
     for r in rows:
-        full = os.path.join(RECEIPTS_DIR, r["_receipt_path"])
+        full = receipt_abspath(r["_receipt_path"]) or ""
         if not os.path.isfile(full):
             r["Receipt"] = "(file missing)"
             missing += 1
             continue
-        name = os.path.basename(r["_receipt_path"])
-        if name in used:
-            used[name] += 1
+        name = r["Receipt"]
+        while name.lower() in used:   # Windows names ignore case
             stem, ext = os.path.splitext(name)
-            name = "%s (%d)%s" % (stem, used[name], ext)
-        else:
-            used[name] = 1
+            name = stem + "+" + ext
+        used.add(name.lower())
         dest = os.path.join(stage, name)
         shutil.copy2(full, dest)
         r["Receipt"] = name          # keep the cell and the attachment in step
@@ -2047,7 +2328,7 @@ def report_receipt_attachments(data):
         note = ("%d receipt file(s) recorded in the app could not be found on "
                 "disk and are marked “(file missing)” in the table."
                 % missing)
-    if total > RECEIPT_ATTACH_LIMIT:
+    if total + reserve > RECEIPT_ATTACH_LIMIT:
         import zipfile
         out = os.path.join(REPORTS_DIR, "receipts_%s.zip" % data["month"])
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
@@ -2058,16 +2339,16 @@ def report_receipt_attachments(data):
                   "they are attached as a single zip instead — the names "
                   "inside it still match the Receipt column."
                   % (len(staged), total / 1048576.0))
-        return [out], note
-    return staged, note
+        return [out], note, staged
+    return staged, note, staged
 
 
 def report_text(data, owner_name="", note=""):
     """The email body: one sentence, and only what a person needs to read.
 
     Everything else now lives in the attached workbook — the table used to be
-    pasted into the body, which made the message long and awkward to read on a
-    phone, and Excel is where these numbers were always going to end up.
+    pasted into the body, which made the message long and awkward to read, and
+    Excel is where these numbers were always going to end up.
     """
     who = (owner_name or "").strip()
     lead = ("%s's expense report for the month of %s."
@@ -2081,7 +2362,9 @@ def report_text(data, owner_name="", note=""):
                    and r["Receipt"] != "(file missing)")
     if receipts:
         lines.append("%d receipt file(s) are attached, each named as the "
-                     "Receipt column in the workbook names it." % receipts)
+                     "Receipt column in the workbook names it — the number at "
+                     "the start of a file name is its line in the table "
+                     "(1 = the first expense listed)." % receipts)
     pcard = sum(1 for r in data["rows"] if r.get("_pcard"))
     if pcard:
         lines.append("%d of them were P-card purchases; the workbook has a "
@@ -2166,7 +2449,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.7"
+APP_VERSION = "1.4.8"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -2458,11 +2741,90 @@ def update_apply(stage_dir, rels, old_version):
     return bdir
 
 
-def update_restart():
+UPDATE_STATE = {"state": "idle", "message": ""}
+
+
+def update_trial(stage_dir, version):
+    """Actually START the new version — beside the running one, on a spare
+    port, against a COPY of the user's database — before touching anything.
+    That exercises database migrations on real data, port binding and the
+    first page load, which a mere import test can't. Raises UpdateError."""
+    import subprocess
+    import urllib.request
+    data_dir = os.path.join(stage_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    if os.path.isfile(DB_PATH):
+        sqlite_snapshot(DB_PATH, os.path.join(data_dir, "grants.db"))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+    logp = os.path.join(stage_dir, "trial.log")
+    with open(logp, "wb") as log:
+        kw = dict(cwd=stage_dir, stdin=subprocess.DEVNULL, stdout=log,
+                  stderr=log)
+        if os.name == "nt":
+            kw["creationflags"] = 0x08000000   # no console window
+        proc = subprocess.Popen([sys.executable,
+                                 os.path.join(stage_dir, "server.py"),
+                                 "--port", str(port)], **kw)
+    ok, why = False, "it didn't start within 30 seconds"
+    try:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                why = "it stopped right after starting"
+                break
+            try:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:%d/api/ping" % port, timeout=2) as r:
+                    j = json.loads(r.read(10000).decode())
+                if j.get("version") == str(version):
+                    req = urllib.request.Request(
+                        "http://127.0.0.1:%d/api/state" % port,
+                        headers={"X-Grants-App": "1"})
+                    with urllib.request.urlopen(req, timeout=15) as r2:
+                        json.loads(r2.read().decode())   # builds from real data
+                    ok = True
+                    break
+            except Exception:  # noqa: BLE001 — not up yet
+                pass
+            time.sleep(0.4)
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=10)
+        except Exception:  # noqa: BLE001
+            pass
+    if not ok:
+        raise UpdateError("The new version didn't pass its start-up test on "
+                          "this computer (%s), so it was NOT installed. Your "
+                          "current version and data are untouched." % why)
+
+
+def update_rollback(bdir, rels):
+    """Put the previous program files back (used when a freshly installed
+    version fails to come up)."""
+    for rel in rels:
+        dst = os.path.join(BASE_DIR, *rel.split("/"))
+        old = os.path.join(bdir, *rel.split("/"))
+        try:
+            if os.path.isfile(old):
+                shutil.copyfile(old, dst)
+            elif os.path.isfile(dst):
+                os.remove(dst)
+        except OSError:
+            pass
+
+
+def update_restart(bdir, rels, version):
     """Start the freshly installed copy in the background. It finds this old
     one on the port and takes over (graceful /api/shutdown), so the page can
     simply wait for the new version to answer. Delayed so this request's
-    response is delivered first."""
+    response is delivered first. If the new copy never takes over, this
+    (still-running) copy restores the previous files, so the next launch
+    can't hit a broken install."""
+    UPDATE_STATE.update(state="restarting", message="", version=str(version))
+
     def go():
         import subprocess
         time.sleep(0.8)
@@ -2476,8 +2838,18 @@ def update_restart():
             kw["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
         else:
             kw["start_new_session"] = True
-        subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "server.py")],
-                         **kw)
+        try:
+            subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "server.py")],
+                             **kw)
+        except OSError:
+            pass
+        # If the new copy takes over, we're shut down and never get past here.
+        time.sleep(35)
+        update_rollback(bdir, rels)
+        UPDATE_STATE.update(
+            state="rolled_back",
+            message="The new version couldn't start on this computer, so your "
+                    "previous version was put back. Nothing was lost.")
     threading.Thread(target=go, daemon=True).start()
 
 
@@ -2501,12 +2873,14 @@ def update_install():
         try:
             zpath = os.path.join(work, UPDATE_ASSET)
             update_fetch_zip(latest, zpath)
-            rels = update_stage(zpath, latest, os.path.join(work, "stage"))
+            stage = os.path.join(work, "stage")
+            rels = update_stage(zpath, latest, stage)
+            update_trial(stage, latest)
             db_backup = make_backup(force=True)
-            update_apply(os.path.join(work, "stage"), rels, APP_VERSION)
+            bdir = update_apply(stage, rels, APP_VERSION)
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        update_restart()
+        update_restart(bdir, rels, latest)
         return {"ok": True, "version": latest, "from": APP_VERSION,
                 "db_backup": os.path.basename(db_backup or "")}
     finally:
@@ -2539,6 +2913,19 @@ def full_state(conn):
     }
 
 
+def receipt_abspath(rel):
+    """Absolute path of a stored receipt, or None if `rel` is empty, escapes
+    the receipts folder, or isn't a file. Every place that turns a stored or
+    client-supplied receipt path into a file goes through here."""
+    if not rel:
+        return None
+    try:
+        p = safe_under(RECEIPTS_DIR, str(rel))
+    except (PermissionError, ValueError):
+        return None
+    return p if os.path.isfile(p) else None
+
+
 def safe_under(base, untrusted):
     """Resolve `untrusted` (from a URL) inside `base` and refuse anything that
     escapes it.
@@ -2555,26 +2942,63 @@ def safe_under(base, untrusted):
         raise PermissionError("path outside allowed directory")
     full = os.path.realpath(os.path.join(base, rel))
     root = os.path.realpath(base)
-    if full != root and not full.startswith(root + os.sep):
+    nc = os.path.normcase
+    if nc(full) != nc(root) and not nc(full).startswith(nc(root) + os.sep):
         raise PermissionError("path outside allowed directory")
     return full
 
 
+RECEIPT_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic",
+                ".heif", ".tif", ".tiff", ".bmp", ".txt", ".csv", ".xlsx",
+                ".xls", ".doc", ".docx", ".eml", ".msg"}
+MAX_STORED_PATH = 235   # Windows stops at 260; leave room for OneDrive sync
+
+
 def save_receipt(grant, payload):
-    """payload: {name, data(base64)} -> relative path under receipts/."""
-    fname = os.path.basename(payload.get("name") or "receipt")
-    fname = re.sub(r"[^A-Za-z0-9._ -]+", "_", fname)
-    raw = base64.b64decode(payload["data"])
+    """payload: {name, data(base64)} -> relative path under receipts/.
+
+    Never overwrites an existing file, refuses file types a browser could run
+    as a web page (.html/.svg...), and keeps the whole path short enough for
+    Windows. Raises ValueError with a message the user can act on."""
+    orig = os.path.basename(str(payload.get("name") or "receipt"))
+    stem, ext = os.path.splitext(orig)
+    ext = ext.lower()
+    if ext not in RECEIPT_EXTS:
+        raise ValueError("A %s file can't be attached as a receipt. Use a PDF "
+                         "or a photo (JPG/PNG)." % (ext or "typeless"))
+    try:
+        raw = base64.b64decode(payload["data"], validate=False)
+    except (ValueError, KeyError):
+        raise ValueError("That receipt file couldn't be read.")
     if len(raw) > 30 * 1024 * 1024:
         raise ValueError("Receipt file too large (max 30 MB)")
+    stem = _win_safe(re.sub(r"[^A-Za-z0-9._ -]+", "_", stem)) or "receipt"
     sub = os.path.join(slugify(grant["name"]), str(date.today().year))
     folder = os.path.join(RECEIPTS_DIR, sub)
-    os.makedirs(folder, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(folder, f"{stamp}_{fname}")
-    with open(path, "wb") as f:
-        f.write(raw)
-    return os.path.relpath(path, RECEIPTS_DIR)
+    for attempt in range(5):
+        tag = uuid.uuid4().hex[:6]
+        room = MAX_STORED_PATH - len(os.path.abspath(folder)) - 1 \
+            - len("%s_%s_" % (stamp, tag)) - len(ext)
+        if room < 8:
+            raise ValueError(
+                "Grants Manager is stored too deep in your folders for "
+                "Windows to save receipts. Move the whole Grants Manager "
+                "folder somewhere shorter, like C:\\GrantsManager, then try "
+                "again.")
+        name = "%s_%s_%s%s" % (stamp, tag, stem[:room].rstrip(" ."), ext)
+        path = os.path.join(folder, name)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(path, "xb") as f:   # 'x': never clobber another receipt
+                f.write(raw)
+            return os.path.relpath(path, RECEIPTS_DIR).replace("\\", "/")
+        except FileExistsError:
+            continue
+        except OSError as e:
+            raise ValueError("Couldn't save the receipt file (%s). The expense "
+                             "was not added." % (e.strerror or e))
+    raise ValueError("Couldn't pick a free name for the receipt — try again.")
 
 
 TABLES = {
@@ -2613,7 +3037,9 @@ def validate_row(table, data, creating):
         if v is None or v == "":
             continue
         try:
-            datetime.strptime(str(v), "%Y-%m-%d")
+            # "2026-9-3" parses, but stored as typed it sorts after
+            # "2026-09-30" and falls out of that month's report: normalise.
+            data[f] = datetime.strptime(str(v), "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
             raise ValueError("“%s” isn't a date the app can read. Use the "
                              "date picker, or type it as YYYY-MM-DD." % v)
@@ -2649,21 +3075,6 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.client_address[0] or "")
         return host in ("127.0.0.1", "::1", "::ffff:127.0.0.1")
 
-    def presented_key(self):
-        q = urlparse(self.path).query
-        for part in q.split("&"):
-            if part.startswith("k="):
-                return unquote(part[2:])
-        hdr = self.headers.get("X-Grants-Key")
-        if hdr:
-            return hdr
-        cookie = self.headers.get("Cookie") or ""
-        for c in cookie.split(";"):
-            c = c.strip()
-            if c.startswith("gmkey="):
-                return c[len("gmkey="):]
-        return None
-
     def check_host(self):
         """Refuse requests that address this server by a *domain name*.
 
@@ -2671,13 +3082,13 @@ class Handler(BaseHTTPRequestHandler):
         127.0.0.1 (short DNS TTL, then re-answer with the loopback address —
         "DNS rebinding"). The victim's browser then treats evil.example:8765
         as same-origin with Grants Manager: `is_local()` sees a loopback
-        client so no access key is asked for, and the CSRF check passes too
+        client so it looks like this computer, and the CSRF check passes too
         because Origin and Host now agree. Every grant, expense and receipt is
         readable and writable by that page.
 
         The defence is that a rebinding attack always arrives under a NAME.
-        Legitimate use is always by address — 127.0.0.1, localhost, or the
-        LAN IP printed at startup — so only those are accepted.
+        Legitimate use is always by address — 127.0.0.1 or localhost — so a
+        request addressed to any other name is refused.
         """
         host = (self.headers.get("Host") or "").strip()
         if not host:          # HTTP/1.0 clients may omit it
@@ -2694,26 +3105,9 @@ class Handler(BaseHTTPRequestHandler):
             return True
         except ValueError:
             pass
-        short = socket.gethostname().split(".")[0].lower()
-        if name in (short, short + ".local"):   # Bonjour name on the same Wi-Fi
-            return True
-        self.send_json({"error": "Grants Manager only answers to its own "
-                        "address. Open it at http://127.0.0.1:%d (or the "
-                        "http://<ip>:%d link shown when it started), not "
-                        "through some other web address." % (PORT, PORT)}, 403)
-        return False
-
-    def check_access(self):
-        """Off-machine requests need the access key. Returns True to continue."""
-        if self.is_local() or ACCESS_KEY is None:
-            return True
-        import hmac
-        given = self.presented_key() or ""
-        if hmac.compare_digest(given, ACCESS_KEY):
-            return True
-        self.send_json({"error": "This computer isn't authorised to open "
-                        "Grants Manager. Ask the owner for the link that "
-                        "includes the access key."}, 403)
+        self.send_json({"error": "Grants Manager only answers at its own "
+                        "address. Open it at http://127.0.0.1:%d, not "
+                        "through some other web address." % PORT}, 403)
         return False
 
     def check_not_csrf(self):
@@ -2740,6 +3134,14 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     # ------------------------------------------------------------- helpers
+    def end_headers(self):
+        # No page may frame the app (clickjacking), and browsers must trust
+        # our Content-Type rather than guessing one.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        super().end_headers()
+
     def send_json(self, obj, code=200):
         body = json.dumps(json_safe(obj), allow_nan=False).encode()
         self.send_response(code)
@@ -2782,7 +3184,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Request too large")
         return reject_wild_numbers(json.loads(self.rfile.read(length)))
 
-    def send_file(self, path, download_name=None):
+    def send_file(self, path, download_name=None, untrusted=False):
         if not os.path.isfile(path):
             self.send_json({"error": "not found"}, 404)
             return
@@ -2795,10 +3197,17 @@ class Handler(BaseHTTPRequestHandler):
                   ".xlsx": "application/vnd.openxmlformats-officedocument."
                            "spreadsheetml.sheet"}
         ext = os.path.splitext(path)[1].lower()
+        ctype = ctypes.get(ext, "application/octet-stream")
+        if untrusted and ext not in (".pdf", ".png", ".jpg", ".jpeg", ".gif",
+                                     ".webp"):
+            # a receipt is someone else's file: never let a browser render it
+            # as a page (a script in an .html/.svg would run as the app)
+            ctype = "application/octet-stream"
+            download_name = download_name or os.path.basename(path)
         with open(path, "rb") as f:
             body = f.read()
         self.send_response(200)
-        self.send_header("Content-Type", ctypes.get(ext, "application/octet-stream"))
+        self.send_header("Content-Type", ctype)
         # The app's own code (HTML/JS/CSS) must never be served stale, or after
         # someone unzips a new version their browser keeps showing the old UI
         # from cache until a manual hard-refresh. Force a re-fetch for these;
@@ -2827,15 +3236,14 @@ class Handler(BaseHTTPRequestHandler):
                 out["pid"] = os.getpid()
             self.send_json(out)
             return
-        if not self.check_access():
-            return
         try:
             if path == "/" or path == "/index.html":
                 self.send_file(os.path.join(APP_DIR, "index.html"))
             elif path.startswith("/app/"):
                 self.send_file(safe_under(APP_DIR, path[len("/app/"):]))
             elif path.startswith("/receipts/"):
-                self.send_file(safe_under(RECEIPTS_DIR, path[len("/receipts/"):]))
+                self.send_file(safe_under(RECEIPTS_DIR, path[len("/receipts/"):]),
+                               untrusted=True)
             elif path == "/api/state":
                 conn = db()
                 try:
@@ -2880,9 +3288,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(d)
                 finally:
                     conn.close()
-            elif path == "/api/lan_info":
-                self.send_json({"lan_ip": lan_ip(), "port": PORT,
-                                "key": ACCESS_KEY})
+            elif path == "/api/update/status":
+                self.send_json(dict(UPDATE_STATE))
             elif path == "/api/trash":
                 conn = db()
                 try:
@@ -2890,8 +3297,9 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     conn.close()
             elif path == "/api/backup/download":
-                make_backup(force=True)
-                self.send_file(DB_PATH, download_name=(
+                # serve the consistent snapshot just taken, not the live file
+                snap = make_backup(force=True)
+                self.send_file(snap, download_name=(
                     f"grants_backup_{date.today().isoformat()}.db"))
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -2936,10 +3344,10 @@ class Handler(BaseHTTPRequestHandler):
                             f"{r['amount']:.2f}",
                             csv_safe(r["description"]), csv_safe(r["person"] or ""),
                             csv_safe(r["receipt_path"] or ""), csv_safe(r["source"])])
-            body = buf.getvalue().encode()
+            body = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
             name = f"{slugify(grant['name'])}_ledger.csv"
             self.send_response(200)
-            self.send_header("Content-Type", "text/csv")
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
             self.send_header("Content-Disposition", f'attachment; filename="{name}"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -2977,9 +3385,9 @@ class Handler(BaseHTTPRequestHandler):
                 "Sent, waiting" if e["wd_entry"] == "sent"
                 else "Not sent yet",
                 e["id"]])
-        body = buf.getvalue().encode()
+        body = b"\xef\xbb\xbf" + buf.getvalue().encode("utf-8")
         self.send_response(200)
-        self.send_header("Content-Type", "text/csv")
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
         self.send_header("Content-Disposition",
                          'attachment; filename="workday_entry_sheet.csv"')
         self.send_header("Content-Length", str(len(body)))
@@ -2987,8 +3395,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if not self.check_host() or not self.check_access() \
-                or not self.check_not_csrf():
+        if not self.check_host() or not self.check_not_csrf():
             return
         path = unquote(urlparse(self.path).path)
         conn = db()
@@ -3000,24 +3407,57 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 table = m.group(1)
                 validate_row(table, data, creating=True)
-                if table == "expenses" and data.get("receipt"):
+                data.pop("receipt_path", None)   # only the server sets this
+                if table in ("expenses", "appointments"):
                     grant = conn.execute("SELECT * FROM grants WHERE id=?",
-                                         (data["grant_id"],)).fetchone()
+                                         (data.get("grant_id"),)).fetchone()
                     if grant is None:
                         raise ValueError("That grant no longer exists — "
                                          "reload the page and try again.")
-                    data["receipt_path"] = save_receipt(dict(grant),
-                                                        data.pop("receipt"))
+                also = data.pop("also", None) if table == "expenses" else None
+                saved = None
+                if table == "expenses" and data.get("receipt"):
+                    saved = save_receipt(dict(grant), data.pop("receipt"))
+                    data["receipt_path"] = saved
                 cols = [c for c in TABLES[table] if c in data]
-                cur = conn.execute(
-                    f"INSERT INTO {table} ({','.join(cols)}) "
-                    f"VALUES ({','.join('?' * len(cols))})",
-                    [data[c] for c in cols])
-                if table == "expenses":
-                    audit_log(conn, "added", cur.lastrowid, data.get("grant_id"),
-                              data.get("description"), data.get("amount"))
-                conn.commit()
-                self.send_json({"id": cur.lastrowid})
+                try:
+                    cur = conn.execute(
+                        f"INSERT INTO {table} ({','.join(cols)}) "
+                        f"VALUES ({','.join('?' * len(cols))})",
+                        [data[c] for c in cols])
+                    if table == "expenses":
+                        audit_log(conn, "added", cur.lastrowid,
+                                  data.get("grant_id"), data.get("description"),
+                                  data.get("amount"))
+                    also_id = None
+                    if also:   # the other half of a split: same transaction
+                        also = validate_row("expenses", dict(also), creating=True)
+                        also.pop("receipt_path", None)
+                        also.pop("receipt", None)
+                        if not conn.execute("SELECT 1 FROM grants WHERE id=?",
+                                            (also.get("grant_id"),)).fetchone():
+                            raise ValueError("The grant you're splitting with "
+                                             "no longer exists — reload the "
+                                             "page and try again.")
+                        c2 = [c for c in TABLES["expenses"] if c in also]
+                        cur2 = conn.execute(
+                            f"INSERT INTO expenses ({','.join(c2)}) "
+                            f"VALUES ({','.join('?' * len(c2))})",
+                            [also[c] for c in c2])
+                        also_id = cur2.lastrowid
+                        audit_log(conn, "added", also_id, also.get("grant_id"),
+                                  also.get("description"), also.get("amount"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    if saved:   # don't leave an orphan file behind
+                        try:
+                            os.remove(os.path.join(RECEIPTS_DIR, saved))
+                        except OSError:
+                            pass
+                    raise
+                self.send_json({"id": cur.lastrowid, "also_id": also_id}
+                               if also_id else {"id": cur.lastrowid})
                 return
             # Update record: /api/<table>/<id>
             m = re.match(r"/api/(grants|categories|people|appointments|expenses)"
@@ -3025,6 +3465,7 @@ class Handler(BaseHTTPRequestHandler):
             if m:
                 table, rid = m.group(1), int(m.group(2))
                 validate_row(table, data, creating=False)
+                data.pop("receipt_path", None)   # only the server sets this
                 if table == "expenses" and data.get("receipt"):
                     grant = conn.execute(
                         "SELECT g.* FROM grants g JOIN expenses e ON e.grant_id=g.id "
@@ -3079,6 +3520,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "batch_id": batch})
                     return
 
+                before_rows = {r["id"]: dict(r) for r in conn.execute(
+                    f"SELECT * FROM expenses WHERE id IN ({marks})", ids)}
                 # field updates — only ever the columns we explicitly allow
                 fields = data.get("fields") or {}
                 allowed = ("grant_id", "category_id", "person_id", "year",
@@ -3115,6 +3558,13 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute(
                         f"UPDATE expenses SET {assign} WHERE id IN ({marks})",
                         list(sets.values()) + ids)
+                for rid, b in before_rows.items():
+                    a = conn.execute("SELECT * FROM expenses WHERE id=?",
+                                     (rid,)).fetchone()
+                    change = audit_describe_change(conn, b, dict(a)) if a else None
+                    if change:
+                        audit_log(conn, "edited", rid, a["grant_id"],
+                                  a["description"], a["amount"], change)
                 conn.commit()
                 self.send_json({"ok": True, "count": len(ids)})
                 return
@@ -3174,16 +3624,33 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "No expenses recorded for %s — "
                                     "nothing to report yet." % d["label"]}, 400)
                     return
-                # receipts are staged FIRST: staging renames any clashing
-                # basenames and writes the final name back into each row, so
-                # the table must be rendered after it, not before
-                receipts, note = report_receipt_attachments(d)
-                attach = [report_xlsx_path(d)] + receipts
+                # receipts are staged FIRST: staging can mark a missing file in
+                # its row, so the table must be rendered after it, not before
+                receipts, note, staged = report_receipt_attachments(d)
+                xlsx = report_xlsx_path(d)
+                attach = [xlsx] + receipts
                 who = (cfg.get("owner_name") or "").strip()
                 subject = ("%s — expense report, %s" % (who, d["label"])
                            if who else "Expense report — %s" % d["label"])
-                wd_send_mail(to, "", subject,
-                             report_text(d, who, note), attachment=attach)
+                body = report_text(d, who, note)
+                too_big = (sum(os.path.getsize(a) for a in attach)
+                           > RECEIPT_ATTACH_LIMIT)
+                try:
+                    if too_big:
+                        raise OutlookUnavailable("too big for one email")
+                    wd_send_mail(to, "", subject, body, attachment=attach)
+                except OutlookUnavailable as why:
+                    folder, mailto = prepare_outbox(
+                        to, subject, body, [xlsx] + staged, d["month"])
+                    self.send_json({
+                        "ok": True, "fallback": True, "to": to,
+                        "reason": "size" if too_big else "outlook",
+                        "detail": str(why), "folder": folder,
+                        "folder_name": os.path.basename(folder),
+                        "mailto": mailto, "count": len(d["rows"]),
+                        "attachments": [os.path.basename(a)
+                                        for a in [xlsx] + staged]})
+                    return
                 sent = get_setting(conn, "reports_sent", {}) or {}
                 sent[month] = datetime.now().isoformat(timespec="seconds")
                 set_setting(conn, "reports_sent", sent)
@@ -3200,14 +3667,22 @@ class Handler(BaseHTTPRequestHandler):
                 if not to:
                     self.send_json({"error": "Recipient email is required"}, 400)
                     return
-                attach = None
-                if data.get("receipt_path"):
-                    p = os.path.join(RECEIPTS_DIR, data["receipt_path"])
-                    if os.path.isfile(p):
-                        attach = p
-                wd_send_mail(to, "",
-                             data.get("subject") or "Workday expense entry",
-                             data.get("body") or "", attach)
+                attach = receipt_abspath(data.get("receipt_path"))
+                subj = data.get("subject") or "Workday expense entry"
+                text = data.get("body") or ""
+                try:
+                    wd_send_mail(to, "", subj, text, attach)
+                except OutlookUnavailable as why:
+                    folder, mailto = prepare_outbox(
+                        to, subj, text, [attach] if attach else [], "expense")
+                    self.send_json({
+                        "ok": True, "fallback": True, "to": to,
+                        "reason": "outlook", "detail": str(why),
+                        "folder": folder,
+                        "folder_name": os.path.basename(folder),
+                        "mailto": mailto,
+                        "attachments": [os.path.basename(attach)] if attach else []})
+                    return
                 for eid in data.get("expense_ids") or []:
                     conn.execute("UPDATE expenses SET wd_entry='sent' WHERE id=?",
                                  (int(eid),))
@@ -3216,6 +3691,13 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = get_setting(conn, "workday_push", {}) or {}
                 cfg["owner_email"] = to
                 set_setting(conn, "workday_push", cfg)
+                self.send_json({"ok": True})
+                return
+            if path == "/api/outbox/open":
+                if not self.is_local():
+                    self.send_json({"error": "not found"}, 404)
+                    return
+                reveal_folder(safe_under(OUTBOX_DIR, str(data.get("name") or "")))
                 self.send_json({"ok": True})
                 return
             if path == "/api/workday/worktags":
@@ -3228,6 +3710,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if path == "/api/workday/raas_config":
+                for k in ("summary_url", "detail_url"):
+                    u = (data.get(k) or "").strip()
+                    bad = wd_check_raas_url(u) if u else ""
+                    if bad:
+                        self.send_json({"error": bad}, 400)
+                        return
                 cfg = {"summary_url": (data.get("summary_url") or "").strip(),
                        "detail_url": (data.get("detail_url") or "").strip(),
                        "username": (data.get("username") or "").strip(),
@@ -3271,6 +3759,8 @@ class Handler(BaseHTTPRequestHandler):
                         "expense_id IS NOT NULL AND "
                         "LOWER(TRIM(worker))=LOWER(TRIM(?)))",
                         (data["target_id"], data["wd_key"]))
+                if data.get("kind") in ("grant", "category"):
+                    wd_apply_balances(conn)
                 conn.commit()
                 self.send_json(wd_match(conn))
                 return
@@ -3329,15 +3819,31 @@ class Handler(BaseHTTPRequestHandler):
                 tmp_path = DB_PATH + ".restore_tmp"
                 with open(tmp_path, "wb") as f:
                     f.write(raw)
+                test = None
                 try:
                     test = sqlite3.connect(tmp_path)
                     tables = {r[0] for r in test.execute(
                         "SELECT name FROM sqlite_master WHERE type='table'")}
-                    test.close()
+                    check = [r[0] for r in test.execute(
+                        "PRAGMA integrity_check")]
                 except sqlite3.DatabaseError:
+                    if test:
+                        test.close()
                     os.remove(tmp_path)
                     self.send_json({"error": "That file isn't a valid "
                                     "database."}, 400)
+                    return
+                test.close()
+                if check != ["ok"]:
+                    # right table names but damaged pages (a truncated or
+                    # half-synced copy): replacing a healthy database with it
+                    # would lose everything
+                    os.remove(tmp_path)
+                    self.send_json({"error": "That backup file is damaged "
+                                    "(it failed SQLite's integrity check), so "
+                                    "it was NOT restored and your current "
+                                    "data is untouched. Try an earlier "
+                                    "backup."}, 400)
                     return
                 required = {"grants", "expenses", "people", "appointments"}
                 if not required.issubset(tables):
@@ -3348,7 +3854,18 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 make_backup(force=True)  # safety copy of what we're overwriting
                 conn.close()
-                os.replace(tmp_path, DB_PATH)
+                try:
+                    os.replace(tmp_path, DB_PATH)
+                except OSError as e:   # Windows refuses while the file is in use
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    self.send_json({"error": "Couldn't restore right now — "
+                                    "Windows says the data file is in use (%s). "
+                                    "Close other Grants Manager tabs and try "
+                                    "again." % (e.strerror or e)}, 400)
+                    return
                 self.send_json({"ok": True, "message": "Restored. Quit and "
                                "restart Grants Manager now to finish loading "
                                "the restored data."})
@@ -3363,11 +3880,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json("POST %s" % path, e)
         finally:
             conn.close()
-            threading.Thread(target=write_snapshot, daemon=True).start()
 
     def do_DELETE(self):
-        if not self.check_host() or not self.check_access() \
-                or not self.check_not_csrf():
+        if not self.check_host() or not self.check_not_csrf():
             return
         path = unquote(urlparse(self.path).path)
         conn = db()
@@ -3443,6 +3958,12 @@ class Handler(BaseHTTPRequestHandler):
             if table == "expenses":
                 audit_log(conn, "deleted", rid, row["grant_id"],
                           row["description"], row["amount"])
+                # A charge the user deleted must stay deleted when the same
+                # Workday report is imported again — but come back if they
+                # restore it from the trash (see trash_restore).
+                conn.execute("UPDATE workday_lines SET status='deleted' "
+                             "WHERE expense_id=? AND status IN "
+                             "('imported','matched')", (rid,))
             conn.execute(f"DELETE FROM {table} WHERE id=?", (rid,))
             conn.commit()
             self.send_json({"ok": True, "batch_id": batch})
@@ -3450,168 +3971,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json("DELETE %s" % path, e)
         finally:
             conn.close()
-            threading.Thread(target=write_snapshot, daemon=True).start()
-
-
-# ------------------------------------------------------- phone snapshot
-
-def _month_key(d):
-    return d[:7]
-
-
-def _add_months(ym, n):
-    y, m = int(ym[:4]), int(ym[5:7])
-    t = y * 12 + (m - 1) + n
-    return f"{t // 12:04d}-{t % 12 + 1:02d}"
-
-
-def _months_between(a, b):
-    if a > b:
-        return 0
-    return (int(b[:4]) * 12 + int(b[5:7])) - (int(a[:4]) * 12 + int(a[5:7])) + 1
-
-
-def compute_projections(conn):
-    """Per-grant future commitments — same rules as the web UI."""
-    today = date.today().isoformat()
-    out = {}
-    for a in conn.execute("SELECT * FROM appointments"):
-        g = conn.execute("SELECT * FROM grants WHERE id=?", (a["grant_id"],)).fetchone()
-        if not g or g["status"] != "active":
-            continue
-        g_end = g["nce_end_date"] or g["end_date"]
-        ends = sorted(x for x in [a["end_date"] and _month_key(a["end_date"]),
-                                  g_end and _month_key(g_end)] if x)
-        if not ends:
-            continue
-        end_ym = ends[0]
-        charged = [_month_key(e["date"]) for e in conn.execute(
-            "SELECT e.date FROM expenses e JOIN categories c ON c.id=e.category_id "
-            "WHERE e.grant_id=? AND e.person_id=? AND e.amount>0 AND c.name='Personnel'",
-            (a["grant_id"], a["person_id"]))]
-        start_ym = _month_key(a["start_date"] or today)
-        if charged:
-            nxt = _add_months(max(charged), 1)
-            start_ym = max(start_ym, nxt)
-        else:
-            start_ym = max(start_ym, _month_key(today))
-        months = _months_between(start_ym, end_ym)
-        if months <= 0:
-            continue
-        sal = a["monthly_salary"] * months
-        fri = sal * (a["fringe_rate"] or 0) / 100
-        tui = (a["annual_tuition"] or 0) / 12 * months
-        d = out.setdefault(a["grant_id"], {"salary": 0, "fringe": 0, "tuition": 0})
-        d["salary"] += sal
-        d["fringe"] += fri
-        d["tuition"] += tui
-    return out
-
-
-def write_snapshot():
-    """Write a read-only, phone-formatted snapshot next to GrantsApp
-    (inside the OneDrive-synced folder) so it can be opened on an iPhone."""
-    try:
-        conn = db()
-        fmt = lambda v: "${:,.0f}".format(v)
-        # Grant/category names are free text (and can arrive from a Workday
-        # import), so escape them rather than trusting them in HTML.
-        esc = lambda t: (str(t if t is not None else "").replace("&", "&amp;")
-                         .replace("<", "&lt;").replace(">", "&gt;"))
-        projs = compute_projections(conn)
-        grants = rows_to_list(conn.execute(
-            "SELECT * FROM grants ORDER BY status, end_date"))
-        cards = []
-        tot_sal_now = tot_sal_proj = tot_avail = 0.0
-        for g in grants:
-            if g["status"] != "active" or g["name"] == "Other":
-                continue
-            spent = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) FROM expenses WHERE grant_id=?",
-                (g["id"],)).fetchone()[0]
-            avail = g["initial_amount"] - spent
-            per_cat = {}
-            for r in conn.execute(
-                    "SELECT c.name, COALESCE(SUM(b.amount),0) AS bud FROM budget_lines b "
-                    "JOIN categories c ON c.id=b.category_id WHERE b.grant_id=? "
-                    "GROUP BY c.name", (g["id"],)):
-                per_cat[r["name"]] = {"budget": r["bud"], "spent": 0.0}
-            for r in conn.execute(
-                    "SELECT c.name, COALESCE(SUM(e.amount),0) AS sp FROM expenses e "
-                    "JOIN categories c ON c.id=e.category_id WHERE e.grant_id=? "
-                    "GROUP BY c.name", (g["id"],)):
-                per_cat.setdefault(r["name"], {"budget": 0.0, "spent": 0.0})
-                per_cat[r["name"]]["spent"] = r["sp"]
-            p = projs.get(g["id"], {"salary": 0, "fringe": 0, "tuition": 0})
-            sal_now = per_cat.get("Personnel", {"budget": 0, "spent": 0})
-            sal_now = sal_now["budget"] - sal_now["spent"]
-            fri_rem = per_cat.get("Fringe", {"budget": 0, "spent": 0})
-            fri_rem = fri_rem["budget"] - fri_rem["spent"]
-            tui_rem = per_cat.get("Tuition", {"budget": 0, "spent": 0})
-            tui_rem = tui_rem["budget"] - tui_rem["spent"]
-            sal_proj = (sal_now - p["salary"]
-                        - max(0, p["fringe"] - max(0, fri_rem))
-                        - max(0, p["tuition"] - max(0, tui_rem)))
-            proj_avail = avail - p["salary"] - p["fringe"] - p["tuition"]
-            tot_sal_now += max(0, sal_now)
-            tot_sal_proj += max(0, sal_proj)
-            tot_avail += avail
-            end = g["nce_end_date"] or g["end_date"] or "—"
-            rows = "".join(
-                f"<tr><td>{esc(n)}</td><td class=n>{fmt(v['budget'] - v['spent'])}</td></tr>"
-                for n, v in sorted(per_cat.items())
-                if v["budget"] or v["spent"])
-            neg = ' style="color:#d24545"' if sal_proj < 0 else ""
-            cards.append(
-                f"<div class=card><h2>{esc(g['name'])}</h2>"
-                f"<div class=sub>{esc(g['agency'])} · ends {esc(end)}</div>"
-                f"<div class=big>{fmt(avail)} <small>available now</small></div>"
-                f"<div class=big2{neg}>{fmt(sal_proj)} <small>salary after "
-                f"projections</small></div>"
-                f"<table><tr><th>Category</th><th class=n>Remaining</th></tr>{rows}"
-                f"</table></div>")
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Grants Snapshot</title><style>
-body{{font-family:-apple-system,Helvetica,sans-serif;background:#f7f8fa;color:#1a2333;
-margin:0;padding:14px;font-size:15px}}
-h1{{font-size:20px;margin:4px 0 2px}} h2{{font-size:16px;margin:0 0 2px}}
-.sub{{color:#6b7688;font-size:12.5px;margin-bottom:8px}}
-.card{{background:#fff;border:1px solid #e5e8ee;border-radius:12px;padding:14px;
-margin:10px 0;box-shadow:0 1px 3px rgba(20,30,60,.06)}}
-.big{{font-size:21px;font-weight:700}} .big2{{font-size:16px;font-weight:600;color:#1d9a6c}}
-.big small,.big2 small{{font-size:11px;color:#6b7688;font-weight:500}}
-table{{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}}
-th{{text-align:left;color:#6b7688;font-size:10.5px;text-transform:uppercase;
-padding:4px 0;border-bottom:1px solid #e5e8ee}}
-td{{padding:4px 0;border-bottom:1px solid #f0f2f6}} .n{{text-align:right}}
-.stats{{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}}
-.stat{{flex:1;min-width:140px;background:#fff;border:1px solid #e5e8ee;
-border-radius:12px;padding:10px}}
-.stat .l{{font-size:10px;color:#6b7688;text-transform:uppercase;font-weight:600}}
-.stat .v{{font-size:17px;font-weight:700}}
-@media(prefers-color-scheme:dark){{body{{background:#12161f;color:#e6eaf2}}
-.card,.stat{{background:#1a2030;border-color:#2a3245}}
-td{{border-color:#232b3d}}th{{border-color:#2a3245}}}}
-</style></head><body>
-<h1>💰 Grants Snapshot</h1>
-<div class=sub>Read-only · updated {stamp} · open the app on your Mac to edit</div>
-<div class=stats>
-<div class=stat><div class=l>Salary to hire (projected)</div><div class=v style="color:#1d9a6c">{fmt(tot_sal_proj)}</div></div>
-<div class=stat><div class=l>Salary now</div><div class=v>{fmt(tot_sal_now)}</div></div>
-<div class=stat><div class=l>Available (all active)</div><div class=v>{fmt(tot_avail)}</div></div>
-</div>
-{''.join(cards)}
-<div class=sub style="margin-top:14px">Generated automatically by Grants Manager
-whenever data changes. This file lives in OneDrive, so it syncs to your phone.</div>
-</body></html>"""
-        out = os.path.join(os.path.dirname(BASE_DIR), "Grants Snapshot.html")
-        with open(out, "w") as f:
-            f.write(html)
-        conn.close()
-    except Exception:  # noqa: BLE001 — snapshot must never break the app
-        pass
 
 
 CLEAN_README = """# Grants Manager
@@ -3700,17 +4059,11 @@ official balances and posted charges (drop report exports into a
 `workday_imports/` folder next to the app, or set up a direct RaaS
 connection in the ⇅ Workday panel), and push new expenses as
 workday-ready emails to your financial team through **Microsoft Outlook**
-(Mac or Windows), with the receipt PDF attached and you CC'd.
-
-## Use it on your iPhone
-
-With the app running on your computer and the phone on the **same Wi-Fi**:
-
-1. The terminal shows a line like `On your iPhone: http://192.168.1.x:8765`
-2. Open that address in Safari on the phone.
-3. Tap **Share → Add to Home Screen** — it installs like a native app with
-   its own icon and opens full screen. (The computer must be running the
-   app while you use it from the phone.)
+(Mac or Windows), with the receipt PDF attached and you CC'd. If Outlook can't
+be controlled (the "new Outlook" or none installed), the app prepares a folder
+with the files and a ready-to-send email draft instead. Monthly report receipts
+are renamed like `03 - 2026-09-15 - 412.75 - Lab supplies.pdf`, matching the
+Receipt column of the workbook row they belong to.
 
 ## Updating to a newer version
 
@@ -3775,13 +4128,23 @@ WIN_BAT = "\r\n".join([
     "rem If server.py isn't beside us, this was launched from INSIDE the .zip.",
     'if not exist "server.py" goto notextracted',
     "",
-    "rem Find a working Python 3 without tripping the Store alias.",
+    "rem Find a working Python 3.9+ without tripping the Store alias. Each",
+    "rem candidate is run with an argument (the alias only opens the Store when",
+    "rem run with none) and must report 3.9 or newer - an old Python 2 on the",
+    "rem PATH must not be mistaken for a working install.",
     'set "PY="',
-    'py -3 --version >nul 2>&1 && set "PY=py -3"',
-    'if not defined PY ( python --version >nul 2>&1 && set "PY=python" )',
-    'if not defined PY ( python3 --version >nul 2>&1 && set "PY=python3" )',
-    "if not defined PY goto nopython",
+    'for %%C in ("py -3" "python" "python3") do (',
+    '  if not defined PY (',
+    '    %%~C -c "import sys; sys.exit(0 if sys.version_info>=(3,9) else 1)" >nul 2>&1 && set "PY=%%~C"',
+    '  )',
+    ')',
+    "if defined PY goto havepython",
+    'py -3 --version >nul 2>&1 && goto tooold',
+    'python --version >nul 2>&1 && goto tooold',
+    'python3 --version >nul 2>&1 && goto tooold',
+    "goto nopython",
     "",
+    ":havepython",
     "%PY% server.py --launch",
     "if %errorlevel%==0 goto :eof",
     "goto startfailed",
@@ -3797,6 +4160,17 @@ WIN_BAT = "\r\n".join([
     "echo     3. Open the extracted folder.",
     "echo     4. Double-click this file again.",
     "echo.",
+    "pause",
+    "goto :eof",
+    "",
+    ":tooold",
+    "echo.",
+    "echo   The Python on this computer is too old - this app needs Python 3.9",
+    "echo   or newer. Installing a current one is free and needs no admin rights.",
+    "echo   Opening the Microsoft Store: click \"Get\" (or \"Update\"), wait for it",
+    "echo   to finish, then double-click this file again.",
+    "echo.",
+    'start "" "ms-windows-store://search/?query=Python 3"',
     "pause",
     "goto :eof",
     "",
@@ -3863,7 +4237,6 @@ def make_clean_copy():
         ("app/app.js", os.path.join(APP_DIR, "app.js")),
         ("app/chart.umd.js", os.path.join(APP_DIR, "chart.umd.js")),
         ("app/icon.png", os.path.join(APP_DIR, "icon.png")),
-        ("app/manifest.json", os.path.join(APP_DIR, "manifest.json")),
     ]
     # the Instructions walkthrough clips — swept rather than listed, so a new
     # one is shared automatically instead of showing as a broken image
@@ -3999,18 +4372,19 @@ def find_free_port(start, tries=50):
     raise RuntimeError(f"No free port found near {start}")
 
 
-def lan_ip():
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except OSError:
-        return None
-
-
 def main():
     global PORT
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     launch = "--launch" in sys.argv
+    if "--port" in sys.argv:
+        try:
+            PORT = int(sys.argv[sys.argv.index("--port") + 1])
+        except (ValueError, IndexError):
+            pass
     if port_in_use(PORT):
         info = our_server_info(PORT)
         if info is not None:
@@ -4059,10 +4433,13 @@ def main():
         print("  'conflicted copy' file beside it — it may hold your newest work.")
         print("  Help: samuelbf@uark.edu\n")
         sys.exit(1)
-    write_snapshot()
     # Look for a new release in the background — never delays startup, and is
     # silently skipped when there's no internet.
     threading.Thread(target=check_for_update, daemon=True).start()
+    try:   # older versions kept a secret here for the removed phone feature
+        os.remove(os.path.join(DATA_DIR, "access_key.txt"))
+    except OSError:
+        pass
     try:
         make_backup()  # one automatic dated copy per day, pruned after 30
         prune_backups()
@@ -4077,23 +4454,24 @@ def main():
         make_clean_copy()  # keep the shareable (data-free) zip fresh
     except OSError:
         pass
-    load_access_key()
-    # bind all interfaces so the app is reachable from a phone on the same Wi-Fi
+    # Listen on this computer only. Nothing else on the network can reach the
+    # app, and Windows never shows its "allow this app through the firewall"
+    # prompt (which needs admin rights) for a loopback-only listener.
     global SERVER
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server.daemon_threads = False   # server_close() then waits for requests
     SERVER = server
     print(f"Grants Manager running at {url}  (Ctrl+C to stop)")
-    ip = lan_ip()
-    if ip:
-        print(f"On your iPhone (same Wi-Fi): http://{ip}:{PORT}/?k={ACCESS_KEY}")
-        print("  ^ that link includes your access key — anyone with it can see")
-        print("    your grants, so treat it like a password.")
     if launch:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        # let a request already in progress (an email being sent, an import)
+        # finish before the process exits, instead of cutting it off half-done
+        server.server_close()
 
 
 if __name__ == "__main__":
