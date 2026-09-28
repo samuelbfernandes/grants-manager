@@ -2166,7 +2166,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.6"
+APP_VERSION = "1.4.7"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -2243,7 +2243,274 @@ def update_info():
         info.update(available=True, latest=latest, notes=c.get("notes") or "",
                     url=c.get("url") or "", published=c.get("published") or "",
                     name=c.get("name") or "")
+        blocker = update_blocker()
+        info.update(can_install=not blocker, blocker=blocker)
     return info
+
+
+# ------------------------------------------------------------ self-update
+#
+# One click installs the newest release over the running copy. The rule that
+# keeps users' work safe: only PROGRAM files are ever written (server.py, the
+# app/ folder, README). data/ and receipts/ are not on that list, so an update
+# cannot overwrite the database, backups or receipts — there is nothing to
+# "copy your data across". The old program is kept in data/code_backups/, the
+# database is backed up first, and any failure rolls the files back.
+
+UPDATE_MAX_ZIP = 40 * 1024 * 1024
+UPDATE_MAX_UNPACKED = 120 * 1024 * 1024
+UPDATE_CODE_BACKUPS_KEPT = 2
+UPDATE_ASSET = "GrantsManager.zip"
+UPDATE_LOCK = threading.Lock()
+_UPDATE_EXTS = (".html", ".css", ".js", ".png", ".gif", ".json", ".md")
+
+
+class UpdateError(Exception):
+    """A problem worth showing the user, in plain words."""
+
+
+def update_blocker():
+    """Why this copy can't update itself in place ('' when it can)."""
+    if os.path.isdir(os.path.join(BASE_DIR, ".git")):
+        return ("This copy is a developer checkout (it has a .git folder), "
+                "so update it with git instead.")
+    probe = os.path.join(BASE_DIR, ".update-write-test")
+    try:
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+    except OSError:
+        return ("Grants Manager can't write to its own folder, so it can't "
+                "update itself. Download the new version instead.")
+    return ""
+
+
+def _update_wanted(rel):
+    """Only program files are ever installed. The two starter scripts are
+    deliberately excluded: a running .bat is read line by line by Windows, so
+    rewriting it under itself can break the launch that is replacing it."""
+    if rel in ("server.py", "README.md"):
+        return True
+    parts = rel.split("/")
+    return (parts[0] == "app" and 2 <= len(parts) <= 3
+            and rel.lower().endswith(_UPDATE_EXTS))
+
+
+def update_fetch_zip(version, dest):
+    """Download the release zip for `version` to `dest` (HTTPS, this repo only)
+    and check it against the SHA-256 GitHub publishes for the asset."""
+    import hashlib
+    import urllib.error
+    import urllib.request
+    if not re.match(r"^\d+(\.\d+){1,3}$", str(version)):
+        raise UpdateError("Unrecognised version number.")
+    tag = "v%s" % version
+    digest = None
+    try:  # the published checksum is best-effort: rate limits shouldn't block
+        req = urllib.request.Request(
+            "https://api.github.com/repos/%s/releases/tags/%s"
+            % (UPDATE_REPO, tag),
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": "GrantsManager/%s" % APP_VERSION})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rel = json.loads(r.read(1_000_000).decode("utf-8", "replace"))
+        for a in rel.get("assets") or []:
+            if a.get("name") == UPDATE_ASSET and str(
+                    a.get("digest") or "").startswith("sha256:"):
+                digest = a["digest"].split(":", 1)[1].lower()
+    except Exception:  # noqa: BLE001
+        pass
+    url = "https://github.com/%s/releases/download/%s/%s" % (
+        UPDATE_REPO, tag, UPDATE_ASSET)
+    h, size = hashlib.sha256(), 0
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "GrantsManager/%s" % APP_VERSION})
+        with urllib.request.urlopen(req, timeout=60) as r, \
+                open(dest, "wb") as out:
+            while True:
+                chunk = r.read(65536)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > UPDATE_MAX_ZIP:
+                    raise UpdateError("The download is larger than expected.")
+                h.update(chunk)
+                out.write(chunk)
+    except urllib.error.HTTPError as e:
+        raise UpdateError("GitHub returned an error (HTTP %d) for that "
+                          "version." % e.code)
+    except (urllib.error.URLError, OSError) as e:
+        raise UpdateError("Couldn't download the update — check your internet "
+                          "connection (%s)." % getattr(e, "reason", e))
+    if digest and h.hexdigest() != digest:
+        raise UpdateError("The download didn't match GitHub's checksum, so it "
+                          "was discarded. Nothing was changed.")
+
+
+def update_stage(zip_path, want_version, stage_dir):
+    """Validate a downloaded release and unpack ONLY its program files into
+    `stage_dir`. Returns the relative paths staged. Nothing live is touched."""
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except (zipfile.BadZipFile, OSError):
+        raise UpdateError("The downloaded file isn't a valid update package.")
+    wanted, total = [], 0
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = info.filename.replace("\\", "/")
+        rel = name[len("GrantsManager/"):] if name.startswith(
+            "GrantsManager/") else None
+        if rel is None:
+            raise UpdateError("The update package has an unexpected layout.")
+        parts = rel.split("/")
+        if (rel.startswith("/") or "" in parts or ".." in parts
+                or ":" in rel):
+            raise UpdateError("The update package contains an unsafe path.")
+        if not _update_wanted(rel):
+            continue
+        total += info.file_size
+        if total > UPDATE_MAX_UNPACKED:
+            raise UpdateError("The update package is larger than expected.")
+        wanted.append((rel, info))
+    rels = {r for r, _ in wanted}
+    for need in ("server.py", "app/index.html", "app/app.js",
+                 "app/styles.css"):
+        if need not in rels:
+            raise UpdateError("The update package is incomplete (missing %s)."
+                              % need)
+    src = zf.read("GrantsManager/server.py").decode("utf-8")
+    m = re.search(r'^APP_VERSION = "([^"]+)"', src, re.M)
+    if not m or m.group(1) != str(want_version):
+        raise UpdateError("The package holds version %s, not the expected %s."
+                          % (m.group(1) if m else "?", want_version))
+    try:
+        compile(src, "server.py", "exec")
+    except SyntaxError:
+        raise UpdateError("The new version failed a safety check.")
+    shutil.rmtree(stage_dir, ignore_errors=True)
+    for rel, info in wanted:
+        dst = os.path.join(stage_dir, *rel.split("/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with zf.open(info) as fin, open(dst, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+    # the new code must import cleanly on THIS machine's Python before we
+    # put it in place — a version that can't start must never replace one
+    # that can
+    import subprocess
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); import server; "
+             "print(server.APP_VERSION)", stage_dir],
+            capture_output=True, text=True, timeout=60, cwd=stage_dir)
+    except (OSError, subprocess.TimeoutExpired):
+        raise UpdateError("The new version couldn't be test-loaded.")
+    if r.returncode != 0 or r.stdout.strip() != str(want_version):
+        raise UpdateError("The new version failed to load on this computer "
+                          "(it may need a newer Python). Nothing was changed.")
+    return sorted(rels)
+
+
+def update_apply(stage_dir, rels, old_version):
+    """Swap the staged program files in, keeping the old ones. Rolls back on
+    any error. Never touches data/ or receipts/ (not in `rels`)."""
+    for rel in rels:
+        assert rel.split("/")[0] not in ("data", "receipts"), rel
+    bdir = os.path.join(DATA_DIR, "code_backups", "v%s" % old_version)
+    shutil.rmtree(bdir, ignore_errors=True)
+    for rel in rels:
+        cur = os.path.join(BASE_DIR, *rel.split("/"))
+        if os.path.isfile(cur):
+            dst = os.path.join(bdir, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(cur, dst)
+    order = [r for r in rels if r != "server.py"] + ["server.py"]
+    done = []
+    try:
+        for rel in order:
+            dst = os.path.join(BASE_DIR, *rel.split("/"))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            tmp = dst + ".update-tmp"
+            shutil.copyfile(os.path.join(stage_dir, *rel.split("/")), tmp)
+            os.replace(tmp, dst)
+            done.append(rel)
+    except Exception as e:  # noqa: BLE001 — put everything back
+        for rel in done:
+            dst = os.path.join(BASE_DIR, *rel.split("/"))
+            old = os.path.join(bdir, *rel.split("/"))
+            try:
+                if os.path.isfile(old):
+                    shutil.copyfile(old, dst)
+                else:
+                    os.remove(dst)
+            except OSError:
+                pass
+        raise UpdateError("Couldn't install the update (%s). Your current "
+                          "version was restored." % e)
+    root = os.path.join(DATA_DIR, "code_backups")  # keep only the newest few
+    olds = sorted((d for d in os.listdir(root) if d.startswith("v")),
+                  key=lambda d: os.path.getmtime(os.path.join(root, d)))
+    for d in olds[:-UPDATE_CODE_BACKUPS_KEPT]:
+        shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+    return bdir
+
+
+def update_restart():
+    """Start the freshly installed copy in the background. It finds this old
+    one on the port and takes over (graceful /api/shutdown), so the page can
+    simply wait for the new version to answer. Delayed so this request's
+    response is delivered first."""
+    def go():
+        import subprocess
+        time.sleep(0.8)
+        try:
+            log = open(os.path.join(DATA_DIR, "last_start.log"), "ab")
+        except OSError:
+            log = subprocess.DEVNULL
+        kw = dict(cwd=BASE_DIR, stdin=subprocess.DEVNULL, stdout=log,
+                  stderr=log, close_fds=True)
+        if os.name == "nt":  # DETACHED | NEW_PROCESS_GROUP | NO_WINDOW
+            kw["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
+        else:
+            kw["start_new_session"] = True
+        subprocess.Popen([sys.executable, os.path.join(BASE_DIR, "server.py")],
+                         **kw)
+    threading.Thread(target=go, daemon=True).start()
+
+
+def update_install():
+    """The whole one-click update. Returns what the UI should tell the user."""
+    if not UPDATE_LOCK.acquire(blocking=False):
+        raise UpdateError("An update is already in progress.")
+    try:
+        blocker = update_blocker()
+        if blocker:
+            raise UpdateError(blocker)
+        check_for_update(force=True)
+        c = read_update_cache()
+        latest = c.get("latest") or ""
+        if not latest or _version_tuple(latest) <= _version_tuple(APP_VERSION):
+            raise UpdateError("You're already on the newest version (%s)."
+                              % APP_VERSION)
+        work = os.path.join(DATA_DIR, "update_work")
+        shutil.rmtree(work, ignore_errors=True)
+        os.makedirs(work, exist_ok=True)
+        try:
+            zpath = os.path.join(work, UPDATE_ASSET)
+            update_fetch_zip(latest, zpath)
+            rels = update_stage(zpath, latest, os.path.join(work, "stage"))
+            db_backup = make_backup(force=True)
+            update_apply(os.path.join(work, "stage"), rels, APP_VERSION)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        update_restart()
+        return {"ok": True, "version": latest, "from": APP_VERSION,
+                "db_backup": os.path.basename(db_backup or "")}
+    finally:
+        UPDATE_LOCK.release()
 
 
 # Changes every time the app starts. The dashboard hangs dismissed alerts off
@@ -3026,6 +3293,22 @@ class Handler(BaseHTTPRequestHandler):
                 if SERVER is not None:
                     threading.Thread(target=SERVER.shutdown, daemon=True).start()
                 return
+            if path == "/api/update/install":
+                # Replaces program files, so only from the machine running the
+                # app (the CSRF gate above already blocks web pages).
+                if not self.is_local():
+                    self.send_json({"error": "Updates can only be started "
+                                    "from the computer that runs Grants "
+                                    "Manager."}, 403)
+                    return
+                try:
+                    self.send_json(update_install())
+                except UpdateError as e:
+                    self.send_json({"error": str(e)}, 400)
+                except Exception as e:  # noqa: BLE001
+                    self.send_json({"error": "The update failed (%s). Nothing "
+                                    "was changed." % e}, 500)
+                return
             if path == "/api/export_clean":
                 self.send_json({"path": make_clean_copy()})
                 return
@@ -3429,6 +3712,23 @@ With the app running on your computer and the phone on the **same Wi-Fi**:
    its own icon and opens full screen. (The computer must be running the
    app while you use it from the phone.)
 
+## Updating to a newer version
+
+When a newer version exists, the app tells you (bell icon, and at the bottom
+of **⚙ Settings**). Click it, then **Update now**. The app downloads the
+release from this project's GitHub page, installs it over the current copy
+and restarts itself. **Your data is never touched** — grants, expenses,
+receipts, backups and settings stay exactly where they are. It backs up your
+database first and keeps your previous version in `data/code_backups/`, so you
+can go back. It works only from the computer running the app, in a folder the
+app can write to; otherwise it points you to the download instead.
+
+*By hand instead* (or when coming from a version older than 1.4.7, which
+can't update itself): download the new `GrantsManager.zip`, extract it, and
+copy **both** your `data` folder (database, backups, settings) **and** your
+`receipts` folder from the old copy into the new one, replacing the empty
+ones. Then start the new copy — it takes over from the old one on its own.
+
 ## Your data
 
 Everything lives in this folder: `data/grants.db` (the database) and
@@ -3460,10 +3760,10 @@ backup from the Settings panel.
 - **Browser doesn't open** — start it yourself and visit
   <http://127.0.0.1:8765>.
 - **`python3` / `py` not found** — install Python (see above).
-- **The app opens showing someone's existing data** — another copy of
-  Grants Manager is already running on this computer (the starter then
-  just opens that one). Close the other copy first (quit its terminal
-  window), then start this one.
+- **The app shows different data than I expected** — you probably opened
+  a different copy (folder) of Grants Manager. Every copy keeps its own data
+  inside its own folder, and opening a copy replaces whichever copy was
+  already running. Open the folder that holds your real `data` folder.
 - **Stop the app** — close the terminal window.
 """
 

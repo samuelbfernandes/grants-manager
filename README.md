@@ -181,9 +181,19 @@ what changed in it. About once every 15 days the app asks GitHub for the
 latest released version number — it sends nothing about you or your grants,
 and if you're offline it quietly does nothing and tries again later.
 
-To update: download the new `GrantsManager.zip`, unzip it, and copy your
-existing `data` folder into the new folder, replacing the empty one. Your
-grants, expenses and receipts all live in there.
+**To update, click the new-version notice (the bell, or the bottom of
+⚙ Settings) and choose "Update now".** The app downloads the release from this
+project's GitHub page, installs it over the current copy and restarts itself.
+Your data is never touched — grants, expenses, receipts, backups and settings
+stay exactly where they are. It backs up your database first and keeps your
+previous version in `data/code_backups/`, so you can always go back. It works
+only from the computer that runs the app, in a folder the app can write to.
+
+*Updating by hand instead* (or from a version older than 1.4.7, which can't
+update itself): download the new `GrantsManager.zip`, extract it, and copy
+**both** your `data` folder (database, backups, settings) **and** your
+`receipts` folder into the new folder, replacing the empty ones. Then start
+the new copy — it takes over from the old one automatically.
 
 ---
 

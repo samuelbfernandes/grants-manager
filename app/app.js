@@ -1809,7 +1809,7 @@ function renderInstructions() {
     ${sec("🔔 Notifications", `
       <p>The bell in the top bar shows a <strong>red dot</strong> when something needs you: a grant gone over budget, a category over its line for the current year, an award ending within 60 days, receipts missing from recent manual entries, or a monthly report you haven't sent yet.</p>
       <p>Click a notification to jump straight to what it's about. <em>Mark all read</em> clears the dot until something new happens. If you've added the app to your home screen or dock, the badge appears on the app icon too, and the browser tab icon carries a small red count.</p>
-      <p><strong>New versions.</strong> The bell also tells you when a newer version of Grants Manager has been released. Click it to read <em>what changed</em> in that version and, if you want it, a button to open the download page. Updating never touches your data — you unzip the new folder and copy your existing <code>data</code> folder into it.</p>
+      <p><strong>New versions.</strong> The bell also tells you when a newer version of Grants Manager has been released. Click it to read <em>what changed</em> in that version, then press <strong>Update now</strong>: the app installs the new version over this one and restarts itself. Updating never touches your data — grants, expenses, receipts, backups and settings stay exactly where they are, your database is backed up first, and your previous version is kept in <code>data/code_backups/</code>. (If this copy can't update itself, the dialog explains why and links the download; then copy both your <code>data</code> and <code>receipts</code> folders into the new folder.)</p>
       <p class="sub">How the check works: about <strong>once every 15 days</strong>, the app asks GitHub what the latest released version number is. It sends nothing about you or your grants — no data leaves your computer, it only reads a public version number. If you're offline it silently does nothing and tries again next time; you'll never see an error about it.</p>
       ${demo('notifications', 'The 🔔 bell collects everything the app wants to tell you; clicking an item opens the grant it is about.')}
     `)}
@@ -1937,16 +1937,53 @@ function updateModal(u) {
   }
   if (inList) html += "</ul>";
   if (!html) html = `<p class="sub">No release notes were published for this version.</p>`;
+  const manual = u.url ? `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer" style="color:var(--accent)">download it yourself</a>` : "download it yourself";
   modal(`
     <h2>⬆ Version ${esc(u.latest)} is available</h2>
-    <p class="sub" style="margin-bottom:10px">You're running ${esc(u.current)}${u.published ? ` · released ${esc(u.published)}` : ""}. Your data isn't touched by updating — you keep the same <code>data</code> folder.</p>
-    <div style="max-height:46vh;overflow:auto;border:1px solid var(--line,#e5e8ee);border-radius:10px;padding:10px 14px;font-size:13.5px">${html}</div>
-    <p class="sub" style="margin-top:10px">To update: download the new <code>GrantsManager.zip</code>, unzip it, and copy your existing <code>data</code> folder into the new folder (replacing the empty one). Then start it as usual.</p>
-    <div class="actions">
+    <p class="sub" style="margin-bottom:10px">You're running ${esc(u.current)}${u.published ? ` · released ${esc(u.published)}` : ""}.</p>
+    <div style="max-height:40vh;overflow:auto;border:1px solid var(--line,#e5e8ee);border-radius:10px;padding:10px 14px;font-size:13.5px">${html}</div>
+    <div id="up-body">
+      ${u.can_install
+        ? `<p class="sub" style="margin-top:12px"><strong>Update now</strong> installs it over this copy and restarts the app. <strong>All your data stays exactly as it is</strong> — grants, expenses, receipts, backups and settings are never touched. A backup of your database is taken first, and your current version is kept in case you ever want to go back.</p>`
+        : `<p class="sub" style="margin-top:12px;border-left:3px solid #b97a08;padding-left:10px">${esc(u.blocker || "This copy can't update itself.")} You can ${manual} instead: unzip it, then copy your <code>data</code> <strong>and</strong> <code>receipts</code> folders into the new folder.</p>`}
+    </div>
+    <div class="actions" id="up-actions">
       <button class="btn secondary" id="m-cancel">Later</button>
-      ${u.url ? `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer"><button class="btn">Open download page</button></a>` : ""}
+      ${u.can_install ? `<button class="btn" id="up-go">⬆ Update now</button>` : (u.url ? `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer"><button class="btn">Open download page</button></a>` : "")}
     </div>`, (el, close) => {
     $("#m-cancel", el).onclick = close;
+    const go = $("#up-go", el);
+    if (!go) return;
+    go.onclick = async () => {
+      const body = $("#up-body", el), actions = $("#up-actions", el);
+      const say = (html) => { body.innerHTML = `<p style="margin:14px 0 4px">${html}</p>`; };
+      actions.style.display = "none";
+      say(`<span class="spinner"></span> Downloading and installing version ${esc(u.latest)}… this takes a few seconds. Please keep this window open.`);
+      let r;
+      try {
+        r = await api("/api/update/install", "POST", {});
+      } catch (err) {
+        say(`<strong style="color:var(--red,#b3261e)">Couldn't update.</strong> ${esc(err.message)}<br><span class="sub">Nothing was changed — you're still on ${esc(u.current)} with all your data. You can also ${manual}.</span>`);
+        actions.style.display = ""; go.remove();
+        return;
+      }
+      say(`<span class="spinner"></span> Installed. Restarting Grants Manager…`);
+      // wait for the NEW version to answer, then load its screens
+      const t0 = Date.now();
+      const poll = async () => {
+        try {
+          const j = await (await fetch("/api/ping", { cache: "no-store" })).json();
+          if (j && j.version === r.version) { location.reload(); return; }
+        } catch (e) { /* server is between versions — keep waiting */ }
+        if (Date.now() - t0 > 60000) {
+          say(`<strong>Version ${esc(r.version)} is installed</strong>, but the app hasn't come back on its own. Close this tab and open Grants Manager the way you normally do — your data is safe.`);
+          actions.style.display = ""; go.remove();
+          return;
+        }
+        setTimeout(poll, 1000);
+      };
+      setTimeout(poll, 1500);
+    };
   });
 }
 
