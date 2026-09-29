@@ -1639,9 +1639,12 @@ function wdDashCards() {
     html += `<div class="card">
       <div class="section-head">
         <h2>→ To enter in Workday (${queue.length})</h2>
-        <a href="${"/api/workday/entry_sheet.csv"}" class="no-print"><button class="btn secondary small">⬇ Entry sheet (CSV)</button></a>
+        <span class="no-print" style="display:flex;gap:6px">
+          ${queue.length > 1 ? `<button class="btn secondary small" id="wd-done-all" title="Hide every expense in this list — use once they're all entered in Workday">✓ Mark all entered</button>` : ""}
+          <a href="${"/api/workday/entry_sheet.csv"}"><button class="btn secondary small">⬇ Entry sheet (CSV)</button></a>
+        </span>
       </div>
-      <p class="sub" style="margin-bottom:8px">Expenses added here that haven't shown up in Workday yet. 📤 reopens the send-to-Workday box; a row clears itself once the posted charge syncs back in.</p>
+      <p class="sub" style="margin-bottom:8px">Expenses added here that haven't shown up in Workday yet. 📤 reopens the send-to-Workday box. Once you've entered one in Workday, click <strong>✓ Entered</strong> to take it off this list (a row also clears itself when the posted charge syncs back in).</p>
       <table>
         <thead><tr><th>Date</th><th>Grant</th><th>Category</th><th>Description</th><th class="num">Amount</th><th>Status</th><th class="no-print"></th></tr></thead>
         <tbody>${queue.map((e) => `<tr style="${e.wd_entry === "sent" ? "opacity:.55" : ""}">
@@ -1653,9 +1656,10 @@ function wdDashCards() {
           <td><select data-wd-entry="${e.id}" style="width:190px">
             <option value="" ${!e.wd_entry ? "selected" : ""}>Not sent yet</option>
             <option value="sent" ${e.wd_entry === "sent" ? "selected" : ""}>Sent, waiting</option>
+            <option value="done">Entered in Workday ✓</option>
             <option value="na">Doesn't go to Workday</option>
           </select></td>
-          <td class="no-print"><button class="icon-btn" data-wd-sheet="${e.id}" title="Send to Workday / entry sheet">📤</button></td>
+          <td class="no-print" style="white-space:nowrap"><button class="btn secondary small" data-wd-done="${e.id}" title="I've entered this in Workday — take it off this list">✓ Entered</button> <button class="icon-btn" data-wd-sheet="${e.id}" title="Send to Workday / entry sheet">📤</button></td>
         </tr>`).join("")}</tbody>
       </table>
     </div>`;
@@ -1755,9 +1759,29 @@ function wireWorkdayBits(m) {
   });
   $$("[data-wd-entry]", m).forEach((sel) => sel.onchange = async () => {
     await api(`/api/expenses/${sel.dataset.wdEntry}`, "POST", { wd_entry: sel.value });
-    toast(sel.value === "na" ? "Hidden — doesn't go to Workday" : "Status saved");
+    toast(sel.value === "na" ? "Hidden — doesn't go to Workday"
+      : sel.value === "done" ? "Marked as entered in Workday — off this list"
+      : "Status saved");
     await wdRefresh();
   });
+  // one click: "I've entered this in Workday" — hides it from the list.
+  // (Bring it back any time: edit the expense → Workday status.)
+  $$("[data-wd-done]", m).forEach((b) => b.onclick = async () => {
+    b.disabled = true;
+    await api(`/api/expenses/${b.dataset.wdDone}`, "POST", { wd_entry: "done" });
+    toast("Marked as entered in Workday. To bring it back: edit the expense → Workday status.");
+    await wdRefresh();
+  });
+  const doneAll = $("#wd-done-all", m);
+  if (doneAll) doneAll.onclick = async () => {
+    const ids = ((WD && WD.push && WD.push.queue) || []).map((e) => e.id);
+    if (!ids.length) return;
+    if (!confirm(`Mark all ${ids.length} expenses in this list as entered in Workday? They'll disappear from the dashboard (you can bring any of them back by editing the expense).`)) return;
+    doneAll.disabled = true;
+    await api("/api/expenses/bulk", "POST", { ids, fields: { wd_entry: "done" } });
+    toast(`${ids.length} marked as entered in Workday`);
+    await wdRefresh();
+  };
   $$("[data-wd-sheet]", m).forEach((b) => b.onclick = () => {
     const e = (WD?.push?.queue || []).find((x) => x.id === +b.dataset.wdSheet);
     if (e) wdPushModal(wdPayloadFromExpense(e));
@@ -1921,7 +1945,7 @@ function renderInstructions() {
       <p>You don't have to set anything up first: the addresses you use are remembered from your last send and pre-filled next time (⚙ Settings → Advanced is where to correct one). On a Mac, the first send asks permission for <strong>Grants Manager</strong> to control Outlook — click OK once.</p>
       <p><strong>Charging someone else's account:</strong> pick <strong>“Other”</strong> as the grant when a colleague or the department provides the account — a <em>Worktag (whose account)</em> field appears; type in that account's worktag (GR… or CC…). These expenses never count against your grant budgets, but with <strong>📤 Add to Workday</strong> still ticked they're sent to the financial team the same as any other expense, using the worktag you typed instead of one of your own grants.</p>
       <p><strong>Splits:</strong> tick <em>Split across worktags</em> to reveal the split fields — the other grant, its percentage, and its <em>Cost Center</em> and <em>Worktag</em> (auto-filled if the grant is known, editable if not). The email then lists both accounting lines with their percentages and amounts.</p>
-      <p>Grant and Award worktags fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
+      <p>Grant and Award worktags fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Entered one in Workday yourself? Click <strong>✓ Entered</strong> on its row (or <strong>✓ Mark all entered</strong> at the top) and it leaves the list right away; to bring one back, edit the expense and change <em>Workday status</em>. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
 
     ${sec("📄 Data, backups & undo", `
       <p>Everything lives in one file: <code>GrantsApp/data/grants.db</code>. Older actuals were imported from scanned Workday DBRs; new actuals come from the ⇅ Workday panel.</p>
@@ -3266,6 +3290,12 @@ function expenseModal(e, grantId) {
     <label class="field"><span>Receipt</span>
       <div class="dropzone ${e?.receipt_path ? "has-file" : ""}" id="m-drop">${e?.receipt_path ? "✓ receipt attached (drop to replace)" : "📎 Drop receipt here or click to choose"}</div>
       <input type="file" id="m-file" hidden></label>
+    ${e && e.source === "manual" ? `<label class="field"><span>Workday status</span><select id="m-wd-entry">
+      <option value="" ${!e.wd_entry ? "selected" : ""}>Not entered yet — show in “To enter in Workday”</option>
+      <option value="sent" ${e.wd_entry === "sent" ? "selected" : ""}>Sent, waiting to post</option>
+      <option value="done" ${e.wd_entry === "done" ? "selected" : ""}>Entered in Workday ✓ (hidden from the dashboard list)</option>
+      <option value="na" ${e.wd_entry === "na" ? "selected" : ""}>Doesn't go to Workday</option>
+    </select></label>` : ""}
     <label style="display:flex;align-items:center;gap:7px;font-size:13.5px;cursor:pointer;margin:4px 0 2px"><input type="checkbox" id="m-pcard" style="width:auto" ${e?.pcard ? "checked" : ""}>💳 Bought on a P-card</label>
     <div class="form-row" style="align-items:flex-end">${pcardFields("m", e || {})}</div>
     <div class="actions">
@@ -3292,6 +3322,7 @@ function expenseModal(e, grantId) {
         person_id: $("#m-person", el).value ? +$("#m-person", el).value : null,
         ...readPcard(),
       };
+      if ($("#m-wd-entry", el)) body.wd_entry = $("#m-wd-entry", el).value;
       const receipt = file ? await fileToPayload(file) : null;
       const splitG = !e && $("#m-split-grant", el) ? +$("#m-split-grant", el).value : 0;
       const pct = !e ? parseFloat($("#m-split-pct", el)?.value) : NaN;

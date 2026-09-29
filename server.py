@@ -184,9 +184,10 @@ MIGRATIONS = [  # (table, column, DDL type/default)
     ("appointments", "pct", "REAL DEFAULT 100"),
     # pay-period date of a Workday journal line (payroll month bucketing)
     ("workday_lines", "budget_date", "TEXT DEFAULT ''"),
-    # Workday fast-entry status: '' needs entry, 'sent' entered/waiting to
-    # post, 'na' not a Workday expense (cleared automatically once a Workday
-    # line links to the expense)
+    # Workday fast-entry status: '' needs entry, 'sent' emailed/waiting to
+    # post, 'done' the user marked it entered in Workday (hidden from the
+    # dashboard list), 'na' not a Workday expense (cleared automatically once
+    # a Workday line links to the expense)
     ("expenses", "wd_entry", "TEXT DEFAULT ''"),
     # explicit worktag typed at entry time — used for expenses (e.g. "Other"
     # external accounts) that have no grant-level Workday mapping to pull one from
@@ -1810,7 +1811,8 @@ def wd_push_state(conn):
     """Everything the 'push to Workday' fast-entry queue needs.
 
     Queue = manual expenses from the last 90 days that no imported Workday
-    line has linked yet (i.e. not visible as posted) and not marked 'na'.
+    line has linked yet (i.e. not visible as posted) and not marked 'na' (not
+    a Workday expense) or 'done' (the user says it's already been entered).
     """
     cutoff = (date.today() - timedelta(days=90)).isoformat()
     linked = {r[0] for r in conn.execute(
@@ -1824,7 +1826,7 @@ def wd_push_state(conn):
         "LEFT JOIN people p ON p.id=e.person_id "
         "JOIN grants g ON g.id=e.grant_id "
         "WHERE e.source='manual' AND e.date>=? AND (e.wd_entry IS NULL OR "
-        "e.wd_entry!='na') ORDER BY e.date DESC", (cutoff,)))
+        "e.wd_entry NOT IN ('na','done')) ORDER BY e.date DESC", (cutoff,)))
         if e["id"] not in linked]
     # Workday codes per app grant (learned from imports via the mapping)
     codes = {}
@@ -3061,6 +3063,8 @@ def validate_row(table, data, creating):
         except ValueError:
             raise ValueError("“%s” isn't a date the app can read. Use the "
                              "date picker, or type it as YYYY-MM-DD." % v)
+    if data.get("wd_entry") not in (None, "", "sent", "done", "na"):
+        raise ValueError("Unknown Workday status.")
     for f in MONEY_FIELDS:
         if f not in data or data[f] is None or data[f] == "":
             continue
