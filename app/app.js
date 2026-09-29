@@ -65,6 +65,10 @@ async function api(path, method = "GET", body = null) {
 }
 async function reload() {
   S = await api("/api/state");
+  // The "To enter in Workday" list is computed by the server from the same
+  // expenses, so it must be re-read too — otherwise an expense added from a
+  // grant page never appeared on the dashboard until the page was reloaded.
+  try { WD = await api("/api/workday/state"); } catch (e) { /* keep the last one */ }
   render();
   if (typeof refreshNotifBadge === "function") refreshNotifBadge();
 }
@@ -636,28 +640,33 @@ function renderGrant() {
         <div class="toolbar no-print">
           <select id="f-cat" style="width:150px"><option value="">All categories</option>${cats.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select>
           <select id="f-year" style="width:110px"><option value="">All years</option>${range(years).map((y) => `<option value="${y}">Year ${y}</option>`).join("")}</select>
+          <button class="btn small secondary" id="g-send-sel" style="display:none" title="Email the ticked expenses (with their receipts and documents) to the financial team">📤 Send selected to Workday</button>
           <button class="btn small" id="btn-add-exp">+ Add expense</button>
         </div>
       </div>
       <table id="exp-table">
-        <thead><tr><th>Date</th><th>Category</th><th>Yr</th><th>Description</th><th>Person</th><th class="num">Amount</th><th>Receipt</th><th class="no-print"></th></tr></thead>
-        <tbody>${gExp.map(expRow).join("") || `<tr><td colspan="8" class="empty">No expenses yet.</td></tr>`}</tbody>
+        <thead><tr><th class="no-print" style="width:26px"><input type="checkbox" id="g-sel-all" style="width:auto" title="Select all shown"></th><th>Date</th><th>Category</th><th>Yr</th><th>Description</th><th>Person</th><th class="num">Amount</th><th>Receipt</th><th>Workday</th><th class="no-print"></th></tr></thead>
+        <tbody>${gExp.map(expRow).join("") || `<tr><td colspan="10" class="empty">No expenses yet.</td></tr>`}</tbody>
       </table>
     </div>
   `;
 }
 
 function expRow(e) {
+  const docs = extraDocs(e);
   return `<tr data-exp-row data-cat="${e.category_id || ""}" data-year="${e.year || 1}">
+    <td class="no-print">${e.source === "manual" ? `<input type="checkbox" class="g-sel" data-id="${e.id}" style="width:auto" title="Select to send to Workday">` : ""}</td>
     <td>${e.date}</td>
     <td>${esc(catName(e.category_id))}</td>
     <td>Y${e.year || 1}</td>
     <td>${esc(e.description)} ${e.source === "salary" ? '<span class="badge gray">auto</span>' : e.source === "adjust" ? '<span class="badge blue">rollover</span>' : e.source === "workday" ? '<span class="badge green">workday</span>' : ""}</td>
     <td>${esc(personName(e.person_id))}</td>
     <td class="num">${money2(e.amount)}</td>
-    <td>${e.receipt_path ? `<a class="receipt-link" href="${`/receipts/${encodeURIComponent(e.receipt_path).replaceAll("%2F", "/")}`}" target="_blank">📎 view</a>` : ""}</td>
+    <td>${e.receipt_path ? `<a class="receipt-link" href="${receiptUrl(e.receipt_path)}" target="_blank">📎 view</a>` : ""}${docs.length ? ` <a href="#" data-edit-exp="${e.id}" title="${esc(docs.map((d) => d.name).join(", "))}" style="font-size:12px;white-space:nowrap">+${docs.length} doc${docs.length === 1 ? "" : "s"}</a>` : ""}</td>
+    <td>${wdChip(e)}</td>
     <td class="no-print" style="white-space:nowrap">
-      <button class="icon-btn" data-edit-exp="${e.id}" title="Edit">✏️</button>
+      ${e.source === "manual" ? `<button class="icon-btn" data-send-exp="${e.id}" title="Send this expense to Workday (email the entry, receipt and documents)">📤</button>` : ""}
+      <button class="icon-btn" data-edit-exp="${e.id}" title="Edit / attach documents">✏️</button>
       <button class="icon-btn" data-del-exp="${e.id}" title="Delete">🗑</button>
     </td></tr>`;
 }
@@ -1052,6 +1061,8 @@ function wdPayloadFromExpense(e) {
     memo: e.description || "",
     spend: suggest[e.category_id] || e.category || "",
     person: e.person || "", receipt_path: e.receipt_path || "",
+    extra_paths: extraDocs(e).map((d) => d.path),
+    extra_names: extraDocs(e).map((d) => d.name),
     grant_label: e.grant_name,
     lines: [line],
   };
@@ -1060,7 +1071,9 @@ function wdPayloadFromExpense(e) {
 function wdPushModal(p) {
   const cfg = WD?.push_cfg || {};
   const receiptName = p.receipt_path ? p.receipt_path.split("/").pop() : "";
-  const notPdf = receiptName && !receiptName.toLowerCase().endsWith(".pdf");
+  const docNames = p.extra_names || [];
+  const notPdf = (receiptName && !receiptName.toLowerCase().endsWith(".pdf")) ||
+    docNames.some((n) => !n.toLowerCase().endsWith(".pdf"));
   const multi = p.lines.length > 1;
   const fieldRows = [
     ["Amount (USD)", p.total.toFixed(2)],
@@ -1069,6 +1082,7 @@ function wdPushModal(p) {
     ["Business purpose / memo", p.memo],
     ["Person", p.person],
     ["Receipt", receiptName ? receiptName + " — attached to the email" : ""],
+    ["Additional documents", docNames.length ? docNames.join(", ") + " — attached to the email" : ""],
   ].filter(([, v]) => v);
   const lineRows = (l) => [
     ["Grant worktag", l.worktag], ["Award", l.award],
@@ -1081,7 +1095,7 @@ function wdPushModal(p) {
       (multi ? `Accounting line ${i + 1} — ${l.pct}% (${money2(l.amount)}):\n` : "") +
       lineRows(l).map(([k, v]) => `${multi ? "  " : ""}${k}: ${v}`).join("\n")
     ).join("\n\n") +
-    `\n\n${receiptName ? "The receipt is attached." : "No receipt for this expense."}\n\nThank you!`;
+    `\n\n${receiptName ? "The receipt is attached" : "No receipt for this expense"}${docNames.length ? ` (plus ${docNames.length} supporting document${docNames.length === 1 ? "" : "s"})` : ""}.\n\nThank you!`;
   const subject = `Workday expense entry — ${money2(p.total)} — ${p.grant_label}${multi ? " (split)" : ""}`;
   modal(`
     <h2>📤 Add to Workday</h2>
@@ -1091,7 +1105,7 @@ function wdPushModal(p) {
       ${p.lines.map((l, i) => (multi ? `<tr><td colspan="2" style="font-weight:700;padding-top:8px">Accounting line ${i + 1} — ${l.pct}% (${money2(l.amount)})</td></tr>` : "") +
         lineRows(l).map(([k, v]) => `<tr><td style="color:var(--muted);white-space:nowrap;font-size:13px">${esc(k)}</td><td style="font-weight:600">${esc(String(v))}</td></tr>`).join("")).join("")}
     </table>
-    ${notPdf ? `<p style="color:#b97a08;font-size:13px;margin:8px 0 0">⚠️ This receipt is not a PDF — Workday only accepts PDF attachments. Consider re-saving it as PDF before sending.</p>` : ""}
+    ${notPdf ? `<p style="color:#b97a08;font-size:13px;margin:8px 0 0">⚠️ Not every attached file is a PDF — Workday itself only accepts PDF attachments. Your financial team can still receive these by email; convert any that need uploading to Workday.</p>` : ""}
     <div class="form-row" style="margin-top:12px">
       <label class="field"><span>Send to me</span><input id="wd-mail-to" type="email" value="${esc(cfg.owner_email || "")}" placeholder="you@uark.edu"></label>
     </div>
@@ -1114,11 +1128,91 @@ function wdPushModal(p) {
       try {
         const r = await api("/api/workday/send_email", "POST", {
           to, subject, body: bodyText,
-          receipt_path: p.receipt_path, expense_ids: p.expense_ids,
+          receipt_path: p.receipt_path, attachment_paths: p.extra_paths || [],
+          expense_ids: p.expense_ids,
         });
         close();
         if (r.fallback) { outboxModal(r, "Your email to the financial team"); return; }
         toast(`Sent to ${to} — marked “Sent, waiting”`);
+        await wdRefresh();
+      } catch (e) {
+        btn.disabled = false; btn.textContent = "✉ Send email";
+        showProblem("Send failed: " + e.message);
+      }
+    };
+  });
+}
+
+/* One email for SEVERAL expenses: each is listed with its own entry details,
+   and every receipt and supporting document is attached. */
+function wdBatchModal(exps) {
+  const cfg = WD?.push_cfg || {};
+  const payloads = exps.map(wdPayloadFromExpense);
+  const total = payloads.reduce((s, p) => s + p.total, 0);
+  const grants = [...new Set(exps.map((e) => e.grant_name))];
+  const label = grants.length === 1 ? grants[0] : `${grants.length} grants`;
+  const base = (x) => String(x).split("/").pop();
+  const paths = [];
+  payloads.forEach((p) => {
+    if (p.receipt_path) paths.push(p.receipt_path);
+    (p.extra_paths || []).forEach((x) => paths.push(x));
+  });
+  const fileList = (p) => [p.receipt_path ? base(p.receipt_path) : null, ...(p.extra_names || [])].filter(Boolean);
+  const nonPdf = payloads.some((p) => [p.receipt_path ? base(p.receipt_path) : "", ...(p.extra_names || [])]
+    .some((n) => n && !n.toLowerCase().endsWith(".pdf")));
+  const block = (p, i) => {
+    const lines = p.lines.map((l, k) => {
+      const rows = [["Grant worktag", l.worktag], ["Award", l.award], ["Cost Center", l.cost_center],
+        ["Fund", l.fund], ["Additional worktags", l.extra]].filter(([, v]) => v)
+        .map(([kk, v]) => `  ${kk}: ${v}`).join("\n");
+      return (p.lines.length > 1 ? `  Accounting line ${k + 1} — ${l.pct}% (${money2(l.amount)}):\n` : "") + rows;
+    }).join("\n");
+    const files = fileList(p);
+    return `Expense ${i + 1} of ${payloads.length}\n` +
+      [["Amount (USD)", p.total.toFixed(2)], ["Date", p.date], ["Spend Category (suggested)", p.spend],
+       ["Business purpose / memo", p.memo], ["Person", p.person],
+       ["Attached files", files.join("; ")]].filter(([, v]) => v).map(([k, v]) => `  ${k}: ${v}`).join("\n") +
+      "\n" + lines;
+  };
+  const bodyText = `Hi,\n\nPlease enter the following ${payloads.length} expenses in Workday:\n\n` +
+    payloads.map(block).join("\n\n") +
+    `\n\n${paths.length ? `${paths.length} file${paths.length === 1 ? " is" : "s are"} attached (receipts and supporting documents).` : "There are no receipts for these expenses."}\n\nThank you!`;
+  const subject = `Workday expense entries — ${payloads.length} expenses — ${money2(total)} — ${label}`;
+  modal(`
+    <h2>📤 Send ${payloads.length} expenses to Workday</h2>
+    <p class="sub" style="margin-bottom:10px">One email with all ${payloads.length} entries, ${paths.length} attached file${paths.length === 1 ? "" : "s"}. It comes to you first (CC'd) — check it, then forward to your accountant.</p>
+    <div style="max-height:34vh;overflow:auto"><table>
+      <thead><tr><th>Date</th>${grants.length > 1 ? "<th>Grant</th>" : ""}<th>Purpose</th><th class="num">Amount</th><th>Files</th></tr></thead>
+      <tbody>${payloads.map((p, i) => `<tr><td>${esc(p.date)}</td>${grants.length > 1 ? `<td>${esc(exps[i].grant_name)}</td>` : ""}<td>${esc(p.memo || "—")}</td><td class="num">${money2(p.total)}</td><td>${fileList(p).length ? "📎 " + fileList(p).length : '<span style="color:var(--muted)">—</span>'}</td></tr>`).join("")}
+      <tr><td colspan="${grants.length > 1 ? 3 : 2}" style="font-weight:700">Total</td><td class="num" style="font-weight:700">${money2(total)}</td><td></td></tr></tbody>
+    </table></div>
+    ${nonPdf ? `<p style="color:#b97a08;font-size:13px;margin:8px 0 0">⚠️ Not every attached file is a PDF — Workday itself only accepts PDF attachments. Your financial team can still receive these by email.</p>` : ""}
+    <div class="form-row" style="margin-top:12px">
+      <label class="field"><span>Send to me</span><input id="wd-mail-to" type="email" value="${esc(cfg.owner_email || "")}" placeholder="you@uark.edu"></label>
+    </div>
+    <div class="actions">
+      <button class="btn secondary" id="m-copy-all" style="margin-right:auto">⧉ Copy as text</button>
+      <button class="btn secondary" id="m-cancel">Not now</button>
+      <button class="btn" id="m-send">✉ Send email</button>
+    </div>`, (el, close) => {
+    $("#m-cancel", el).onclick = close;
+    $("#m-copy-all", el).onclick = async () => {
+      await navigator.clipboard.writeText(subject + "\n\n" + bodyText);
+      toast("Copied — paste it anywhere");
+    };
+    $("#m-send", el).onclick = async () => {
+      const to = $("#wd-mail-to", el).value.trim();
+      if (!to) { toast("Enter your email address"); return; }
+      const btn = $("#m-send", el);
+      btn.disabled = true; btn.textContent = "Sending…";
+      try {
+        const r = await api("/api/workday/send_email", "POST", {
+          to, subject, body: bodyText, attachment_paths: paths,
+          expense_ids: payloads.flatMap((p) => p.expense_ids),
+        });
+        close();
+        if (r.fallback) { outboxModal(r, "Your email to the financial team"); return; }
+        toast(`Sent ${payloads.length} expenses to ${to} — marked “Sent, waiting”`);
         await wdRefresh();
       } catch (e) {
         btn.disabled = false; btn.textContent = "✉ Send email";
@@ -1945,7 +2039,7 @@ function renderInstructions() {
       <p>You don't have to set anything up first: the addresses you use are remembered from your last send and pre-filled next time (⚙ Settings → Advanced is where to correct one). On a Mac, the first send asks permission for <strong>Grants Manager</strong> to control Outlook — click OK once.</p>
       <p><strong>Charging someone else's account:</strong> pick <strong>“Other”</strong> as the grant when a colleague or the department provides the account — a <em>Worktag (whose account)</em> field appears; type in that account's worktag (GR… or CC…). These expenses never count against your grant budgets, but with <strong>📤 Add to Workday</strong> still ticked they're sent to the financial team the same as any other expense, using the worktag you typed instead of one of your own grants.</p>
       <p><strong>Splits:</strong> tick <em>Split across worktags</em> to reveal the split fields — the other grant, its percentage, and its <em>Cost Center</em> and <em>Worktag</em> (auto-filled if the grant is known, editable if not). The email then lists both accounting lines with their percentages and amounts.</p>
-      <p>Grant and Award worktags fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Entered one in Workday yourself? Click <strong>✓ Entered</strong> on its row (or <strong>✓ Mark all entered</strong> at the top) and it leaves the list right away; to bring one back, edit the expense and change <em>Workday status</em>. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
+      <p>Grant and Award worktags fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). You can also send from inside a grant: each manual expense on a grant page has a <strong>📤</strong> button, and you can tick several and press <strong>📤 Send selected to Workday</strong> for one email covering all of them (the same bulk button is on <em>All Expenses</em>). Need to include an authorization form or a spreadsheet? Click <strong>✏️</strong> on the expense and use <strong>Additional documents</strong> — they travel with the expense in the Workday email and in the monthly report. Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Entered one in Workday yourself? Click <strong>✓ Entered</strong> on its row (or <strong>✓ Mark all entered</strong> at the top) and it leaves the list right away; to bring one back, edit the expense and change <em>Workday status</em>. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
 
     ${sec("📄 Data, backups & undo", `
       <p>Everything lives in one file: <code>GrantsApp/data/grants.db</code>. Older actuals were imported from scanned Workday DBRs; new actuals come from the ⇅ Workday panel.</p>
@@ -2467,6 +2561,7 @@ function renderAllExpenses() {
         <button class="btn secondary small" data-bulk="category">Change category…</button>
         <button class="btn secondary small" data-bulk="grant">Move to grant…</button>
         <button class="btn secondary small" data-bulk="person">Set person…</button>
+        <button class="btn secondary small" data-bulk="send" title="One email to the financial team with every ticked expense, its receipt and documents">📤 Send to Workday…</button>
         <button class="btn danger small" data-bulk="delete" style="margin-left:auto">🗑 Delete selected</button>
       </div>
       <table id="all-exp-table">
@@ -2482,8 +2577,8 @@ function renderAllExpenses() {
             <td>${esc(e.description)}</td><td>${esc(personName(e.person_id))}</td>
             <td class="num">${money2(e.amount)}</td>
             <td>${e.receipt_path
-                ? `<a class="receipt-link" href="${`/receipts/${encodeURIComponent(e.receipt_path).replaceAll("%2F", "/")}`}" target="_blank">📎</a>`
-                : `<span style="color:var(--muted)" title="No receipt attached">—</span>`}</td>
+                ? `<a class="receipt-link" href="${receiptUrl(e.receipt_path)}" target="_blank">📎</a>`
+                : `<span style="color:var(--muted)" title="No receipt attached">—</span>`}${extraDocs(e).length ? ` <a href="#" data-edit-exp="${e.id}" title="${esc(extraDocs(e).map((d) => d.name).join(", "))}" style="font-size:12px">+${extraDocs(e).length}</a>` : ""}</td>
             <td class="no-print" style="white-space:nowrap">
               <button class="icon-btn" data-edit-exp="${e.id}" title="Edit / attach receipt">✏️</button>
             </td></tr>`;
@@ -2617,7 +2712,8 @@ function wireAllExpenses(m) {
 
   // edit / attach a receipt straight from this list (the grant page has the
   // same button; this is the view people actually browse in)
-  $$("[data-edit-exp]", m).forEach((b) => b.onclick = () => {
+  $$("[data-edit-exp]", m).forEach((b) => b.onclick = (ev) => {
+    if (ev && ev.preventDefault) ev.preventDefault();
     const e = S.expenses.find((x) => x.id === +b.dataset.editExp);
     if (e) expenseModal(e, e.grant_id);
   });
@@ -2652,6 +2748,7 @@ function wireAllExpenses(m) {
       await reload();
       return;
     }
+    if (kind === "send") { wdSendExpenses(ids); return; }
     bulkFieldModal(kind, ids);
   });
   refresh();
@@ -2751,6 +2848,46 @@ function wireDropzone(zone, fileInput, onFile) {
   zone.ondragleave = () => zone.classList.remove("drag");
   zone.ondrop = (e) => { e.preventDefault(); zone.classList.remove("drag"); set(e.dataTransfer.files[0] || null); };
   return () => picked;
+}
+
+/* Additional documents on an expense (a P-card authorization form, a
+   spreadsheet...) live in its extra_files JSON: [{path, name, added}]. */
+function extraDocs(e) {
+  try {
+    const v = JSON.parse((e && e.extra_files) || "[]");
+    return Array.isArray(v) ? v.filter((x) => x && x.path) : [];
+  } catch (err) { return []; }
+}
+const receiptUrl = (p) => `/receipts/${encodeURIComponent(p).replaceAll("%2F", "/")}`;
+
+/* Where an expense stands with Workday, as a small chip. Only expenses you
+   entered yourself ever go to Workday. */
+function wdChip(e) {
+  if (e.source !== "manual") return "";
+  const chip = (t, c, tip) => `<span title="${esc(tip)}" style="font-size:11.5px;padding:2px 7px;border-radius:9px;white-space:nowrap;background:${c}">${t}</span>`;
+  if (e.wd_entry === "done") return chip("✓ entered", "var(--green-soft, #e3f6ec)", "Marked as entered in Workday");
+  if (e.wd_entry === "sent") return chip("✉ sent", "var(--accent-soft, #eef3fe)", "Emailed to the financial team — waiting to post");
+  if (e.wd_entry === "na") return chip("—", "transparent", "Doesn't go to Workday");
+  return chip("to enter", "var(--amber-soft, #fdf1d8)", "Not entered in Workday yet — it's on the dashboard list");
+}
+
+/* Send one or several of your expenses to Workday (an email to the financial
+   team with the entries, receipts and any supporting documents attached). */
+function wdSendExpenses(ids) {
+  const list = ids.map((id) => S.expenses.find((e) => e.id === id))
+    .filter((e) => e && e.source === "manual");
+  if (!list.length) {
+    toast("Pick expenses you entered yourself — imported Workday charges are already in Workday.");
+    return;
+  }
+  const full = list.map((e) => ({
+    ...e,
+    grant_name: (S.grants.find((g) => g.id === e.grant_id) || {}).name || "",
+    category: catName(e.category_id),
+    person: personName(e.person_id),
+  }));
+  if (full.length === 1) wdPushModal(wdPayloadFromExpense(full[0]));
+  else wdBatchModal(full);
 }
 
 function fileToPayload(f) {
@@ -2970,10 +3107,26 @@ function wireGrantView(m) {
     await reload();
   };
   $("#btn-add-exp", m).onclick = () => expenseModal(null, g.id);
-  $$("[data-edit-exp]", m).forEach((b) => b.onclick = () => {
+  $$("[data-edit-exp]", m).forEach((b) => b.onclick = (ev) => {
+    if (ev && ev.preventDefault) ev.preventDefault();
     const e = S.expenses.find((x) => x.id === +b.dataset.editExp);
     expenseModal(e, e.grant_id);
   });
+  // send one expense, or tick several and send them in one email
+  $$("[data-send-exp]", m).forEach((b) => b.onclick = () => wdSendExpenses([+b.dataset.sendExp]));
+  const gBoxes = () => $$(".g-sel", m).filter((b) => b.closest("tr").style.display !== "none");
+  const gChosen = () => gBoxes().filter((b) => b.checked).map((b) => +b.dataset.id);
+  const gSendBtn = $("#g-send-sel", m), gAll = $("#g-sel-all", m);
+  const gRefresh = () => {
+    const n = gChosen().length, all = gBoxes();
+    gSendBtn.style.display = n ? "" : "none";
+    gSendBtn.textContent = `📤 Send ${n} selected to Workday`;
+    gAll.checked = n > 0 && n === all.length;
+    gAll.indeterminate = n > 0 && n < all.length;
+  };
+  gAll.onchange = () => { gBoxes().forEach((b) => b.checked = gAll.checked); gRefresh(); };
+  $$(".g-sel", m).forEach((b) => b.onchange = gRefresh);
+  gSendBtn.onclick = () => wdSendExpenses(gChosen());
   $$("[data-del-exp]", m).forEach((b) => b.onclick = async () => {
     if (!confirm("Delete this expense?")) return;
     await api(`/api/expenses/${b.dataset.delExp}`, "DELETE");
@@ -3006,6 +3159,7 @@ function wireGrantView(m) {
       const okY = !fy || tr.dataset.year === fy;
       tr.style.display = okC && okY ? "" : "none";
     });
+    if (typeof gRefresh === "function") gRefresh();
   };
   $("#f-cat", m).onchange = applyFilter;
   $("#f-year", m).onchange = applyFilter;
@@ -3308,6 +3462,11 @@ function expenseModal(e, grantId) {
     <label class="field"><span>Receipt</span>
       <div class="dropzone ${e?.receipt_path ? "has-file" : ""}" id="m-drop">${e?.receipt_path ? "✓ receipt attached (drop to replace)" : "📎 Drop receipt here or click to choose"}</div>
       <input type="file" id="m-file" hidden></label>
+    ${e ? `<div class="field"><span>Additional documents <span class="sub" style="font-weight:400">— e.g. a P-card authorization form or a spreadsheet; sent along with this expense and included in the monthly report</span></span>
+      <div id="m-docs" style="margin:2px 0 6px"></div>
+      <div class="dropzone" id="m-doc-drop" style="padding:10px">＋ Add files — drop here or click to choose</div>
+      <input type="file" id="m-doc-file" multiple hidden>
+      <span class="sub" style="font-size:12px">Files are added to the expense right away (you don't need to press Save).</span></div>` : `<p class="sub" style="margin:2px 0 8px">Want to attach an authorization form or spreadsheet as well? Add the expense first, then click ✏️ on it.</p>`}
     ${e && e.source === "manual" ? `<label class="field"><span>Workday status</span><select id="m-wd-entry">
       <option value="" ${!e.wd_entry ? "selected" : ""}>Not entered yet — show in “To enter in Workday”</option>
       <option value="sent" ${e.wd_entry === "sent" ? "selected" : ""}>Sent, waiting to post</option>
@@ -3322,6 +3481,48 @@ function expenseModal(e, grantId) {
     </div>`, (el, close) => {
     fillCatSelect($("#m-cat", el), grantId, e?.category_id);
     const readPcard = wirePcardFields("m", el);
+    if (e) {
+      const row = () => S.expenses.find((x) => x.id === e.id) || e;
+      const renderDocs = () => {
+        const docs = extraDocs(row());
+        $("#m-docs", el).innerHTML = docs.length
+          ? docs.map((d, i) => `<div style="display:flex;align-items:center;gap:8px;padding:3px 0;font-size:13.5px">📄
+              <a href="${receiptUrl(d.path)}" target="_blank" style="flex:1;word-break:break-all">${esc(d.name)}</a>
+              <button class="icon-btn" data-doc-rm="${i}" title="Remove from this expense (the file itself is kept on disk)">✕</button></div>`).join("")
+          : `<div class="sub" style="font-size:13px">None yet.</div>`;
+        $$("[data-doc-rm]", el).forEach((b) => b.onclick = async () => {
+          const d = extraDocs(row())[+b.dataset.docRm];
+          if (!d) return;
+          const r = await api(`/api/expenses/${e.id}/files/remove`, "POST", { path: d.path });
+          row().extra_files = JSON.stringify(r.files);
+          renderDocs();
+          toast("Removed from this expense (the file itself is kept in the receipts folder)");
+        });
+      };
+      const addFiles = async (files) => {
+        for (const f of [...files]) {
+          const big = largeReceiptNote(f);
+          if (big) toast("⚠ " + big, 12000);
+          const zone = $("#m-doc-drop", el);
+          zone.textContent = `Uploading ${f.name}…`;
+          try {
+            const r = await api(`/api/expenses/${e.id}/files`, "POST", { file: await fileToPayload(f) });
+            row().extra_files = JSON.stringify(r.files);
+          } catch (err) {
+            showProblem(`Couldn't attach “${f.name}”: ` + err.message);
+          }
+          zone.innerHTML = "＋ Add files — drop here or click to choose";
+          renderDocs();
+        }
+      };
+      renderDocs();
+      const dz = $("#m-doc-drop", el), di = $("#m-doc-file", el);
+      dz.onclick = () => di.click();
+      di.onchange = () => { const fs = [...di.files]; di.value = ""; if (fs.length) addFiles(fs); };
+      dz.ondragover = (ev) => { ev.preventDefault(); dz.classList.add("drag"); };
+      dz.ondragleave = () => dz.classList.remove("drag");
+      dz.ondrop = (ev) => { ev.preventDefault(); dz.classList.remove("drag"); if (ev.dataTransfer.files.length) addFiles(ev.dataTransfer.files); };
+    }
     let file = null;
     wireDropzone($("#m-drop", el), $("#m-file", el), (f) => file = f);
     // auto-pick budget year from date

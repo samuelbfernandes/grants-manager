@@ -192,6 +192,10 @@ MIGRATIONS = [  # (table, column, DDL type/default)
     # explicit worktag typed at entry time — used for expenses (e.g. "Other"
     # external accounts) that have no grant-level Workday mapping to pull one from
     ("expenses", "wd_worktag", "TEXT DEFAULT ''"),
+    # additional documents beyond the main receipt (a P-card authorization
+    # form, a spreadsheet...): JSON list of {"path","name","added"}. Kept on the
+    # row itself so deleting/restoring an expense carries them along.
+    ("expenses", "extra_files", "TEXT DEFAULT ''"),
     # P-card purchases. The university's reconciliation form asks for these on
     # every card transaction, so they are recorded at entry time rather than
     # reconstructed from memory at month end.
@@ -1819,7 +1823,7 @@ def wd_push_state(conn):
         "SELECT expense_id FROM workday_lines WHERE expense_id IS NOT NULL")}
     queue = [e for e in rows_to_list(conn.execute(
         "SELECT e.id, e.date, e.amount, e.description, e.grant_id, "
-        "e.category_id, e.receipt_path, e.wd_entry, e.wd_worktag, "
+        "e.category_id, e.receipt_path, e.extra_files, e.wd_entry, e.wd_worktag, "
         "c.name AS category, p.name AS person, g.name AS grant_name "
         "FROM expenses e "
         "LEFT JOIN categories c ON c.id=e.category_id "
@@ -2161,6 +2165,21 @@ def receipt_export_name(n, width, row):
     return "%0*d - %s - %s - %s%s" % (width, n, row["Date"], amt, purpose, ext)
 
 
+def extra_export_name(n, width, k, row, x):
+    """Name for an additional document: same line number as its expense plus
+    '(+k)', and the original file's own name so the accountant can see WHAT it
+    is (e.g. '03 (+1) - 2026-09-15 - 412.75 - Lab supplies - P-card form.pdf')."""
+    ext = os.path.splitext(x["path"])[1].lower()
+    purpose = re.sub(r"[^A-Za-z0-9 ._()-]+", " ",
+                     row["Business Purpose"] or row["Spend Category"] or "")
+    purpose = re.sub(r"\s+", " ", purpose).strip(" .-")[:30].strip(" .-") or "expense"
+    stem = re.sub(r"[^A-Za-z0-9 ._()-]+", " ", os.path.splitext(x["name"])[0])
+    stem = re.sub(r"\s+", " ", stem).strip(" .-")[:30].strip(" .-") or "document"
+    amt = "%.2f" % abs(row["_amount"]) + (" credit" if row["_amount"] < 0 else "")
+    return "%0*d (+%d) - %s - %s - %s - %s%s" % (width, n, k, row["Date"], amt,
+                                                 purpose, stem, ext)
+
+
 def report_rows(conn, month):
     """Every expense dated inside `month`, shaped for an accountant."""
     start, end = month_bounds(month)
@@ -2201,6 +2220,7 @@ def report_rows(conn, month):
             "_amount": e["amount"],
             "_grant": e["grant_name"],
             "_receipt_path": e["receipt_path"] or "",
+            "_extras": expense_files(e["extra_files"]),
             "_pcard": bool(e["pcard"]),
             "_manual": e["source"] == "manual",
         })
@@ -2211,8 +2231,13 @@ def report_rows(conn, month):
     # match — in the preview, the workbook and the attachments alike.
     width = max(2, len(str(len(out))))
     for n, r in enumerate(out, 1):
+        files = []
         if r["_receipt_path"]:
-            r["Receipt"] = receipt_export_name(n, width, r)
+            files.append((r["_receipt_path"], receipt_export_name(n, width, r)))
+        for k, x in enumerate(r["_extras"], 1):
+            files.append((x["path"], extra_export_name(n, width, k, r, x)))
+        r["_files"] = files
+        r["Receipt"] = "; ".join(name for _, name in files)
     return out
 
 
@@ -2239,7 +2264,7 @@ def report_data(conn, month):
         "total": sum(r["_amount"] for r in rows),
         "by_grant": by_grant,
         "missing_receipts": sum(1 for r in rows
-                                if not r["Receipt"] and r["_manual"]),
+                                if not r["_receipt_path"] and r["_manual"]),
     }
 
 
@@ -2307,7 +2332,7 @@ def report_receipt_attachments(data, reserve=1024 * 1024):
     always the individual renamed files, and `note` a line for the email when
     something was zipped or missing. `reserve` is room kept for the workbook.
     """
-    rows = [r for r in data["rows"] if r["_receipt_path"]]
+    rows = [r for r in data["rows"] if r["_files"]]
     if not rows:
         return [], "", []
     stage = os.path.join(REPORTS_DIR, "receipts_%s" % data["month"])
@@ -2316,21 +2341,24 @@ def report_receipt_attachments(data, reserve=1024 * 1024):
     os.makedirs(stage, exist_ok=True)
     used, staged, total, missing = set(), [], 0, 0
     for r in rows:
-        full = receipt_abspath(r["_receipt_path"]) or ""
-        if not os.path.isfile(full):
-            r["Receipt"] = "(file missing)"
-            missing += 1
-            continue
-        name = r["Receipt"]
-        while name.lower() in used:   # Windows names ignore case
-            stem, ext = os.path.splitext(name)
-            name = stem + "+" + ext
-        used.add(name.lower())
-        dest = os.path.join(stage, name)
-        shutil.copy2(full, dest)
-        r["Receipt"] = name          # keep the cell and the attachment in step
-        staged.append(dest)
-        total += os.path.getsize(dest)
+        shown = []
+        for rel, name in r["_files"]:
+            full = receipt_abspath(rel) or ""
+            if not os.path.isfile(full):
+                shown.append("(file missing)")
+                missing += 1
+                continue
+            while name.lower() in used:   # Windows names ignore case
+                stem, ext = os.path.splitext(name)
+                name = stem + "+" + ext
+            used.add(name.lower())
+            dest = os.path.join(stage, name)
+            shutil.copy2(full, dest)
+            shown.append(name)            # keep the cell and the attachment in step
+            staged.append(dest)
+            total += os.path.getsize(dest)
+        r["Receipt"] = "; ".join(shown)
+        r["_nattached"] = sum(1 for x in shown if x != "(file missing)")
     note = ""
     if missing:
         note = ("%d receipt file(s) recorded in the app could not be found on "
@@ -2366,10 +2394,9 @@ def report_text(data, owner_name="", note=""):
              "%d expense(s), total %s — the full table is attached as "
              "expenses_%s.xlsx." % (len(data["rows"]),
                                     money_str(data["total"]), data["month"])]
-    receipts = sum(1 for r in data["rows"] if r["Receipt"]
-                   and r["Receipt"] != "(file missing)")
+    receipts = sum(r.get("_nattached", 0) for r in data["rows"])
     if receipts:
-        lines.append("%d receipt file(s) are attached, each named as the "
+        lines.append("%d receipt/document file(s) are attached, each named as the "
                      "Receipt column in the workbook names it — the number at "
                      "the start of a file name is its line in the table "
                      "(1 = the first expense listed)." % receipts)
@@ -2978,6 +3005,25 @@ MAX_STORED_PATH = 235   # Windows stops at 260; leave room for OneDrive sync
 MAX_RECEIPT_BYTES = 150 * 1024 * 1024
 
 
+MAX_EXTRA_FILES = 20
+
+
+def expense_files(raw):
+    """The additional documents on an expense, as [{'path','name'}] — tolerant
+    of an empty or damaged value."""
+    try:
+        v = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+    out = []
+    for x in v if isinstance(v, list) else []:
+        if isinstance(x, dict) and isinstance(x.get("path"), str) and x["path"]:
+            out.append({"path": x["path"],
+                        "name": str(x.get("name") or os.path.basename(x["path"]))[:120],
+                        "added": str(x.get("added") or "")})
+    return out
+
+
 def save_receipt(grant, payload):
     """payload: {name, data(base64)} -> relative path under receipts/.
 
@@ -3489,6 +3535,63 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"id": cur.lastrowid, "also_id": also_id}
                                if also_id else {"id": cur.lastrowid})
                 return
+            m = re.match(r"/api/expenses/(\d+)/files$", path)
+            if m:
+                rid = int(m.group(1))
+                exp = conn.execute(
+                    "SELECT e.*, g.name AS gname FROM expenses e "
+                    "JOIN grants g ON g.id=e.grant_id WHERE e.id=?",
+                    (rid,)).fetchone()
+                if exp is None:
+                    raise ValueError("That expense no longer exists — reload "
+                                     "the page and try again.")
+                files = expense_files(exp["extra_files"])
+                if len(files) >= MAX_EXTRA_FILES:
+                    raise ValueError("An expense can hold up to %d additional "
+                                     "documents." % MAX_EXTRA_FILES)
+                payload = data.get("file") or {}
+                shown = re.sub(r"[\x00-\x1f]", "", os.path.basename(
+                    str(payload.get("name") or "document")))[:120] or "document"
+                saved = save_receipt({"name": exp["gname"]}, payload)
+                files.append({"path": saved, "name": shown,
+                              "added": date.today().isoformat()})
+                try:
+                    conn.execute("UPDATE expenses SET extra_files=? WHERE id=?",
+                                 (json.dumps(files), rid))
+                    audit_log(conn, "edited", rid, exp["grant_id"],
+                              exp["description"], exp["amount"],
+                              "attached “%s”" % shown)
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    try:
+                        os.remove(os.path.join(RECEIPTS_DIR, saved))
+                    except OSError:
+                        pass
+                    raise
+                self.send_json({"files": files})
+                return
+            m = re.match(r"/api/expenses/(\d+)/files/remove$", path)
+            if m:
+                rid = int(m.group(1))
+                exp = conn.execute("SELECT * FROM expenses WHERE id=?",
+                                   (rid,)).fetchone()
+                if exp is None:
+                    raise ValueError("That expense no longer exists.")
+                files = expense_files(exp["extra_files"])
+                gone = [f for f in files if f["path"] == data.get("path")]
+                files = [f for f in files if f["path"] != data.get("path")]
+                # the file itself stays on disk: removing a document from an
+                # expense is not a reason to destroy the only copy of it
+                conn.execute("UPDATE expenses SET extra_files=? WHERE id=?",
+                             (json.dumps(files), rid))
+                if gone:
+                    audit_log(conn, "edited", rid, exp["grant_id"],
+                              exp["description"], exp["amount"],
+                              "removed attachment “%s”" % gone[0]["name"])
+                conn.commit()
+                self.send_json({"files": files})
+                return
             # Update record: /api/<table>/<id>
             m = re.match(r"/api/(grants|categories|people|appointments|expenses)"
                          r"/(\d+)$", path)
@@ -3697,20 +3800,29 @@ class Handler(BaseHTTPRequestHandler):
                 if not to:
                     self.send_json({"error": "Recipient email is required"}, 400)
                     return
-                attach = receipt_abspath(data.get("receipt_path"))
+                # the receipt plus any supporting documents (P-card form...);
+                # every path must resolve inside the receipts folder
+                wanted = ([data.get("receipt_path")] if data.get("receipt_path")
+                          else []) + list(data.get("attachment_paths") or [])
+                attach, seen = [], set()
+                for rel in wanted[:60]:
+                    ap = receipt_abspath(rel)
+                    if ap and ap not in seen:
+                        seen.add(ap)
+                        attach.append(ap)
                 subj = data.get("subject") or "Workday expense entry"
                 text = data.get("body") or ""
                 # a big receipt would be bounced by the mail server (a file
                 # grows ~1/3 when sent), so prepare a folder instead of sending
-                too_big = bool(attach) and (os.path.getsize(attach)
-                                            > RECEIPT_ATTACH_LIMIT)
+                too_big = sum(os.path.getsize(a) for a in attach) \
+                    > RECEIPT_ATTACH_LIMIT
                 try:
                     if too_big:
                         raise OutlookUnavailable("receipt too big for one email")
                     wd_send_mail(to, "", subj, text, attach)
                 except OutlookUnavailable as why:
-                    folder, mailto = prepare_outbox(
-                        to, subj, text, [attach] if attach else [], "expense")
+                    folder, mailto = prepare_outbox(to, subj, text, attach,
+                                                    "expense")
                     self.send_json({
                         "ok": True, "fallback": True, "to": to,
                         "reason": "size" if too_big else "outlook",
@@ -3718,7 +3830,7 @@ class Handler(BaseHTTPRequestHandler):
                         "folder": folder,
                         "folder_name": os.path.basename(folder),
                         "mailto": mailto,
-                        "attachments": [os.path.basename(attach)] if attach else []})
+                        "attachments": [os.path.basename(a) for a in attach]})
                     return
                 for eid in data.get("expense_ids") or []:
                     conn.execute("UPDATE expenses SET wd_entry='sent' WHERE id=?",
@@ -4100,7 +4212,10 @@ workday-ready emails to your financial team through **Microsoft Outlook**
 be controlled (the "new Outlook" or none installed), the app prepares a folder
 with the files and a ready-to-send email draft instead. Monthly report receipts
 are renamed like `03 - 2026-09-15 - 412.75 - Lab supplies.pdf`, matching the
-Receipt column of the workbook row they belong to.
+Receipt column of the workbook row they belong to. Click ✏️ on an expense to
+attach extra documents (a P-card authorization form, a spreadsheet); they go
+with it in the Workday email and the monthly report. Tick expenses on a grant
+page and press "Send selected to Workday" to email several at once.
 
 ## Updating to a newer version
 

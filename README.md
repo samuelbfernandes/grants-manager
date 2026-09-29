@@ -149,6 +149,16 @@ same name, so a row and its file always match.
 Tick **💳 P-card** when you add a card purchase and it carries those details
 automatically; set the cardholder once under **⚙ Settings → 💳 P-card**.
 
+**Extra documents.** Click ✏️ on any expense and use **Additional documents** to
+attach more than the receipt — a P-card authorization form, a spreadsheet, a
+second receipt. They travel with the expense: they're attached to its Workday
+email and to the monthly report (named like `05 (+1) - 2026-06-25 - 321.00 -
+Lab supplies - P-card authorization.pdf`, and listed in the row's Receipt cell).
+
+**Sending from a grant.** Every hand-entered expense on a grant page has a 📤
+button, and you can tick several and choose **📤 Send selected to Workday** for
+one email covering all of them (the same button is on *All Expenses*).
+
 Sending uses **Microsoft Outlook** on Mac or Windows, which is what lets the
 receipts ride along as attachments. On a Mac the first send asks permission
 for Grants Manager to control Outlook — click OK once.
