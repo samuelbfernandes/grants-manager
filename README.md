@@ -156,8 +156,14 @@ email and to the monthly report (named like `05 (+1) - 2026-06-25 - 321.00 -
 Lab supplies - P-card authorization.pdf`, and listed in the row's Receipt cell).
 
 **Sending from a grant.** Every hand-entered expense on a grant page has a 📤
-button, and you can tick several and choose **📤 Send selected to Workday** for
-one email covering all of them (the same button is on *All Expenses*).
+button that emails that one expense.
+
+**Bundling several into one email.** Tick expenses (on a grant page, on *All
+Expenses*, or on the dashboard's "To enter in Workday" list) and press **📦
+Bundle & send**. You get ONE email with two attachments: a **spreadsheet**
+with one expense per line (the receipt's file name in the Receipt column) and
+**one zip** holding every receipt and supporting document under exactly those
+names. **📁 Prepare only** builds both in a folder without emailing anything.
 
 Sending uses **Microsoft Outlook** on Mac or Windows, which is what lets the
 receipts ride along as attachments. On a Mac the first send asks permission

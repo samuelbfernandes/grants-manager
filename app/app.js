@@ -640,7 +640,7 @@ function renderGrant() {
         <div class="toolbar no-print">
           <select id="f-cat" style="width:150px"><option value="">All categories</option>${cats.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select>
           <select id="f-year" style="width:110px"><option value="">All years</option>${range(years).map((y) => `<option value="${y}">Year ${y}</option>`).join("")}</select>
-          <button class="btn small secondary" id="g-send-sel" style="display:none" title="Email the ticked expenses (with their receipts and documents) to the financial team">📤 Send selected to Workday</button>
+          <button class="btn small secondary" id="g-send-sel" style="display:none" title="One email to the financial team: a spreadsheet with a line per ticked expense, plus ONE zip of all their receipts and documents">📦 Bundle & send</button>
           <button class="btn small" id="btn-add-exp">+ Add expense</button>
         </div>
       </div>
@@ -1143,82 +1143,73 @@ function wdPushModal(p) {
   });
 }
 
-/* One email for SEVERAL expenses: each is listed with its own entry details,
-   and every receipt and supporting document is attached. */
-function wdBatchModal(exps) {
+/* BUNDLE: several expenses -> ONE email with two attachments — a spreadsheet
+   (one expense per line, the receipt's file name in a column) and ONE zip with
+   every receipt and supporting document under exactly those names. The dialog
+   asks the server what the bundle would contain, so what you see is what is
+   attached. */
+const mbLabel = (mb) => (mb < 0.1 ? "under 0.1 MB" : mb + " MB");
+async function wdBundleModal(ids) {
+  let pv;
+  try {
+    pv = await api("/api/workday/bundle/preview", "POST", { expense_ids: ids });
+  } catch (e) { showProblem(e.message); return; }
   const cfg = WD?.push_cfg || {};
-  const payloads = exps.map(wdPayloadFromExpense);
-  const total = payloads.reduce((s, p) => s + p.total, 0);
-  const grants = [...new Set(exps.map((e) => e.grant_name))];
-  const label = grants.length === 1 ? grants[0] : `${grants.length} grants`;
-  const base = (x) => String(x).split("/").pop();
-  const paths = [];
-  payloads.forEach((p) => {
-    if (p.receipt_path) paths.push(p.receipt_path);
-    (p.extra_paths || []).forEach((x) => paths.push(x));
-  });
-  const fileList = (p) => [p.receipt_path ? base(p.receipt_path) : null, ...(p.extra_names || [])].filter(Boolean);
-  const nonPdf = payloads.some((p) => [p.receipt_path ? base(p.receipt_path) : "", ...(p.extra_names || [])]
-    .some((n) => n && !n.toLowerCase().endsWith(".pdf")));
-  const block = (p, i) => {
-    const lines = p.lines.map((l, k) => {
-      const rows = [["Grant worktag", l.worktag], ["Award", l.award], ["Cost Center", l.cost_center],
-        ["Fund", l.fund], ["Additional worktags", l.extra]].filter(([, v]) => v)
-        .map(([kk, v]) => `  ${kk}: ${v}`).join("\n");
-      return (p.lines.length > 1 ? `  Accounting line ${k + 1} — ${l.pct}% (${money2(l.amount)}):\n` : "") + rows;
-    }).join("\n");
-    const files = fileList(p);
-    return `Expense ${i + 1} of ${payloads.length}\n` +
-      [["Amount (USD)", p.total.toFixed(2)], ["Date", p.date], ["Spend Category (suggested)", p.spend],
-       ["Business purpose / memo", p.memo], ["Person", p.person],
-       ["Attached files", files.join("; ")]].filter(([, v]) => v).map(([k, v]) => `  ${k}: ${v}`).join("\n") +
-      "\n" + lines;
-  };
-  const bodyText = `Hi,\n\nPlease enter the following ${payloads.length} expenses in Workday:\n\n` +
-    payloads.map(block).join("\n\n") +
-    `\n\n${paths.length ? `${paths.length} file${paths.length === 1 ? " is" : "s are"} attached (receipts and supporting documents).` : "There are no receipts for these expenses."}\n\nThank you!`;
-  const subject = `Workday expense entries — ${payloads.length} expenses — ${money2(total)} — ${label}`;
+  const multiGrant = new Set(pv.rows.map((r) => r.grant)).size > 1;
+  const names = (s) => String(s || "").split(";").map((x) => x.trim()).filter(Boolean);
   modal(`
-    <h2>📤 Send ${payloads.length} expenses to Workday</h2>
-    <p class="sub" style="margin-bottom:10px">One email with all ${payloads.length} entries, ${paths.length} attached file${paths.length === 1 ? "" : "s"}. It comes to you first (CC'd) — check it, then forward to your accountant.</p>
-    <div style="max-height:34vh;overflow:auto"><table>
-      <thead><tr><th>Date</th>${grants.length > 1 ? "<th>Grant</th>" : ""}<th>Purpose</th><th class="num">Amount</th><th>Files</th></tr></thead>
-      <tbody>${payloads.map((p, i) => `<tr><td>${esc(p.date)}</td>${grants.length > 1 ? `<td>${esc(exps[i].grant_name)}</td>` : ""}<td>${esc(p.memo || "—")}</td><td class="num">${money2(p.total)}</td><td>${fileList(p).length ? "📎 " + fileList(p).length : '<span style="color:var(--muted)">—</span>'}</td></tr>`).join("")}
-      <tr><td colspan="${grants.length > 1 ? 3 : 2}" style="font-weight:700">Total</td><td class="num" style="font-weight:700">${money2(total)}</td><td></td></tr></tbody>
+    <h2>📦 Bundle ${pv.count} expense${pv.count === 1 ? "" : "s"} into one email</h2>
+    <p class="sub" style="margin-bottom:8px">One email, ${pv.files ? "two attachments" : "one attachment"}:
+      <strong>${esc(pv.xlsx_name)}</strong> — one expense per line, with each receipt's file name in the Receipt column${pv.files ? `;
+      and <strong>${esc(pv.zip_name)}</strong> — every receipt and supporting document zipped together (${mbLabel(pv.size_mb)}).` : "."}
+      It comes to you first (CC'd) — check it, then forward it.</p>
+    <div style="max-height:40vh;overflow:auto"><table>
+      <thead><tr><th>#</th><th>Date</th><th>Expense${pv.files ? " &amp; its files (in the zip)" : ""}</th><th class="num">Amount</th></tr></thead>
+      <tbody>${pv.rows.map((r) => `<tr>
+        <td>${r.line}</td><td style="white-space:nowrap">${esc(r.date)}</td>
+        <td><div>${esc(r.purpose || "—")}${r.pcard ? ' <span class="badge blue">P-card</span>' : ""}</div>
+          ${multiGrant ? `<div style="font-size:11.5px;color:var(--muted)">${esc(r.grant)}</div>` : ""}
+          <div style="font-size:12px;color:var(--muted);word-break:break-word;margin-top:2px">${names(r.receipt).length ? names(r.receipt).map((n) => "📎 " + esc(n)).join("<br>") : "no receipt"}</div></td>
+        <td class="num" style="white-space:nowrap">${money2(r.amount)}</td></tr>`).join("")}
+      <tr><td colspan="3" style="font-weight:700">Total</td><td class="num" style="font-weight:700">${money2(pv.total)}</td></tr></tbody>
     </table></div>
-    ${nonPdf ? `<p style="color:#b97a08;font-size:13px;margin:8px 0 0">⚠️ Not every attached file is a PDF — Workday itself only accepts PDF attachments. Your financial team can still receive these by email.</p>` : ""}
+    ${pv.missing ? `<p style="color:#b97a08;font-size:13px;margin:8px 0 0">⚠️ ${pv.missing} file${pv.missing === 1 ? "" : "s"} recorded in the app couldn't be found on disk; ${pv.missing === 1 ? "it is" : "they are"} marked “(file missing)”.</p>` : ""}
+    ${pv.too_big ? `<p style="color:#b97a08;font-size:13px;margin:8px 0 0">⚠️ These files add up to about ${mbLabel(pv.size_mb)} — too big for one email. Grants Manager will prepare the spreadsheet and zip in a folder for you to attach yourself instead.</p>` : ""}
     <div class="form-row" style="margin-top:12px">
       <label class="field"><span>Send to me</span><input id="wd-mail-to" type="email" value="${esc(cfg.owner_email || "")}" placeholder="you@uark.edu"></label>
     </div>
     <div class="actions">
-      <button class="btn secondary" id="m-copy-all" style="margin-right:auto">⧉ Copy as text</button>
+      <button class="btn secondary" id="m-copy-all" style="margin-right:auto">⧉ Copy email text</button>
       <button class="btn secondary" id="m-cancel">Not now</button>
-      <button class="btn" id="m-send">✉ Send email</button>
+      <button class="btn secondary" id="m-prep" title="Build the spreadsheet and the zip in a folder without emailing anything">📁 Prepare only</button>
+      <button class="btn" id="m-send">✉ Send bundle</button>
     </div>`, (el, close) => {
     $("#m-cancel", el).onclick = close;
     $("#m-copy-all", el).onclick = async () => {
-      await navigator.clipboard.writeText(subject + "\n\n" + bodyText);
+      await navigator.clipboard.writeText(pv.subject + "\n\n" + pv.body);
       toast("Copied — paste it anywhere");
     };
-    $("#m-send", el).onclick = async () => {
+    const go = async (prepareOnly) => {
       const to = $("#wd-mail-to", el).value.trim();
       if (!to) { toast("Enter your email address"); return; }
-      const btn = $("#m-send", el);
-      btn.disabled = true; btn.textContent = "Sending…";
+      const send = $("#m-send", el), prep = $("#m-prep", el);
+      send.disabled = prep.disabled = true;
+      (prepareOnly ? prep : send).textContent = prepareOnly ? "Preparing…" : "Building & sending…";
       try {
-        const r = await api("/api/workday/send_email", "POST", {
-          to, subject, body: bodyText, attachment_paths: paths,
-          expense_ids: payloads.flatMap((p) => p.expense_ids),
-        });
+        const r = await api("/api/workday/bundle/send", "POST",
+          { expense_ids: pv.ids, to, prepare_only: prepareOnly });
         close();
-        if (r.fallback) { outboxModal(r, "Your email to the financial team"); return; }
-        toast(`Sent ${payloads.length} expenses to ${to} — marked “Sent, waiting”`);
+        if (r.fallback) { outboxModal(r, "Your bundle of " + r.count + " expenses"); return; }
+        toast(`Sent ${r.count} expenses in one email (spreadsheet + zip) to ${to} — marked “Sent, waiting”`, 6000);
         await wdRefresh();
       } catch (e) {
-        btn.disabled = false; btn.textContent = "✉ Send email";
-        showProblem("Send failed: " + e.message);
+        send.disabled = prep.disabled = false;
+        send.textContent = "✉ Send bundle"; prep.textContent = "📁 Prepare only";
+        showProblem("Couldn't send the bundle: " + e.message);
       }
     };
+    $("#m-send", el).onclick = () => go(false);
+    $("#m-prep", el).onclick = () => go(true);
   });
 }
 
@@ -1734,14 +1725,16 @@ function wdDashCards() {
       <div class="section-head">
         <h2>→ To enter in Workday (${queue.length})</h2>
         <span class="no-print" style="display:flex;gap:6px">
+          ${queue.length > 1 ? `<button class="btn small" id="wd-bundle" title="One email: a spreadsheet with a line per expense plus ONE zip of all the receipts and documents. Tick rows to bundle just some.">📦 Bundle & send all (${queue.length})</button>` : ""}
           ${queue.length > 1 ? `<button class="btn secondary small" id="wd-done-all" title="Hide every expense in this list — use once they're all entered in Workday">✓ Mark all entered</button>` : ""}
           <a href="${"/api/workday/entry_sheet.csv"}"><button class="btn secondary small">⬇ Entry sheet (CSV)</button></a>
         </span>
       </div>
       <p class="sub" style="margin-bottom:8px">Expenses added here that haven't shown up in Workday yet. 📤 reopens the send-to-Workday box. Once you've entered one in Workday, click <strong>✓ Entered</strong> to take it off this list (a row also clears itself when the posted charge syncs back in).</p>
       <table>
-        <thead><tr><th>Date</th><th>Grant</th><th>Category</th><th>Description</th><th class="num">Amount</th><th>Status</th><th class="no-print"></th></tr></thead>
+        <thead><tr><th class="no-print" style="width:26px"><input type="checkbox" id="wd-q-all" style="width:auto" title="Select all"></th><th>Date</th><th>Grant</th><th>Category</th><th>Description</th><th class="num">Amount</th><th>Status</th><th class="no-print"></th></tr></thead>
         <tbody>${queue.map((e) => `<tr style="${e.wd_entry === "sent" ? "opacity:.55" : ""}">
+          <td class="no-print"><input type="checkbox" class="wd-q-sel" data-id="${e.id}" style="width:auto"></td>
           <td>${e.date}</td>
           <td>${esc(e.grant_name)}</td>
           <td>${esc(e.category || "—")}</td>
@@ -1866,6 +1859,21 @@ function wireWorkdayBits(m) {
     toast("Marked as entered in Workday. To bring it back: edit the expense → Workday status.");
     await wdRefresh();
   });
+  // bundle: tick some rows (or none = all) and send them as ONE email
+  const qBoxes = () => $$(".wd-q-sel", m);
+  const qChosen = () => qBoxes().filter((b) => b.checked).map((b) => +b.dataset.id);
+  const bundleBtn = $("#wd-bundle", m), qAll = $("#wd-q-all", m);
+  const qRefresh = () => {
+    const n = qChosen().length, total = qBoxes().length;
+    if (bundleBtn) bundleBtn.textContent = n ? `📦 Bundle & send ${n} selected` : `📦 Bundle & send all (${total})`;
+    if (qAll) { qAll.checked = n > 0 && n === total; qAll.indeterminate = n > 0 && n < total; }
+  };
+  qBoxes().forEach((b) => b.onchange = qRefresh);
+  if (qAll) qAll.onchange = () => { qBoxes().forEach((b) => b.checked = qAll.checked); qRefresh(); };
+  if (bundleBtn) bundleBtn.onclick = () => {
+    const ids = qChosen();
+    wdSendExpenses(ids.length ? ids : qBoxes().map((b) => +b.dataset.id));
+  };
   const doneAll = $("#wd-done-all", m);
   if (doneAll) doneAll.onclick = async () => {
     const ids = ((WD && WD.push && WD.push.queue) || []).map((e) => e.id);
@@ -2039,7 +2047,7 @@ function renderInstructions() {
       <p>You don't have to set anything up first: the addresses you use are remembered from your last send and pre-filled next time (⚙ Settings → Advanced is where to correct one). On a Mac, the first send asks permission for <strong>Grants Manager</strong> to control Outlook — click OK once.</p>
       <p><strong>Charging someone else's account:</strong> pick <strong>“Other”</strong> as the grant when a colleague or the department provides the account — a <em>Worktag (whose account)</em> field appears; type in that account's worktag (GR… or CC…). These expenses never count against your grant budgets, but with <strong>📤 Add to Workday</strong> still ticked they're sent to the financial team the same as any other expense, using the worktag you typed instead of one of your own grants.</p>
       <p><strong>Splits:</strong> tick <em>Split across worktags</em> to reveal the split fields — the other grant, its percentage, and its <em>Cost Center</em> and <em>Worktag</em> (auto-filled if the grant is known, editable if not). The email then lists both accounting lines with their percentages and amounts.</p>
-      <p>Grant and Award worktags fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). You can also send from inside a grant: each manual expense on a grant page has a <strong>📤</strong> button, and you can tick several and press <strong>📤 Send selected to Workday</strong> for one email covering all of them (the same bulk button is on <em>All Expenses</em>). Need to include an authorization form or a spreadsheet? Click <strong>✏️</strong> on the expense and use <strong>Additional documents</strong> — they travel with the expense in the Workday email and in the monthly report. Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Entered one in Workday yourself? Click <strong>✓ Entered</strong> on its row (or <strong>✓ Mark all entered</strong> at the top) and it leaves the list right away; to bring one back, edit the expense and change <em>Workday status</em>. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
+      <p>Grant and Award worktags fill in automatically from your imports. Anything not yet visible in Workday collects in the <strong>“To enter in Workday”</strong> card on the Dashboard (📤 reopens the send box; <strong>⬇ Entry sheet (CSV)</strong> downloads the whole list). You can also send from inside a grant: each manual expense on a grant page has a <strong>📤</strong> button. To send <em>several at once</em>, tick them and press <strong>📦 Bundle &amp; send</strong> (the same button is on <em>All Expenses</em> and on the dashboard list): one email with a <strong>spreadsheet</strong> — one expense per line, the receipt's file name in the Receipt column — and <strong>one zip</strong> holding every receipt and supporting document under those names. <em>📁 Prepare only</em> builds both in a folder without emailing anything. Need to include an authorization form or a spreadsheet? Click <strong>✏️</strong> on the expense and use <strong>Additional documents</strong> — they travel with the expense in the Workday email and in the monthly report. Rows clear themselves once the posted charge syncs back — <em>Not sent yet</em> → <em>Sent, waiting</em> → gone. Entered one in Workday yourself? Click <strong>✓ Entered</strong> on its row (or <strong>✓ Mark all entered</strong> at the top) and it leaves the list right away; to bring one back, edit the expense and change <em>Workday status</em>. Untick <strong>📤 Add to Workday</strong> when you add an expense (it is ticked by default) and it never appears in this list at all.</p>`)}
 
     ${sec("📄 Data, backups & undo", `
       <p>Everything lives in one file: <code>GrantsApp/data/grants.db</code>. Older actuals were imported from scanned Workday DBRs; new actuals come from the ⇅ Workday panel.</p>
@@ -2561,7 +2569,7 @@ function renderAllExpenses() {
         <button class="btn secondary small" data-bulk="category">Change category…</button>
         <button class="btn secondary small" data-bulk="grant">Move to grant…</button>
         <button class="btn secondary small" data-bulk="person">Set person…</button>
-        <button class="btn secondary small" data-bulk="send" title="One email to the financial team with every ticked expense, its receipt and documents">📤 Send to Workday…</button>
+        <button class="btn secondary small" data-bulk="send" title="One email to the financial team: a spreadsheet with a line per ticked expense, plus ONE zip of all their receipts and documents">📦 Bundle & send…</button>
         <button class="btn danger small" data-bulk="delete" style="margin-left:auto">🗑 Delete selected</button>
       </div>
       <table id="all-exp-table">
@@ -2887,7 +2895,7 @@ function wdSendExpenses(ids) {
     person: personName(e.person_id),
   }));
   if (full.length === 1) wdPushModal(wdPayloadFromExpense(full[0]));
-  else wdBatchModal(full);
+  else wdBundleModal(full.map((e) => e.id));
 }
 
 function fileToPayload(f) {
@@ -3120,7 +3128,7 @@ function wireGrantView(m) {
   const gRefresh = () => {
     const n = gChosen().length, all = gBoxes();
     gSendBtn.style.display = n ? "" : "none";
-    gSendBtn.textContent = `📤 Send ${n} selected to Workday`;
+    gSendBtn.textContent = n > 1 ? `📦 Bundle ${n} & send` : "📤 Send 1 to Workday";
     gAll.checked = n > 0 && n === all.length;
     gAll.indeterminate = n > 0 && n < all.length;
   };
@@ -3349,7 +3357,9 @@ function outboxModal(r, what) {
     : "Outlook can't be controlled by other programs on this computer (the “new Outlook” doesn't allow it)";
   modal(`
     <h2>📬 ${esc(what)} is ready — one step left</h2>
-    <p class="sub" style="margin:4px 0 10px">Grants Manager couldn't send it for you because ${why}, so it prepared everything instead. Nothing has been sent yet.</p>
+    <p class="sub" style="margin:4px 0 10px">${r.reason === "prepared"
+      ? "Everything is prepared and waiting in a folder. Nothing has been sent."
+      : `Grants Manager couldn't send it for you because ${why}, so it prepared everything instead. Nothing has been sent yet.`}</p>
     <ol style="margin:8px 0 6px;padding-left:20px;line-height:1.6">
       <li>A folder just opened on your screen with the <strong>${n} file${n === 1 ? "" : "s"}</strong> and the email text. <span class="sub">(${esc(r.folder)})</span></li>
       <li>Click <strong>Open email draft</strong> — your email program opens a message already addressed to <strong>${esc(r.to)}</strong>, with the subject and text filled in.</li>

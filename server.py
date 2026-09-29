@@ -2180,19 +2180,37 @@ def extra_export_name(n, width, k, row, x):
                                                  purpose, stem, ext)
 
 
+REPORT_SELECT = (
+    "SELECT e.*, c.name AS category, p.name AS person, g.name AS grant_name "
+    "FROM expenses e LEFT JOIN categories c ON c.id=e.category_id "
+    "LEFT JOIN people p ON p.id=e.person_id "
+    "JOIN grants g ON g.id=e.grant_id ")
+
+
 def report_rows(conn, month):
     """Every expense dated inside `month`, shaped for an accountant."""
     start, end = month_bounds(month)
+    return _shape_report_rows(conn, conn.execute(
+        REPORT_SELECT + "WHERE e.date>=? AND e.date<=? ORDER BY g.name, e.date",
+        (start, end)))
+
+
+def bundle_rows(conn, ids):
+    """The chosen expenses (only ones entered by hand — imported Workday
+    charges are already in Workday), shaped exactly like the monthly report."""
+    ids = sorted({int(i) for i in ids})[:300]
+    if not ids:
+        return []
+    return _shape_report_rows(conn, conn.execute(
+        REPORT_SELECT + "WHERE e.source='manual' AND e.id IN (%s) "
+        "ORDER BY g.name, e.date, e.id" % ",".join("?" * len(ids)), ids))
+
+
+def _shape_report_rows(conn, expenses):
     ps = wd_push_state(conn)
     card = get_setting(conn, "pcard", {}) or {}
     out = []
-    for e in conn.execute(
-            "SELECT e.*, c.name AS category, p.name AS person, g.name AS grant_name "
-            "FROM expenses e LEFT JOIN categories c ON c.id=e.category_id "
-            "LEFT JOIN people p ON p.id=e.person_id "
-            "JOIN grants g ON g.id=e.grant_id "
-            "WHERE e.date>=? AND e.date<=? ORDER BY g.name, e.date",
-            (start, end)):
+    for e in expenses:
         code = ps["codes"].get(e["grant_id"], {})
         prof = ps["profiles"].get(str(e["grant_id"]), {})
         out.append({
@@ -2289,7 +2307,16 @@ def report_xlsx_path(data):
     nobody wants to filter for them by hand.
     """
     os.makedirs(REPORTS_DIR, exist_ok=True)
-    path = os.path.join(REPORTS_DIR, "expenses_%s.xlsx" % data["month"])
+    return write_expense_workbook(
+        os.path.join(REPORTS_DIR, "expenses_%s.xlsx" % data["month"]),
+        data["rows"], data["changes"])
+
+
+def write_expense_workbook(path, rows, changes=()):
+    """Expenses -> .xlsx: the 14 agreed columns, one expense per line, the
+    receipt file name(s) in the Receipt column. A second sheet lists just the
+    P-card purchases when there are any."""
+    data = {"rows": rows, "changes": list(changes)}
 
     def row_of(r):
         out = []
@@ -2324,18 +2351,11 @@ def report_xlsx_path(data):
 RECEIPT_ATTACH_LIMIT = 13 * 1024 * 1024
 
 
-def report_receipt_attachments(data, reserve=1024 * 1024):
-    """Each receipt as its own attachment, named exactly as the Receipt column
-    names it (see receipt_export_name), so a row in the table can be matched to
-    a file by eye. Returns (attach, note, staged): `attach` is what to email
-    (the individual files, or one zip if they'd be too big together), `staged`
-    always the individual renamed files, and `note` a line for the email when
-    something was zipped or missing. `reserve` is room kept for the workbook.
-    """
-    rows = [r for r in data["rows"] if r["_files"]]
-    if not rows:
-        return [], "", []
-    stage = os.path.join(REPORTS_DIR, "receipts_%s" % data["month"])
+def _stage_row_files(rows, stage):
+    """Copy every receipt/document of `rows` into `stage` under its export
+    name, and write the final names back into each row's Receipt cell (a file
+    that can't be found is marked "(file missing)"). Returns
+    (staged_paths, total_bytes, missing_count)."""
     if os.path.isdir(stage):
         shutil.rmtree(stage, ignore_errors=True)
     os.makedirs(stage, exist_ok=True)
@@ -2359,6 +2379,22 @@ def report_receipt_attachments(data, reserve=1024 * 1024):
             total += os.path.getsize(dest)
         r["Receipt"] = "; ".join(shown)
         r["_nattached"] = sum(1 for x in shown if x != "(file missing)")
+    return staged, total, missing
+
+
+def report_receipt_attachments(data, reserve=1024 * 1024):
+    """Each receipt as its own attachment, named exactly as the Receipt column
+    names it (see receipt_export_name), so a row in the table can be matched to
+    a file by eye. Returns (attach, note, staged): `attach` is what to email
+    (the individual files, or one zip if they'd be too big together), `staged`
+    always the individual renamed files, and `note` a line for the email when
+    something was zipped or missing. `reserve` is room kept for the workbook.
+    """
+    rows = [r for r in data["rows"] if r["_files"]]
+    if not rows:
+        return [], "", []
+    staged, total, missing = _stage_row_files(
+        rows, os.path.join(REPORTS_DIR, "receipts_%s" % data["month"]))
     note = ""
     if missing:
         note = ("%d receipt file(s) recorded in the app could not be found on "
@@ -2377,6 +2413,118 @@ def report_receipt_attachments(data, reserve=1024 * 1024):
                   % (len(staged), total / 1048576.0))
         return [out], note, staged
     return staged, note, staged
+
+
+# ------------------------------------------------- expense bundle (one email)
+#
+# Several expenses -> ONE email: a spreadsheet with a line per expense (the
+# receipt's file name in the Receipt column) and ONE zip holding every receipt
+# and supporting document under exactly those names.
+
+BUNDLES_DIR = os.path.join(DATA_DIR, "bundles")
+
+
+def bundle_names(n_expenses, n_files):
+    day = date.today().isoformat()
+    return ("Workday expenses - %s (%d expense%s).xlsx"
+            % (day, n_expenses, "" if n_expenses == 1 else "s"),
+            "Receipts - %s (%d file%s).zip" % (day, n_files, "" if n_files == 1 else "s"))
+
+
+def bundle_text(rows, xlsx_name, zip_name, n_files, missing, owner_name=""):
+    total = sum(r["_amount"] for r in rows)
+    grants = sorted({r["_grant"] for r in rows})
+    lines = ["Hi,", "",
+             "Please enter the %d expenses in the attached spreadsheet in "
+             "Workday — one expense per line, %s in total%s."
+             % (len(rows), money_str(total),
+                " (%s)" % grants[0] if len(grants) == 1
+                else " across %d grants" % len(grants)),
+             "", "Spreadsheet: %s" % xlsx_name]
+    if n_files:
+        lines += ["Receipts and supporting documents: %s (%d file%s zipped "
+                  "together). The Receipt column on each line gives that "
+                  "file's name inside the zip; the number at the start of a "
+                  "name is the line in the spreadsheet."
+                  % (zip_name, n_files, "" if n_files == 1 else "s")]
+    else:
+        lines += ["There are no receipts for these expenses."]
+    pcard = sum(1 for r in rows if r.get("_pcard"))
+    if pcard:
+        lines.append("%d of them were P-card purchases (the spreadsheet has a "
+                     "“P-card purchases” sheet listing just those)." % pcard)
+    if missing:
+        lines.append("%d file(s) recorded in the app could not be found and "
+                     "are marked “(file missing)”." % missing)
+    nore = sum(1 for r in rows if not r["_receipt_path"])
+    if nore:
+        lines.append("%d expense(s) have no main receipt attached." % nore)
+    lines += ["", "Thank you!"]
+    return "\n".join(lines)
+
+
+def bundle_preview(conn, ids):
+    """What a bundle WOULD contain — read-only, nothing is written."""
+    rows = bundle_rows(conn, ids)
+    if not rows:
+        raise ValueError("Pick expenses you entered yourself — imported "
+                         "Workday charges are already in Workday.")
+    files = size = missing = 0
+    for r in rows:
+        for rel, _name in r["_files"]:
+            ap = receipt_abspath(rel)
+            if ap:
+                files += 1
+                size += os.path.getsize(ap)
+            else:
+                missing += 1
+    xlsx_name, zip_name = bundle_names(len(rows), files)
+    total = sum(r["_amount"] for r in rows)
+    grants = sorted({r["_grant"] for r in rows})
+    return {
+        "rows": [{"line": n, "date": r["Date"], "grant": r["Grant / Worktag"],
+                  "purpose": r["Business Purpose"], "amount": r["_amount"],
+                  "receipt": r["Receipt"], "pcard": bool(r["_pcard"])}
+                 for n, r in enumerate(rows, 1)],
+        "count": len(rows), "total": total, "files": files, "missing": missing,
+        "size_mb": round(size / 1048576.0, 1),
+        "too_big": size + 1048576 > RECEIPT_ATTACH_LIMIT,
+        "xlsx_name": xlsx_name, "zip_name": zip_name,
+        "subject": "Workday expense entries — %d expenses — %s — %s" % (
+            len(rows), money_str(total),
+            grants[0] if len(grants) == 1 else "%d grants" % len(grants)),
+        "body": bundle_text(rows, xlsx_name, zip_name, files, missing),
+        "ids": [int(i) for i in ids],
+    }
+
+
+def build_bundle(conn, ids):
+    """Write the spreadsheet and the zip. Returns (rows, xlsx_path, zip_path or
+    None, n_files, missing)."""
+    import zipfile
+    rows = bundle_rows(conn, ids)
+    if not rows:
+        raise ValueError("Pick expenses you entered yourself — imported "
+                         "Workday charges are already in Workday.")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bdir = os.path.join(BUNDLES_DIR, stamp)
+    os.makedirs(bdir, exist_ok=True)
+    stage = os.path.join(bdir, "_receipts")
+    staged, _total, missing = _stage_row_files(rows, stage)   # names -> rows
+    xlsx_name, zip_name = bundle_names(len(rows), len(staged))
+    xlsx = write_expense_workbook(os.path.join(bdir, xlsx_name), rows)
+    zpath = None
+    if staged:
+        zpath = os.path.join(bdir, zip_name)
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            for pth in staged:
+                z.write(pth, os.path.basename(pth))
+    shutil.rmtree(stage, ignore_errors=True)
+    olds = sorted(d for d in os.listdir(BUNDLES_DIR)      # keep the last few
+                  if os.path.isdir(os.path.join(BUNDLES_DIR, d)))
+    for d in olds[:-20]:
+        shutil.rmtree(os.path.join(BUNDLES_DIR, d), ignore_errors=True)
+    return rows, xlsx, zpath, len(staged), missing
 
 
 def report_text(data, owner_name="", note=""):
@@ -3842,6 +3990,53 @@ class Handler(BaseHTTPRequestHandler):
                 set_setting(conn, "workday_push", cfg)
                 self.send_json({"ok": True})
                 return
+            if path == "/api/workday/bundle/preview":
+                self.send_json(bundle_preview(conn, data.get("expense_ids") or []))
+                return
+            if path == "/api/workday/bundle/send":
+                to = (data.get("to") or "").strip()
+                if not to:
+                    self.send_json({"error": "Type the email address the "
+                                    "bundle should go to."}, 400)
+                    return
+                ids = [int(i) for i in (data.get("expense_ids") or [])]
+                rows, xlsx, zpath, n_files, missing = build_bundle(conn, ids)
+                pv = bundle_preview(conn, ids)
+                # the body must describe the files actually built
+                body = bundle_text(rows, os.path.basename(xlsx),
+                                   os.path.basename(zpath) if zpath else "",
+                                   n_files, missing)
+                attach = [xlsx] + ([zpath] if zpath else [])
+                too_big = sum(os.path.getsize(a) for a in attach) > RECEIPT_ATTACH_LIMIT
+                why = None
+                if data.get("prepare_only"):
+                    why = "prepared"
+                elif too_big:
+                    why = "size"
+                else:
+                    try:
+                        wd_send_mail(to, "", pv["subject"], body, attachment=attach)
+                    except OutlookUnavailable:
+                        why = "outlook"
+                if why:
+                    folder, mailto = prepare_outbox(to, pv["subject"], body,
+                                                    attach, "bundle")
+                    self.send_json({
+                        "ok": True, "fallback": True, "reason": why, "to": to,
+                        "folder": folder, "folder_name": os.path.basename(folder),
+                        "mailto": mailto, "count": len(rows),
+                        "attachments": [os.path.basename(a) for a in attach]})
+                    return
+                for eid in ids:
+                    conn.execute("UPDATE expenses SET wd_entry='sent' WHERE id=? "
+                                 "AND source='manual'", (eid,))
+                cfg = get_setting(conn, "workday_push", {}) or {}
+                cfg["owner_email"] = to
+                set_setting(conn, "workday_push", cfg)
+                conn.commit()
+                self.send_json({"ok": True, "to": to, "count": len(rows),
+                                "attachments": [os.path.basename(a) for a in attach]})
+                return
             if path == "/api/outbox/open":
                 if not self.is_local():
                     self.send_json({"error": "not found"}, 404)
@@ -4214,8 +4409,9 @@ with the files and a ready-to-send email draft instead. Monthly report receipts
 are renamed like `03 - 2026-09-15 - 412.75 - Lab supplies.pdf`, matching the
 Receipt column of the workbook row they belong to. Click ✏️ on an expense to
 attach extra documents (a P-card authorization form, a spreadsheet); they go
-with it in the Workday email and the monthly report. Tick expenses on a grant
-page and press "Send selected to Workday" to email several at once.
+with it in the Workday email and the monthly report. Tick expenses and press
+"Bundle & send" to email several at once: one spreadsheet (a line per expense,
+receipt names in a column) plus one zip of all the receipts.
 
 ## Updating to a newer version
 
