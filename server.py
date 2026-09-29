@@ -2972,6 +2972,10 @@ RECEIPT_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic",
                 ".heif", ".tif", ".tiff", ".bmp", ".txt", ".csv", ".xlsx",
                 ".xls", ".doc", ".docx", ".eml", ".msg"}
 MAX_STORED_PATH = 235   # Windows stops at 260; leave room for OneDrive sync
+# Big receipts are ACCEPTED — the page only warns from 20 MB up (large files
+# can make the monthly email too big to send). This is just a safety ceiling,
+# comfortably below the request limit (a file grows ~1/3 when sent as text).
+MAX_RECEIPT_BYTES = 150 * 1024 * 1024
 
 
 def save_receipt(grant, payload):
@@ -2990,8 +2994,12 @@ def save_receipt(grant, payload):
         raw = base64.b64decode(payload["data"], validate=False)
     except (ValueError, KeyError):
         raise ValueError("That receipt file couldn't be read.")
-    if len(raw) > 30 * 1024 * 1024:
-        raise ValueError("Receipt file too large (max 30 MB)")
+    if len(raw) > MAX_RECEIPT_BYTES:
+        raise ValueError("That receipt file is %d MB, which is more than Grants "
+                         "Manager can store (limit %d MB). Save it as a smaller "
+                         "PDF (for photos: export at a lower quality) and try "
+                         "again." % (len(raw) // 1048576,
+                                     MAX_RECEIPT_BYTES // 1048576))
     stem = _win_safe(re.sub(r"[^A-Za-z0-9._ -]+", "_", stem)) or "receipt"
     sub = os.path.join(slugify(grant["name"]), str(date.today().year))
     folder = os.path.join(RECEIPTS_DIR, sub)
@@ -3692,14 +3700,21 @@ class Handler(BaseHTTPRequestHandler):
                 attach = receipt_abspath(data.get("receipt_path"))
                 subj = data.get("subject") or "Workday expense entry"
                 text = data.get("body") or ""
+                # a big receipt would be bounced by the mail server (a file
+                # grows ~1/3 when sent), so prepare a folder instead of sending
+                too_big = bool(attach) and (os.path.getsize(attach)
+                                            > RECEIPT_ATTACH_LIMIT)
                 try:
+                    if too_big:
+                        raise OutlookUnavailable("receipt too big for one email")
                     wd_send_mail(to, "", subj, text, attach)
                 except OutlookUnavailable as why:
                     folder, mailto = prepare_outbox(
                         to, subj, text, [attach] if attach else [], "expense")
                     self.send_json({
                         "ok": True, "fallback": True, "to": to,
-                        "reason": "outlook", "detail": str(why),
+                        "reason": "size" if too_big else "outlook",
+                        "detail": str(why),
                         "folder": folder,
                         "folder_name": os.path.basename(folder),
                         "mailto": mailto,

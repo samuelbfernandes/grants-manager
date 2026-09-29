@@ -68,12 +68,12 @@ async function reload() {
   render();
   if (typeof refreshNotifBadge === "function") refreshNotifBadge();
 }
-function toast(msg) {
+function toast(msg, ms = 2600) {
   const t = $("#toast");
   t.textContent = msg;
   t.classList.add("show");
   clearTimeout(t._h);
-  t._h = setTimeout(() => t.classList.remove("show"), 2600);
+  t._h = setTimeout(() => t.classList.remove("show"), ms);
 }
 
 /* ------------------------------------------------------------ computed */
@@ -1824,7 +1824,7 @@ function renderInstructions() {
     <p class="sub">How to use each part of Grants Manager</p>
 
     ${sec("🏠 Dashboard", `
-      <p><strong>Quick add expense</strong> (top): type the amount, pick the grant and category, adjust the date, add comments, and optionally drop a receipt file (PDF or photo) on the dashed box — then click <em>Add</em>. Receipts are copied into <code>GrantsApp/receipts/&lt;grant&gt;/&lt;year&gt;/</code>, so they're backed up by OneDrive.</p>
+      <p><strong>Quick add expense</strong> (top): type the amount, pick the grant and category, adjust the date, add comments, and optionally drop a receipt file (PDF or photo) on the dashed box — then click <em>Add</em>. Any size is accepted; from 20&nbsp;MB up you get a warning, because very large receipts can make the monthly email too big to send (the app then prepares a folder instead). Receipts are copied into <code>GrantsApp/receipts/&lt;grant&gt;/&lt;year&gt;/</code>, so they're backed up by OneDrive.</p>
       <p><strong>Splitting a cost:</strong> pick a second grant under <em>Split with</em> and the percentage that grant pays — the app creates two linked expenses, one on each grant, with the split noted in each. The same option exists in the grant page's <em>+ Add expense</em> form.</p>
       <p><strong>Alerts</strong> warn when (in the current budget year) a grant is ending soon, a category is over 80% spent, or something is overspent. Click an alert to open that grant.</p>
       <p><strong>Grant cards</strong> show money still available on each grant. The bar starts fully <span style="color:var(--green);font-weight:600">green (available)</span> and fills with gray from left to right as money is spent — a mostly gray bar means the grant is nearly used up.</p><p><strong>“Available” means what you can still spend</strong> — the award minus what you've spent <em>and</em> minus anything already committed (purchase orders and requisitions Workday knows about but hasn't billed yet). That matches the figure your accountant quotes. Commitments only appear once you've imported a Workday report; before that, available is simply award minus spent.</p><p><strong>The two lines under each card answer “am I on track?”</strong> The first compares time against money (“19 of 36 months gone (53%) — you've spent 20% of the money”). The second takes your average spending over the last six months and says where it lands: either how much would be left at the end, or — in amber — how many months early you'd run out. Click a card to open the grant's full page. Totals for all active grants are at the bottom, and closed grants can be hidden with the <em>Hide closed grants</em> button.</p>
@@ -2721,12 +2721,28 @@ function fillCatSelect(sel, grantId, selectedId) {
     `<option value="${c.id}" ${c.id === selectedId ? "selected" : ""}>${esc(c.name)}</option>`).join("");
 }
 
+/* Receipts over this size are accepted, but the person is told: a big file can
+   push the monthly email past what mail systems allow, in which case the report
+   is prepared as a folder instead of being emailed. */
+const LARGE_RECEIPT_BYTES = 20 * 1024 * 1024;
+const mbText = (bytes) => (bytes / 1048576).toFixed(bytes >= 10485760 ? 0 : 1) + " MB";
+function largeReceiptNote(f) {
+  return f && f.size > LARGE_RECEIPT_BYTES
+    ? `This receipt is ${mbText(f.size)}. It will be saved, but a file this big can make the monthly email too large to send — the report is then prepared as a folder for you instead. A smaller PDF is easier to email.`
+    : "";
+}
+
 function wireDropzone(zone, fileInput, onFile) {
   let picked = null;
   const set = (f) => {
     picked = f;
     zone.classList.toggle("has-file", !!f);
-    zone.innerHTML = f ? `✓ ${esc(f.name)}` : "📎 Drop receipt<br>or click";
+    const big = f && f.size > LARGE_RECEIPT_BYTES;
+    zone.innerHTML = f
+      ? `✓ ${esc(f.name)}${big ? `<br><span style="color:#b97a08;font-weight:600">⚠ ${mbText(f.size)} — large</span>` : ""}`
+      : "📎 Drop receipt<br>or click";
+    zone.title = big ? largeReceiptNote(f) : "";
+    if (big) toast("⚠ " + largeReceiptNote(f), 12000);   // a warning, not a refusal
     onFile(f);
   };
   zone.onclick = () => fileInput.click();
@@ -2879,7 +2895,9 @@ function wireQuickAdd(m) {
       if (splitG && !(pct > 0 && pct < 100)) { toast("Enter a split % between 1 and 99"); return; }
       if (receipt) body.receipt = receipt;
       const r = await api("/api/expenses", "POST", body);
-      toast(`Added ${money2(amount)} to ${g.name}`);
+      toast(`Added ${money2(amount)} to ${g.name}` + (largeReceiptNote(file)
+        ? ` — the ${mbText(file.size)} receipt was saved, but it's large (may be too big to email)` : ""),
+        largeReceiptNote(file) ? 8000 : 2600);
       await reload();
       // saved in the DB — now offer the workday-ready email packet
       const exp = S.expenses.find((x) => x.id === r.id);
