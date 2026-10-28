@@ -109,8 +109,16 @@ way to use it is: **download a report from Workday, import the file here.**
    asks who they are — one click adds the person and links their charges. You
    never have to type payroll names yourself.
 
-If a file can't be read, the app says what it actually was — a PDF, the older
-`.xls` format, a CSV — and nothing is imported until one reads cleanly. The
+**PDFs work too, even scanned ones.** Choose a Budget-vs-Actual PDF, or the
+whole monthly packet your department sends (DBR), in the same **📁 Choose
+files** box. The app shows what it read next to the scanned page before
+anything is imported. A full packet also carries the department ledger pages,
+so a brand-new install can rebuild your grants, every transaction, the people
+paid from them and their appointments from the PDFs alone — no typing.
+
+If a file can't be read, the app says what it actually was — the older
+`.xls` format, a CSV, a scan with no text layer — and nothing is imported
+until one reads cleanly. The
 ⇅ Workday panel also offers an **example workbook** with fake data in exactly
 the columns expected, to compare your export against.
 

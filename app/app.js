@@ -2042,20 +2042,30 @@ function wdDashCards() {
     `<option value="ignore">Ignore this class</option>`;
   let html = "";
   if (WD.unmapped_grants.length + WD.unmapped_categories.length) {
+    const nG = WD.unmapped_grants.length, nC = WD.unmapped_categories.length;
     html += `<div class="card" style="border-left:4px solid #b97a08">
-      <h2>⚠️ Map Workday codes (one-time)</h2>
+      <h2>⚠️ Tell the app where ${nG + nC === 1 ? "this Workday code belongs" : `these ${nG + nC} Workday codes belong`}</h2>
+      <p class="sub" style="margin-bottom:10px">Your Workday import uses ${nG && nC ? "grant codes and spending types" : nG ? `${nG === 1 ? "a grant code" : "grant codes"}` : `${nC === 1 ? "a spending type" : "spending types"}`} the app hasn't seen before.
+        Until you answer, ${nG && nC ? "their money isn't counted" : nG ? `${nG === 1 ? "its" : "their"} money isn't counted on any grant` : `${nC === 1 ? "its" : "their"} money isn't counted in any budget category`}.
+        <strong>Pick an answer in each drop-down below</strong>. Your choice is saved straight away and used for every later import, so you only do this once per code.</p>
+      ${nG ? `<p style="margin:10px 0 4px"><strong>Grants.</strong> Choose the grant in this app that the Workday code is. If it isn't in the app yet, choose <strong>➕ Create this as a new grant</strong>. Choose <strong>Ignore</strong> for a grant you don't want to track.</p>` : ""}
       ${WD.unmapped_grants.map((u) => `
         <div class="form-row" style="align-items:center">
           <label class="field"><span>Workday grant ${esc(u.grant_code)}</span>
             <div style="font-size:12px;color:var(--muted)">${esc(u.name || u.grant_name || "")}${u.start ? ` · ${esc(u.start)} → ${esc(u.end || "?")}` : ""}</div></label>
-          <label class="field"><span>→</span><select data-wd-map-grant="${esc(u.grant_code)}">${grantOpts()}</select></label>
+          <label class="field"><span>→ which grant is it in the app?</span><select data-wd-map-grant="${esc(u.grant_code)}">${grantOpts()}</select></label>
         </div>`).join("")}
-      ${WD.unmapped_categories.map((oc) => `
+      ${nC ? `<p style="margin:10px 0 4px"><strong>Spending types.</strong> Workday sorts every charge into a spending type (its “object class”). Choose the budget category in this app those charges should count toward, e.g. <em>01_Personnel</em> → <em>Personnel</em>, <em>10_Materials and Supplies</em> → <em>Supplies</em>.</p>` : ""}
+      ${WD.unmapped_categories.map((oc) => {
+        const project = oc === "Project: Expenses";
+        return `
         <div class="form-row" style="align-items:center">
-          <label class="field"><span>Workday object class</span>
-            <div style="font-size:12px">${esc(wdShortOC(oc))}</div></label>
-          <label class="field"><span>→ maps to</span><select data-wd-map-cat="${esc(oc)}">${catOpts()}</select></label>
-        </div>`).join("")}
+          <label class="field"><span>Workday spending type</span>
+            <div style="font-size:12px">${project ? "Project total (one line, no breakdown)" : esc(wdShortOC(oc))}</div>
+            ${project ? `<div style="font-size:12px;color:var(--muted)">A project account such as a start-up shows only one total. Choose the category most of its money goes to.</div>` : ""}</label>
+          <label class="field"><span>→ count it as</span><select data-wd-map-cat="${esc(oc)}">${catOpts()}</select></label>
+        </div>`;
+      }).join("")}
     </div>`;
   }
   if ((WD.unmatched_workers || []).length) {
@@ -2397,7 +2407,8 @@ function renderInstructions() {
       <p><strong>2. Enable it as a web service.</strong> Edit the custom report → <strong>Advanced</strong> tab → tick <strong>Enable As Web Service</strong> → OK. If the report has prompts (Grant, Organization…), give them default values so it can run unattended.</p>
       <p><strong>3. Copy the URL.</strong> On the report: related actions (…) → <strong>Web Service</strong> → <strong>View URLs</strong> → right-click the <strong>CSV</strong> link → Copy link. It looks like <code>https://….workday.com/ccx/service/customreport2/…</code></p>
       <p><strong>4. Paste it here.</strong> Click <strong>⚙ Settings</strong> → open <strong>Advanced</strong> → paste the URL under <em>Direct connection (RaaS)</em>, enter your Workday username, Save. Then <strong>⇅ Workday → ⇣ Sync from Workday now</strong> and type your password — held in memory for this session only, never written to disk. Once a URL is saved, and only then, the app will offer to connect when it opens.</p>
-      <p><strong>A PDF of the reports (even a scan).</strong> In <strong>⇅ Workday → Import exported files</strong> you can choose a PDF holding Workday's <em>Budget vs Actual</em> pages (<em>RPT - Departmental Grant Budget vs Actual</em>, or <em>Project Budget vs Actual</em>) — for example the printed pages run through a scanner. The app reads the scanner's text layer on your own computer (nothing is uploaded anywhere), finds each grant's table, and checks every row with the report's own arithmetic (Budget − Commitment − Obligation − Actuals = Available) and its Total row. You then see each table next to the scanned page: fix anything highlighted and press <em>Recheck</em>. Pages that aren't budget tables (transaction details, your own ledger sheets) are skipped. Grants that aren't in the PDF are never touched. For each grant you choose whether to <em>bring your expense ledger in line with Workday</em> (added as dated adjustment rows — your own entries are never changed) and, when Workday's budget is higher than yours, whether to <em>raise your budget</em>. A backup is saved before anything is written. If a scan's text layer is poor the app says so and asks you to type the missing figures; a PDF with no text layer at all needs re-scanning with OCR (“searchable PDF”) or Workday's Export to Excel.</p>
+      <p><strong>A PDF of the reports (even a scan).</strong> In <strong>⇅ Workday → Import exported files</strong> you can choose a PDF holding Workday's <em>Budget vs Actual</em> pages (<em>RPT - Departmental Grant Budget vs Actual</em>, or <em>Project Budget vs Actual</em>) — for example the printed pages run through a scanner. The app reads the scanner's text layer on your own computer (nothing is uploaded anywhere), finds each grant's table, and checks every row with the report's own arithmetic (Budget − Commitment − Obligation − Actuals = Available) and its Total row. You then see each table next to the scanned page: fix anything highlighted and press <em>Recheck</em>. Transaction-detail pages are skipped. Grants that aren't in the PDF are never touched.</p>
+      <p><strong>A whole DBR packet rebuilds the app.</strong> The department ledger pages in the packet (one section per category, each charge with its running balance) are read too: every charge becomes an expense, a misread figure is corrected from the running balance, and the payroll names become <strong>People</strong> — with an <strong>appointment</strong> for each person still being paid, worked out from their latest pay (salary, fringe %, tuition; the end date is the grant's end, so adjust it if it ends sooner). A grant the app doesn't have yet is created with its name, dates and budget by year. Importing the same packet twice adds nothing, and next month's packet adds only what is new. What a DBR can't hold — appointments for people not yet hired, how you group or name grants, your receipts — stays yours to enter. If a summary table can't be read at all, the ledger's charges still come in and the app tells you what is missing (usually F&amp;A). For each grant you choose whether to <em>bring your expense ledger in line with Workday</em> (added as dated adjustment rows — your own entries are never changed) and, when Workday's budget is higher than yours, whether to <em>raise your budget</em>. A backup is saved before anything is written. If a scan's text layer is poor the app says so and asks you to type the missing figures; a PDF with no text layer at all needs re-scanning with OCR (“searchable PDF”) or Workday's Export to Excel.</p>
       <p><strong>Transactions too (optional):</strong> the copied report gives balances only. For the individual charges, create a second custom report (<em>Create Custom Report</em> → Advanced) on a journal-lines data source filtered to your grants, including the columns <em>Accounting Date, Budget Date, Operational Transaction, Award, Grant, Worker, Supplier, Ledger Account, Transaction Amount, Object Class, Spend Category</em>; enable it as a web service the same way and paste its URL in the second field.</p>
       <p><strong>If the sync says the login was rejected, or that it got a login page back:</strong> your account is SSO-only and this route is closed. That is the expected outcome for most people — use the import steps above instead.</p>
       ${demo('advanced-settings', 'Where the optional settings live — ⚙ Settings → Advanced: the RaaS URLs, saved addresses and grant worktags.')}
@@ -3838,7 +3849,8 @@ async function wdPdfFlow(file) {
       (el, close) => { $("#m-cancel", el).onclick = close; });
     return;
   }
-  wdPdfReview({ reports: r.reports, file: r.file, pages: r.pages, skipped: r.skipped_pages, rec: {}, bud: {}, conf: {}, stale: {} });
+  wdPdfReview({ reports: r.reports, file: r.file, pages: r.pages, skipped: r.skipped_pages, rec: {}, bud: {}, conf: {}, stale: {},
+    token: r.ledger_token, ledgers: r.ledgers || [], dry: r.dry });
 }
 
 function wdPdfClasses() {
@@ -3851,8 +3863,18 @@ function wdPdfClasses() {
 function wdPdfReview(st) {
   const classes = wdPdfClasses();
   const short = (oc) => String(oc || "").split(":").pop().trim();
+  const dryRep = (code) => (st.dry?.reports || []).find((x) => x.code === code);
+  const dryLed = (code) => (st.dry?.ledger?.grants || []).find((x) => x.code === code);
+  const ledLine = (code) => {
+    const l = st.ledgers.find((x) => x.code === code), d = dryLed(code);
+    if (!l) return "";
+    return `<div style="margin-top:8px;font-size:13px">📒 Its ledger: <strong>${d ? d.added : 0}</strong> new transaction${d && d.added === 1 ? "" : "s"} to add
+      (${l.rows} read${l.unreadable ? `, ${l.unreadable} unreadable — covered by the adjustment below` : ""})${l.people.length ? ` · payroll: ${l.people.map(esc).join(", ")}` : ""}.</div>`;
+  };
   const card = (r, i) => {
-    const p = r.plan || {};
+    const p = { ...(r.plan || {}) };
+    const dr = dryRep(r.code);
+    if (dr && !p.pending && p.mapped !== false) p.reconcile = dr.reconcile;
     const bad = r.problems.length > 0, hard = (r.blocking || []).length > 0;
     const rowHtml = r.rows.map((row, j) => `<tr style="${row.problems?.length ? "background:var(--amber-soft)" : ""}">
         <td style="min-width:170px">${row.object_class
@@ -3903,14 +3925,26 @@ function wdPdfReview(st) {
         <label class="field" style="margin:0"><span>Report date</span><input data-asof="${i}" type="date" value="${esc(r.as_of || "")}"></label></div>` : ""}
       ${r.jpeg ? `<details style="margin-top:8px" ${bad ? "open" : ""}><summary style="cursor:pointer;font-size:13px">Show the scanned page to compare</summary><img src="${r.jpeg}" style="max-width:100%;margin-top:6px;border:1px solid var(--border,#ddd);border-radius:6px"></details>` : ""}
       ${planHtml}
+      ${ledLine(r.code)}
       ${bad && !hard ? `<label style="display:flex;gap:8px;margin-top:8px;font-size:13px"><input type="checkbox" data-conf="${i}" style="width:auto" ${st.conf[i] ? "checked" : ""}> I've compared this with the page — import it as shown</label>` : ""}
     </div>`;
   };
   modal(`
     <h2>Import from PDF</h2>
-    <p class="sub" style="margin:-8px 0 12px">${esc(st.file)} · ${st.pages} pages · ${st.reports.length} budget report${st.reports.length === 1 ? "" : "s"} found${st.skipped ? ` (${st.skipped} other pages — transaction details and ledgers — skipped)` : ""}.
-      Every row below was checked against the report's own arithmetic. Fix anything highlighted, then import. Grants that aren't in this PDF are left exactly as they are.</p>
+    <p class="sub" style="margin:-8px 0 12px">${esc(st.file)} · ${st.pages} pages · ${st.reports.length} budget report${st.reports.length === 1 ? "" : "s"} found${st.ledgers.length ? ` · ${st.ledgers.length} ledger${st.ledgers.length === 1 ? "" : "s"}` : ""}.
+      Every row below was checked against the report's own arithmetic, and each ledger line against its running balance. Highlighted rows can be fixed, or left: Import brings in everything that could be read. Grants that aren't in this PDF are left exactly as they are.</p>
     ${st.reports.map(card).join("")}
+    ${st.ledgers.filter((l) => !st.reports.some((r) => r.code === l.code)).map((l) => `<div class="card" style="margin-bottom:12px;padding:14px">
+      <strong style="font-size:15px">${esc(l.code)}</strong> <span class="sub">· ${esc(l.grant)} · ledger only (no Budget vs Actual table found) · as of ${esc(l.as_of || "?")}</span>
+      ${ledLine(l.code)}</div>`).join("")}
+    ${(() => {
+      const L = st.dry?.ledger; if (!L) return "";
+      const bits = [];
+      if (L.people_added.length) bits.push(`New people: ${L.people_added.map(esc).join(", ")}`);
+      if (L.appointments_added.length) bits.push(`Appointments worked out from their latest pay: ${L.appointments_added.map(esc).join(" · ")}`);
+      if (L.appointments_ended.length) bits.push(`Appointments ended (pay stopped): ${L.appointments_ended.map(esc).join(" · ")}`);
+      return bits.length ? `<div class="card" style="margin-bottom:12px;padding:14px;font-size:13px">👥 From the payroll lines:<ul style="margin:6px 0 0;padding-left:20px">${bits.map((b) => `<li>${b}</li>`).join("")}</ul></div>` : "";
+    })()}
     <div class="actions">
       <button class="btn secondary" id="pdf-recheck">Recheck my edits</button>
       <button class="btn secondary" id="m-cancel">Cancel</button>
@@ -3920,8 +3954,9 @@ function wdPdfReview(st) {
     const strip = () => st.reports.map((r) => { const c = { ...r }; delete c.jpeg; return c; });
     const recheck = async () => {
       try {
-        const r = await api("/api/workday/pdf/check", "POST", { reports: strip() });
+        const r = await api("/api/workday/pdf/check", "POST", { reports: strip(), ledger_token: st.token });
         st.reports = r.reports.map((n, i) => ({ ...n, jpeg: st.reports[i].jpeg }));
+        st.dry = r.dry;
         close(); wdPdfReview(st);
       } catch (e) { toast("Recheck failed: " + e.message); }
     };
@@ -3953,7 +3988,7 @@ function wdPdfReview(st) {
       });
       $("#pdf-apply", el).disabled = true;
       try {
-        const res = await api("/api/workday/pdf/apply", "POST", { reports, choices });
+        const res = await api("/api/workday/pdf/apply", "POST", { reports, choices, ledger_token: st.token });
         close();
         await wdRefresh(); await reload();
         wdPdfDone(res);
@@ -3964,13 +3999,21 @@ function wdPdfReview(st) {
 
 function wdPdfDone(res) {
   const done = res.reports || [], skipped = res.skipped || [];
+  const L = res.ledger || { grants: [], people_added: [], appointments_added: [], appointments_ended: [] };
+  const ledHtml = L.grants.length ? `<h3 style="font-size:14px;margin:12px 0 6px">📒 From the ledgers</h3>
+    <ul style="margin:0 0 8px;padding-left:20px">${L.grants.map((g) => `<li style="margin:4px 0"><strong>${esc(g.grant)}</strong> <span class="sub">(${esc(g.code)})</span>: ${g.added} transaction${g.added === 1 ? "" : "s"} added${g.unreadable ? ` · ${g.unreadable} unreadable line${g.unreadable === 1 ? "" : "s"} (covered by the adjustment rows)` : ""}
+      ${g.notes.map((n) => `<br><span class="sub">${esc(n)}</span>`).join("")}</li>`).join("")}</ul>
+    ${L.people_added.length ? `<p style="margin:4px 0;font-size:13px">New people: ${L.people_added.map(esc).join(", ")}</p>` : ""}
+    ${L.appointments_added.length ? `<p style="margin:4px 0;font-size:13px">Appointments worked out from their latest pay: ${L.appointments_added.map(esc).join(" · ")} <span class="sub">— end dates are the grants' end; adjust them on the People tab.</span></p>` : ""}
+    ${L.appointments_ended.length ? `<p style="margin:4px 0;font-size:13px">Appointments ended (pay stopped): ${L.appointments_ended.map(esc).join(" · ")}</p>` : ""}` : "";
   modal(`
-    <h2>${done.length ? "Imported from PDF" : "Nothing was imported"}</h2>
+    <h2>${done.length || L.expenses_added ? "Imported from PDF" : "Nothing was imported"}</h2>
     ${done.length ? `<ul style="margin:0 0 8px;padding-left:20px">${done.map((r) => `<li style="margin:4px 0"><strong>${esc(r.grant)}</strong> <span class="sub">(${esc(r.code)}, ${r.rows} row${r.rows === 1 ? "" : "s"})</span>
         ${r.reconciled.length ? `<br><span class="sub">Ledger: ${r.reconciled.map(esc).join(" · ")}</span>` : ""}
         ${r.budget.length ? `<br><span class="sub">Budget raised: ${r.budget.map(esc).join(" · ")}</span>` : ""}
         ${r.released ? `<br><span class="sub">${esc(r.released)}</span>` : ""}</li>`).join("")}</ul>
       <p class="sub" style="margin:0 0 8px">A copy of your data was saved first (Settings → backups). Anything you want undone can be edited like any other expense.</p>` : ""}
+    ${ledHtml}
     ${skipped.length ? `<h3 style="font-size:14px;margin:12px 0 6px;color:#b3261e">Not imported</h3>${skipped.map((x) => `<div style="border-left:3px solid #b3261e;padding:4px 0 4px 10px;margin-bottom:6px"><strong>${esc(x.code)}</strong><div class="sub">${esc(x.why)}</div></div>`).join("")}` : ""}
     <div class="actions"><button class="btn" id="m-cancel">Close</button></div>`,
     (el, close) => { $("#m-cancel", el).onclick = close; });

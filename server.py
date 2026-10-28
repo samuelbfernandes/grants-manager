@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 import webbrowser
 import zlib
@@ -2403,10 +2404,13 @@ def pdf_parse_page(page):
     cand = [w for w in words if w["y"] < top and w["y"] > 60]
     cand.sort(key=lambda w: (-round(w["y"]), w["x0"]))
     merged = []
-    for w in sorted(cand, key=lambda w: (-w["y"], w["x0"])):
-        if merged and abs(merged[-1]["y"] - w["y"]) < 2.0 and w["x0"] - merged[-1]["x1"] < 3.0 \
-                and _pdf_money(merged[-1]["t"] + w["t"]) is not None \
-                and re.search(r"\d", w["t"]) and re.fullmatch(r"[\d.,_'OolI|]+", w["t"]):
+    for w in [w for ln in _pdf_lines(cand, tol=2.0) for w in ln["w"]]:
+        # a figure the scan split into pieces ('9' ',77' '1' '.93'): join them
+        # while they touch, even when a piece on its own isn't a figure yet
+        if merged and abs(merged[-1]["y"] - w["y"]) < 2.0 \
+                and -1.0 < w["x0"] - merged[-1]["x1"] < 3.5 \
+                and re.fullmatch(r"[(\-]?[\d.,_'OolI|]+", merged[-1]["t"]) \
+                and re.search(r"\d", w["t"]) and re.fullmatch(r"[\d.,_'OolI|]+\)?", w["t"]):
             p = merged[-1]
             merged[-1] = {"x0": p["x0"], "x1": w["x1"], "y": p["y"], "size": p["size"],
                           "t": p["t"] + w["t"]}
@@ -2522,6 +2526,888 @@ def _pdf_parse_project(rep, lines):
     return rep
 
 
+# ------------------------------------------------ department ledger pages
+#
+# Each grant in a DBR packet also comes with the department's own ledger
+# ("Report 2799"): one section per budget category, every charge on its own
+# line with a running balance. That is where line items, dates and the names
+# on payroll come from. The scan's text layer is poor, so each row is checked
+# against the running balance: when the amount and the balance disagree, the
+# neighbouring rows decide which one was misread.
+
+_LEDGER_AMT_HEADS = ("expense", "salary", "fringes", "tuition", "amount")
+_LEDGER_DATE_X = 112          # dates sit in the left-most column
+_LEDGER_GLYPH = {             # what a scanner turns digits and slashes into
+    "O": "0", "o": "0", "D": "0", "Q": "0", "S": "5", "s": "5", "B": "8",
+    "Z": "2", "g": "9", "q": "9"}
+_LEDGER_AMBIG = {             # glyphs that are a 1, a slash, or both
+    "1": ("1", "/"), "l": ("1", "/"), "I": ("1", "/"), "i": ("1", "/"),
+    "|": ("1", "/"), "t": ("1", "/"), "f": ("1", "/"), "]": ("1", "/"),
+    "L": ("1", "/"), "j": ("1", "/"), "!": ("1", "/"), "r": ("1", "/"),
+    "U": ("1/", "/1", "/"), "u": ("1/", "/1", "/"), "A": ("/1", "1/", "/"),
+    "n": ("/1", "1/", "/"), "v": ("1/", "/1", "/"), "^": ("/1", "1/", "/"),
+    ".": ("", "/"), ",": ("", "/"), "/": ("/",), "-": ("/",), "\\": ("/",)}
+
+
+def _ledger_date_cands(tok, lo, hi):
+    """Every date a scanned 'M/D/YY' token could be, between lo and hi."""
+    t = "".join(_LEDGER_GLYPH.get(c, c) for c in tok.strip("'`\"()"))
+    if not t or len(t) > 12 or not re.search(r"\d", t):
+        return []
+    opts = [""]
+    for c in t:
+        if c.isdigit() and c != "1":
+            alts = (c,)
+        elif c in _LEDGER_AMBIG:
+            alts = _LEDGER_AMBIG[c]
+        else:
+            return []
+        opts = [o + a for o in opts for a in alts]
+        if len(opts) > 4096:
+            return []
+    out = set()
+    for o in opts:
+        m = re.fullmatch(r"(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})", o)
+        if not m:
+            continue
+        y = int(m.group(3))
+        y = y + 2000 if y < 100 else y
+        try:
+            d = date(y, int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            continue
+        if lo <= d <= hi:
+            out.add(d)
+    return sorted(out)
+
+
+def _ledger_pick_date(tok, prev, lo, hi):
+    """The reading of a scanned date that fits the ledger best: not before the
+    row above (rows run in date order, give or take a few days), and on a
+    1st, 15th or month end — the days charges post on — when that decides it."""
+    plain = set(_ledger_date_cands(tok, lo, hi))
+    added = set()
+    t = tok.strip()           # the scan may have dropped a slash: try one back
+    for i in range(1, len(t)):
+        added.update(_ledger_date_cands(t[:i] + "/" + t[i:], lo, hi))
+    added -= plain
+    c = plain | added
+    if c and prev > lo and all(d < prev - timedelta(days=21) for d in c):
+        # far before the row above: the month was misread; keep the day
+        for d in list(c):
+            for k in (0, 1):
+                y, m = prev.year + (prev.month + k - 1) // 12, (prev.month + k - 1) % 12 + 1
+                try:
+                    added.add(date(y, m, d.day))
+                except ValueError:
+                    pass
+        c = plain | added
+    if not c:
+        return None
+
+    def score(d):
+        eom = (d + timedelta(days=1)).day == 1
+        return (d < prev - timedelta(days=21), (not (d.day in (1, 15) or eom)) + (d in added),
+                d < prev, abs((d - prev).days))
+    return min(c, key=score)
+
+
+def _ledger_money(toks):
+    """Tokens of one cell, left to right -> (value, is_credit) or (None, credit)."""
+    s = "".join(toks).replace(" ", "")
+    credit = s.startswith("+") or s.startswith("t+")
+    s = s.lstrip("+t") if credit else s
+    v = _pdf_money(s)
+    return v, credit
+
+
+def _ledger_header(lines, words):
+    """Code, title, report month and expiry from a ledger page's top lines."""
+    info = {}
+    for l in lines[:4]:
+        low = l["text"].lower()
+        if "reeport" in low or "report" in low or "2799" in low:
+            for w in l["w"]:
+                for p in ("GR", "PR", "CR"):
+                    c = _pdf_norm_code(w["t"][:2] + w["t"][2:].replace("t", "1"), p)
+                    if c and "code" not in info:
+                        info["code"] = ("GR" + c[2:]) if p == "CR" else c
+            if "code" in info:
+                txt = l["text"]
+                txt = re.split(r"\bRe+e?port\b|\b2799\b", txt, flags=re.I)[0]
+                info["title"] = txt
+        m = re.search(r"(January|February|March|April|May|June|July|August|September|"
+                      r"October|November|December|[a-z]*tember|[a-z]*uary)\s*(\d{1,2})"
+                      r"\W*\s*(20\d\d)", l["text"], re.I)
+        if m and "as_of" not in info:
+            mon = difflib.get_close_matches(m.group(1).lower()[:3], _PDF_MONTHS, n=1, cutoff=0.3)
+            if not mon and m.group(1).lower().endswith("tember"):
+                mon = ["sep"]
+            if mon:
+                info["as_of"] = _pdf_month_end(int(m.group(3)), _PDF_MONTHS.index(mon[0]) + 1)
+        m = re.search(r"Exp(?!ense)\w*\s+(\S+)", l["text"])
+        if m and "expires_tok" not in info:
+            info["expires_tok"] = m.group(1)
+    if "code" not in info:      # the code on its own, e.g. 'PR01234 Startup/...'
+        for w in words:
+            if w["y"] > lines[0]["y"] - 4:
+                c = _pdf_norm_code(w["t"], "PR") or _pdf_norm_code(w["t"], "GR")
+                if c:
+                    info["code"] = c
+                    info["title"] = lines[0]["text"]
+                    break
+    return info
+
+
+def pdf_parse_ledger_page(page):
+    """One page -> {'header': {...} or None, 'sections': [...]} or None.
+
+    A section starts at a 'Date  Description  <Expense|Salary|...>  Balance'
+    heading; rows before the first heading continue the previous page's last
+    section."""
+    words = _pdf_words(page["runs"])
+    if not words:
+        return None
+    lines = _pdf_lines(words, tol=3.0)
+    low = " ".join(l["text"] for l in lines[:6]).lower()
+    if ("details" in low and "view" in low) or "budget vs" in low or "rpt" in low[:40]:
+        return None
+    heads = []
+    for l in lines:
+        ws = l["w"]
+        bal = [w for w in ws if _pdf_fuzzy(w["t"], "balance", 0.6)]
+        dat = [w for w in ws if _pdf_fuzzy(w["t"], "date", 0.6)]
+        if not bal or not dat:
+            continue
+        amt = [w for w in ws if any(_pdf_fuzzy(w["t"], h, 0.6) for h in _LEDGER_AMT_HEADS)]
+        if not amt:
+            continue
+        a = max(amt, key=lambda w: w["x0"])
+        desc = [w for w in ws if _pdf_fuzzy(w["t"], "description", 0.6)]
+        # some headings name the category: 'Date Description Other Direct Costs ER# ...'
+        lab = [w["t"] for w in ws if desc and w["x0"] > desc[0]["x0"] and w["x0"] < a["x0"]
+               and not re.search(r"#|^(PO|ER|JRN)\W*$", w["t"])
+               and not any(_pdf_fuzzy(w["t"], h, 0.6) for h in _LEDGER_AMT_HEADS)]
+        heads.append({"y": l["y"], "kind": a["t"].lower(), "amt_x": a["x0"],
+                      "bal_x": bal[-1]["x0"], "label": " ".join(lab)})
+    hdr = _ledger_header(lines, words)
+    if not heads and not hdr.get("code"):
+        # a continuation page has no heading: only accept it when its rows
+        # look like ledger rows (a date at the left, money at the right)
+        dated = sum(1 for w in words if w["x0"] < _LEDGER_DATE_X and re.search(r"\d.*\d", w["t"]))
+        if dated < 3:
+            return None
+    return {"header": hdr if hdr.get("code") else None, "heads": heads,
+            "words": words, "h": page.get("h") or 800}
+
+
+def _ledger_rows(pg, head, ytop, ybot):
+    """Rows between two y positions, using one heading's column positions."""
+    amt_lo, bal_lo = head["amt_x"] - 45, head["bal_x"] - 12
+    ws = [w for w in pg["words"] if ybot < w["y"] < ytop]
+    # anchors: anything in the date or money columns
+    anch = sorted((w for w in ws if w["x0"] < _LEDGER_DATE_X and re.search(r"\d", w["t"])
+                   or w["x0"] >= amt_lo and re.search(r"\d", w["t"])),
+                  key=lambda w: -w["y"])
+    bands = []
+    for w in anch:
+        if bands and bands[-1]["y"] - w["y"] <= 8.5:
+            bands[-1]["ys"].append(w["y"])
+        else:
+            bands.append({"y": w["y"], "ys": [w["y"]]})
+    for b in bands:
+        b["top"], b["bot"] = max(b["ys"]), min(b["ys"])
+        b["w"] = []
+    for w in ws:
+        best = None
+        for b in bands:
+            d = 0 if b["bot"] - 0.5 <= w["y"] <= b["top"] + 0.5 else min(
+                abs(w["y"] - b["top"]), abs(w["y"] - b["bot"]))
+            if best is None or d < best[0]:
+                best = (d, b)
+        if best and best[0] <= 9:
+            best[1]["w"].append(w)
+    rows = []
+    for b in bands:
+        bw = sorted(b["w"], key=lambda w: (-round(w["y"] / 4), w["x0"]))
+        dt = [w["t"] for w in sorted(b["w"], key=lambda w: w["x0"])
+              if w["x0"] < _LEDGER_DATE_X and w["x1"] < _LEDGER_DATE_X + 30]
+        desc = [w["t"] for w in bw if _LEDGER_DATE_X <= w["x0"] < amt_lo
+                or (w["x0"] < _LEDGER_DATE_X and w["x1"] >= _LEDGER_DATE_X + 30)]
+        am = [w["t"] for w in sorted(b["w"], key=lambda w: w["x0"]) if amt_lo <= w["x0"] < bal_lo]
+        bl = [w["t"] for w in sorted(b["w"], key=lambda w: w["x0"]) if w["x0"] >= bal_lo]
+        if not (dt or am or bl):
+            continue
+        rows.append({"date_tok": "".join(dt), "desc": " ".join(desc),
+                     "amt_tok": am, "bal_tok": bl})
+    return rows
+
+
+def pdf_ledgers(pages):
+    """All ledger pages of a packet -> {code: ledger} (see _ledger_build)."""
+    out, cur, sec = {}, None, None
+    for i, p in enumerate(pages):
+        pg = pdf_parse_ledger_page(p)
+        if pg is None:
+            if pdf_parse_page(p) is not None:
+                cur, sec = None, None      # a summary page ends the grant's ledger
+            continue
+        if pg["header"]:
+            code = pg["header"]["code"]
+            cur = out.setdefault(code, {"code": code, "header": pg["header"],
+                                        "sections": [], "pages": []})
+            sec = None
+        if cur is None:
+            continue
+        cur["pages"].append(i + 1)
+        top = pg["h"] + 10
+        marks = sorted(pg["heads"], key=lambda h: -h["y"])
+        spans = []
+        if sec is not None:
+            spans.append((sec, sec["head"], top, marks[0]["y"] - 2 if marks else -1))
+        for j, h in enumerate(marks):
+            s = {"head": h, "kind": h["kind"], "rows": []}
+            cur["sections"].append(s)
+            spans.append((s, h, h["y"] - 2, marks[j + 1]["y"] + 2 if j + 1 < len(marks) else -1))
+            sec = s
+        if not marks and pg["header"] and sec is None:
+            continue
+        for s, h, yt, yb in spans:
+            # a ledger page's header block sits above its first heading
+            if pg["header"] and s is not None and yt == top:
+                continue
+            s["rows"].extend(_ledger_rows(pg, h, yt, yb))
+    return {c: _ledger_build(l) for c, l in out.items()}
+
+
+_LEDGER_BUDGET_WORDS = re.compile(
+    r"new\s*funds|funds|\bBAM\b|BAM-|budget|amend|allocat|\bper\s*\d*\s*yr|"
+    r"carry|award|increment|transfer\s*in", re.I)
+
+
+def _ledger_chain(rows, opening):
+    """Fill misread amounts and balances from the running balance.
+
+    Amounts as read are kept unless the balances show they are wrong: a row's
+    amount is replaced only when its printed balance is confirmed by the rows
+    that follow and the amount read is not. Rows posted on the same day are
+    sometimes printed in a different order from the one the balance was run
+    in, so a balance that matches the next row's amount instead is not taken
+    as a misread. Each row gets 'amount' (positive = a charge, negative = a
+    credit, None = could not be read) and 'how'."""
+    n = len(rows)
+    amt = [None if r["a"] is None else (-r["a"] if r["credit"] else r["a"]) for r in rows]
+    bal = [r["b"] for r in rows]
+    how = ["ok"] * n
+
+    def swapped(cur, m):
+        nx = m + 1
+        return (nx < n and amt[nx] is not None and bal[m] is not None
+                and rows[nx]["date"] == rows[m]["date"]
+                and abs(cur - amt[nx] - bal[m]) < 0.011)
+
+    def confirms(x, i):
+        run = x
+        for m in range(i + 1, min(i + 7, n)):
+            if amt[m] is None:
+                return False
+            prev, run = run, round(run - amt[m], 2)
+            if bal[m] is not None:
+                if abs(run - bal[m]) < 0.011:
+                    return True
+                if swapped(prev, m):
+                    continue
+        return False
+    cur = opening
+    for i in range(n):
+        a, b = amt[i], bal[i]
+        cand = None if cur is None or a is None else round(cur - a, 2)
+        if cand is not None and b is not None and abs(cand - b) < 0.011:
+            cur = b
+        elif cand is not None and swapped(cur, i):
+            cur = cand                       # same-day rows printed out of order
+        elif a is not None and cand is None:
+            cur = b if b is not None and confirms(b, i) else None
+        elif a is not None:
+            if b is not None and confirms(b, i) and not confirms(cand, i):
+                amt[i], how[i], cur = round(cur - b, 2), "from balance", b
+            else:
+                cur = cand
+                if b is not None:
+                    how[i] = "balance misread"
+        elif b is not None and cur is not None:
+            amt[i], how[i], cur = round(cur - b, 2), "from balance", b
+        else:
+            nx = i + 1
+            if (cur is not None and nx < n and amt[nx] is not None and bal[nx] is not None):
+                bb = round(bal[nx] + amt[nx], 2)
+                amt[i], how[i], cur = round(cur - bb, 2), "from next row", bb
+            else:
+                how[i] = "unreadable"
+                cur = b
+    for m, r in enumerate(rows):
+        r["amount"], r["how"] = amt[m], how[m]
+    return rows
+
+
+def _ledger_build(l):
+    hdr = l["header"]
+    as_of = hdr.get("as_of") or ""
+    try:
+        hi = datetime.strptime(as_of, "%Y-%m-%d").date() + timedelta(days=31)
+    except ValueError:
+        hi = date.today() + timedelta(days=31)
+    lo = date(2015, 1, 1)
+    exp = _ledger_date_cands(hdr.get("expires_tok", ""), date(2015, 1, 1), date(2045, 12, 31))
+    title = re.sub(r"\s+", " ", hdr.get("title", "")).strip()
+    out = {"code": l["code"], "as_of": as_of, "title": title,
+           "expires": exp[-1].isoformat() if exp else "", "pages": l["pages"],
+           "sections": []}
+    for s in l["sections"]:
+        rows = []
+        for r in s["rows"]:
+            a, cr = _ledger_money(r["amt_tok"])
+            b, _ = _ledger_money(r["bal_tok"])
+            if a is None and not r["amt_tok"] and b is None and not r["bal_tok"] \
+                    and (rows or not r["date_tok"]):
+                continue            # a description-only line (wrapped text)
+            rows.append({"date_tok": r["date_tok"], "desc": r["desc"], "a": a,
+                         "credit": cr or (a is not None and a < 0),
+                         "b": b, "amt_tok": "".join(r["amt_tok"]),
+                         "bal_tok": "".join(r["bal_tok"])})
+            if a is not None and a < 0:
+                rows[-1]["a"] = -a
+        if not rows:
+            continue
+        open_row = rows[0] if not rows[0]["amt_tok"] else None
+        label = s["head"].get("label") or (open_row or rows[0])["desc"]
+        opening = open_row["b"] if open_row else None
+        body = rows[1:] if open_row else rows
+        if opening is None and body and body[0]["a"] is not None and body[0]["b"] is not None:
+            s0 = -1 if body[0]["credit"] else 1
+            opening = round(body[0]["b"] + s0 * body[0]["a"], 2)
+        # dates: the candidate that keeps the ledger in order
+        prev = lo
+        for r in ([open_row] if open_row else []) + body:
+            d = _ledger_pick_date(r["date_tok"], prev, lo, hi)
+            r["date"] = d.isoformat() if d else ""
+            if d:
+                prev = d
+        for i, r in enumerate(body):     # unreadable date: the row above's
+            if not r["date"]:
+                r["date"] = body[i - 1]["date"] if i else (open_row or {}).get("date", "")
+                r["date_guessed"] = True
+        _ledger_chain(body, opening)
+        out["sections"].append({
+            "kind": s["kind"], "label": label, "opening": opening,
+            "label_row": open_row is not None,
+            "opening_date": (open_row or {}).get("date", ""), "rows": body})
+    return out
+
+
+# ledger section -> Workday object-class number (the same keys the summary
+# page uses, so both land in the same app category)
+_LEDGER_CLASSES = [
+    (r"foreign", "07"), (r"travel|domestic", "08"), (r"fringe|benefit", "03"),
+    (r"tuition", "06"), (r"equip", "09"), (r"materi|suppl", "10"),
+    (r"publica", "12"), (r"other|direct", "17"), (r"f\s*&\s*a|indirect|facilit", "18"),
+    (r"person|salar|payroll|wage", "01")]
+
+
+def _ledger_class(sec, code=""):
+    if code.startswith("PR"):
+        return "01"         # a project (start-up) account is one pot: Personnel
+    for txt in (sec["label"], sec["kind"]):
+        low = (txt or "").lower()
+        for rx, nn in _LEDGER_CLASSES:
+            if re.search(rx, low):
+                return nn
+    return ""
+
+
+def _ledger_is_budget(row):
+    """A credit that adds money to the budget (not a refund of a charge)."""
+    return row["amount"] is not None and row["amount"] < 0 and bool(
+        _LEDGER_BUDGET_WORDS.search(row["desc"] or "") or
+        not re.search(r"[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}", row["desc"] or ""))
+
+
+# ------------------------------------------------ ledger -> the app
+#
+# What a DBR packet can rebuild on its own: each grant (name, dates, budget by
+# year), every charge in its ledger, the people on its payroll, and for each
+# person still being paid, an appointment worked out from their latest pay.
+# Plans that never appear in Workday (future hires, how you group grants,
+# receipts) are not in a DBR and are left to you.
+
+PDF_LEDGER_CACHE = {}          # token -> parsed ledgers of one uploaded packet
+_LEDGER_NAME_STOP = {
+    "paa", "payroll", "part", "of", "allow", "salary", "sal", "ary", "fringes",
+    "fringe", "benefits", "to", "uaf", "ga", "fall", "spring", "summer",
+    "tuition", "new", "funds", "jrn", "er", "bam", "and", "per", "adjustment",
+    "the", "for", "from", "on", "post", "doc", "pay", "reimbursed"}
+_LEDGER_PAYROLL = ("01", "03", "06")
+
+
+def _ledger_name(desc):
+    """The person on a payroll line: 'PAA 4/15/26-5/31/26 Alex Example' ->
+    'Alex Example'; 'Sam Sample/PAA to UAF GA' -> 'Sam Sample'."""
+    out = []
+    for t in (desc or "").split():
+        if re.search(r"[\d$#&%]", t):
+            continue                  # dates, amounts, document numbers
+        stop = "/" in t               # 'Name/Spring': what follows is a note
+        t = t.split("/")[0].strip(".,:;()'\"`*!|[]{}-")
+        if t and len(re.sub(r"[^A-Za-z]", "", t)) >= 2 and t.lower() not in _LEDGER_NAME_STOP:
+            out.append(t[0].upper() + t[1:])
+        if (stop and out) or len(out) == 3:
+            break
+    return " ".join(out)
+
+
+def _name_key(name):
+    s = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode()
+    return " ".join(sorted(re.sub(r"[^a-z ]", "", s.lower()).split()))
+
+
+def _name_sim(a, b):
+    """How alike two names are, word by word, whatever their order (OCR swaps
+    words and letters): 'Rlex Example' ~ 'Alex Example', 'Samplc Sam' ~ 'Sam
+    Sample'. 0 when they don't have the same number of words."""
+    ta, tb = _name_key(a).split(), _name_key(b).split()
+    if not ta or len(ta) != len(tb):
+        return 0.0
+    left, tot = list(tb), 0.0
+    for t in ta:
+        best = max(left, key=lambda u: difflib.SequenceMatcher(None, t, u).ratio())
+        tot += difflib.SequenceMatcher(None, t, best).ratio()
+        left.remove(best)
+    return tot / len(ta)
+
+
+def _ledger_people(ledgers):
+    """Group the payroll names of every ledger (OCR spells them several ways)
+    into people. Returns {raw name -> canonical name}."""
+    counts = {}
+    for l in ledgers.values():
+        for sec in l["sections"]:
+            if _ledger_class(sec, l["code"]) not in _LEDGER_PAYROLL:
+                continue
+            for r in sec["rows"]:
+                n = _ledger_name(r["desc"])
+                if n and r.get("amount") is not None and not _ledger_is_budget(r):
+                    r["name"] = n
+                    counts[n] = counts.get(n, 0) + 1
+    canon, out = [], {}
+    for n in sorted(counts, key=lambda n: -counts[n]):
+        best = None
+        for c in canon:
+            ratio = _name_sim(n, c)
+            if ratio >= 0.75 and (best is None or ratio > best[0]):
+                best = (ratio, c)
+        if best:
+            out[n] = best[1]
+        else:
+            canon.append(n)
+            out[n] = n
+    # a name change (marriage, a corrected record): the same first name on the
+    # same grant's payroll, the new one starting where the old one stopped,
+    # at the same pay. Both are one person, kept under the earlier name.
+    for l in ledgers.values():
+        span = {}
+        for sec in l["sections"]:
+            if _ledger_class(sec, l["code"]) != "01":
+                continue
+            for r in sec["rows"]:
+                c = out.get(r.get("name") or "")
+                if c and r["date"] and (r["amount"] or 0) > 0:
+                    span.setdefault(c, []).append((r["date"], r["amount"]))
+        for a_, ra in span.items():
+            for b_, rb in span.items():
+                if a_ == b_ or _name_key(a_).split()[:1] == [] or \
+                        a_.split()[0].lower() != b_.split()[0].lower():
+                    continue
+                la, fb = max(ra), min(rb)
+                gap = (datetime.strptime(fb[0], "%Y-%m-%d")
+                       - datetime.strptime(la[0], "%Y-%m-%d")).days
+                if 0 < gap <= 45 and abs(la[1] - fb[1]) < 0.011:
+                    for k, v in list(out.items()):
+                        if v == b_:
+                            out[k] = a_
+    return out
+
+
+def _ledger_grant_name(title, code, pi=""):
+    """'GR012345 UADA I AES I DEPT I 2026 SPONSOR I SOIL HEALTH I SMITH' ->
+    '2026 SPONSOR Soil Health'. UA titles run entity | division | department |
+    sponsor … | PI, so the first three parts and the PI's name are dropped.
+    A project (PR) account's title is free text: its first word + the code."""
+    t = re.sub(r"\b[GCP]R\s?[0-9OolIt]{5,6}\b|\bCC\d{4,}\b", " ", title or "")
+    if code.startswith("PR"):
+        w = re.findall(r"[A-Za-z][A-Za-z-]+", t)
+        return ("%s %s" % (w[0].title(), code)) if w else code
+    parts = [p.strip() for p in re.split(r"\s+[I|l]\s+|\|", t) if p.strip()]
+    if len(parts) >= 4:
+        parts = parts[3:]
+    words = [w for w in " ".join(parts).split()
+             if not (pi and w.strip(".,").upper() == pi.upper())]
+    words = [w.upper() if re.fullmatch(r"(?i)awd-?\d+", w) else
+             w.title() if w.isupper() and len(w) > 4 else w for w in words]
+    name = re.sub(r"\s+", " ", " ".join(words)).strip(" -|/")
+    return name or code
+
+
+def _ledger_pi(ledgers):
+    """The PI's surname: the word every grant title ends with."""
+    last = {}
+    for l in ledgers.values():
+        w = (l.get("title") or "").split()
+        if w and w[-1].isalpha():
+            last[w[-1].upper()] = last.get(w[-1].upper(), 0) + 1
+    best = max(last, key=last.get) if last else ""
+    return best if last.get(best, 0) >= 2 else ""
+
+
+def _ledger_cat(conn, gid, nn):
+    """App category on grant gid for a ledger section's object class."""
+    oc = _wd_pdf_class_for(wd_pdf_known_classes(conn), nn, "")
+    m = conn.execute("SELECT target_id FROM workday_map WHERE kind='category' AND "
+                     "wd_key=?", (oc,)).fetchone()
+    cid = m["target_id"] if m else _wd_guess_category(conn, oc)
+    if cid is not None and not m:
+        conn.execute("INSERT OR IGNORE INTO workday_map (kind, wd_key, target_id) "
+                     "VALUES ('category', ?, ?)", (oc, cid))
+    return _wd_category_on_grant(conn, cid, gid) if cid is not None else None
+
+
+def _ledger_person(conn, name, alias, made, gid=None, first=""):
+    """Existing person for a payroll name, else None: a name learnt earlier;
+    every word of it in exactly one person's name ('Ana Lima' -> 'Ana
+    Maria Souza Lima'); one person spelled almost the same; or — a name
+    change — the one person with the same first name whose pay on this
+    grant stopped just before this name's started, at the same amount."""
+    k = _name_key(name)
+    if k in alias:
+        if conn.execute("SELECT 1 FROM people WHERE id=?", (alias[k],)).fetchone():
+            return alias[k]
+    if k in made:
+        return made[k]
+    people = rows_to_list(conn.execute("SELECT id, name FROM people"))
+    toks = set(k.split())
+    hits = [p["id"] for p in people if toks and toks <= set(_name_key(p["name"]).split())]
+    if len(hits) == 1:
+        return hits[0]
+    hits = [p["id"] for p in people if _name_sim(name, p["name"]) >= 0.8]
+    if len(hits) == 1:
+        return hits[0]
+    if gid and first:
+        fn = (unicodedata.normalize("NFKD", name).encode("ascii", "ignore")
+              .decode().lower().split() or [""])[0]
+        lo = (datetime.strptime(first, "%Y-%m-%d") - timedelta(days=45)).date().isoformat()
+        hits = []
+        for p in people:
+            pf = (_name_key(p["name"]).split() or [""])
+            if fn not in pf:
+                continue
+            last = conn.execute(
+                "SELECT MAX(e.date) FROM expenses e JOIN categories c ON c.id=e.category_id "
+                "WHERE e.person_id=? AND e.grant_id=? AND c.name='Personnel' "
+                "AND e.amount>0", (p["id"], gid)).fetchone()[0] or ""
+            if lo <= last < first:
+                hits.append(p["id"])
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def _ledger_desc(nn, row, name):
+    d = re.sub(r"\s+", " ", row["desc"] or "").strip()
+    if name and nn in _LEDGER_PAYROLL:
+        what = {"01": "Salary", "03": "Fringe", "06": "Tuition"}[nn]
+        term = re.search(r"\b(Fall|Spring|Summer)\b", d, re.I)
+        if nn == "06" and term:
+            what = term.group(1).title() + " tuition"
+        note = re.search(r"\bPAA\b.*?(?=\s+[A-Z][a-z])", d)
+        return "%s — %s%s" % (what, name, " (%s)" % note.group(0) if note else "")
+    return d or "Ledger entry"
+
+
+def wd_ledger_import(conn, ledgers, accepted):
+    """Write what the packet's ledgers hold. `accepted` = the summary tables
+    that passed their checks, by grant code. Returns what was done."""
+    out = {"grants": [], "people_added": [], "appointments_added": [],
+           "appointments_ended": [], "expenses_added": 0, "unreadable": 0}
+    if not ledgers:
+        return out
+    asofs = [l["as_of"] for l in ledgers.values() if l["as_of"]]
+    pk_asof = max(set(asofs), key=asofs.count) if asofs else ""
+    names = _ledger_people(ledgers)
+    pi = _ledger_pi(ledgers)
+    alias = get_setting(conn, "wd_person_alias", {}) or {}
+    seen_to = get_setting(conn, "wd_ledger_asof", {}) or {}
+    applied = get_setting(conn, "wd_applied", {}) or {}
+
+    def day(d, n=0):
+        return (datetime.strptime(d, "%Y-%m-%d") + timedelta(days=n)).date().isoformat()
+
+    # --- 1. the grants: link or create, and for a new one its dates and budget
+    ctx = {}
+    for code, l in ledgers.items():
+        as_of = l["as_of"] or pk_asof
+        if not as_of:
+            continue
+        m = conn.execute("SELECT target_id FROM workday_map WHERE kind='grant' AND "
+                         "wd_key=?", (code,)).fetchone()
+        gid = m["target_id"] if m else None
+        if m and gid is None:
+            continue                         # a grant you deleted: leave it out
+        if gid and not conn.execute("SELECT 1 FROM grants WHERE id=?", (gid,)).fetchone():
+            gid = None
+        opens = [s["opening_date"] for s in l["sections"] if s["opening_date"]]
+        rows_d = [r["date"] for s in l["sections"] for r in s["rows"] if r["date"]]
+        # the date most sections open on (one misread date can't move the start)
+        start = (max(set(opens), key=lambda d: (opens.count(d), d)) if opens
+                 else min(rows_d) if rows_d else "")
+        if gid is None:
+            gid = conn.execute(
+                "INSERT INTO grants (name, start_date, end_date, status, notes) "
+                "VALUES (?,?,?, 'active', ?)",
+                (_ledger_grant_name(l["title"], code, pi), start, l["expires"],
+                 "Workday %s" % code)).lastrowid
+            conn.execute("INSERT OR REPLACE INTO workday_map (kind, wd_key, target_id) "
+                         "VALUES ('grant', ?, ?)", (code, gid))
+        g = dict(conn.execute("SELECT * FROM grants WHERE id=?", (gid,)).fetchone())
+        fresh = not conn.execute("SELECT 1 FROM expenses WHERE grant_id=? LIMIT 1",
+                                 (gid,)).fetchone()
+        item = {"code": code, "grant": g["name"], "added": 0, "unreadable": 0,
+                "fresh": fresh, "notes": []}
+        out["grants"].append(item)
+        if fresh:
+            upd = {}
+            if re.match(r"^(?:GR|PR)\d", g["name"] or "") or g["name"] == code:
+                upd["name"] = _ledger_grant_name(l["title"], code, pi)
+            if start and g["start_date"] != start:
+                upd["start_date"] = start
+            if l["expires"] and not g["end_date"]:
+                upd["end_date"] = l["expires"]
+            for k, v in upd.items():
+                conn.execute("UPDATE grants SET %s=? WHERE id=?" % k, (v, gid))
+                g[k] = v
+            item["grant"] = g["name"]
+        rep = accepted.get(code)
+        bva_act, bva_bud = {}, {}
+        if rep:
+            for r in rep["rows"]:
+                if r.get("skip") or any(r[k] is None for k in PDF_COLS):
+                    continue
+                nn = (re.search(r":\s*(\d\d)_", r["object_class"] or "") or [None, "01"])[1] \
+                    if rep["kind"] == "grant" else "01"
+                cid = _ledger_cat(conn, gid, nn)
+                if cid is not None:
+                    bva_act[cid] = round(bva_act.get(cid, 0) + r["actuals"], 2)
+                    bva_bud[cid] = round(bva_bud.get(cid, 0) + r["budget"], 2)
+        if fresh and (rep or not conn.execute(
+                "SELECT 1 FROM budget_lines WHERE grant_id=? LIMIT 1", (gid,)).fetchone()):
+            bud = {}
+            for sec in l["sections"]:
+                cid = _ledger_cat(conn, gid, _ledger_class(sec, code))
+                if cid is None:
+                    continue
+                ev = []
+                if sec["label_row"] and sec["opening"]:
+                    ev.append((sec["opening_date"] or start, sec["opening"]))
+                ev += [(r["date"], -r["amount"]) for r in sec["rows"] if _ledger_is_budget(r)]
+                for d, v in ev:
+                    y = budget_year_for(g, d or start)
+                    bud.setdefault(cid, {})
+                    bud[cid][y] = round(bud[cid].get(y, 0) + v, 2)
+            for cid, tot in bva_bud.items():       # Workday's budget is the total
+                have = round(sum((bud.get(cid) or {}).values()), 2)
+                if abs(tot - have) > 0.005:
+                    ys = bud.setdefault(cid, {})
+                    y0 = min(ys) if ys else 1
+                    ys[y0] = round(ys.get(y0, 0) + tot - have, 2)
+            conn.execute("DELETE FROM budget_lines WHERE grant_id=?", (gid,))
+            total = 0.0
+            for cid, ys in bud.items():
+                for y, v in ys.items():
+                    if abs(v) > 0.005:
+                        conn.execute("INSERT INTO budget_lines (grant_id, category_id, "
+                                     "year, amount) VALUES (?,?,?,?)", (gid, cid, y, v))
+                        total += v
+            conn.execute("UPDATE grants SET initial_amount=? WHERE id=?",
+                         (round(total, 2), gid))
+            applied.pop(str(gid), None)      # its own ledger now, not Workday's totals
+        ctx[code] = {"gid": gid, "g": g, "fresh": fresh, "as_of": as_of,
+                     "item": item, "bva_act": bva_act, "has_rep": bool(rep)}
+
+    # --- 2. the people on the payroll: one decision per name
+    pay = {}                                 # name -> [(date, gid, nn)]
+    for code, c in ctx.items():
+        for sec in ledgers[code]["sections"]:
+            nn = _ledger_class(sec, code)
+            if nn not in _LEDGER_PAYROLL:
+                continue
+            for r in sec["rows"]:
+                n = names.get(r.get("name") or "")
+                if n and r["date"] and (r["amount"] or 0) > 0:
+                    pay.setdefault(n, []).append((r["date"], c["gid"], nn))
+    made = {}                                # name key -> person id
+    for n, rs in pay.items():
+        last = max(rs)
+        sal = [d for d, gid, nn in rs if gid == last[1] and nn == "01"]
+        pid = _ledger_person(conn, n, alias, made, last[1], min(sal) if sal else "")
+        if pid is None and last[0] >= day(pk_asof or last[0], -60):
+            pid = conn.execute("INSERT INTO people (name, role) VALUES (?, '')",
+                               (n,)).lastrowid
+            out["people_added"].append(n)
+        if pid:
+            made[_name_key(n)] = pid
+
+    # --- 3. the charges
+    paid = {}                                # (person, grant) -> [(nn, row)]
+    for code, c in ctx.items():
+        l, gid, g, as_of, item = ledgers[code], c["gid"], c["g"], c["as_of"], c["item"]
+        after = seen_to.get(code) or conn.execute(
+            "SELECT MAX(date) FROM expenses WHERE grant_id=? AND source IN "
+            "('dbr', 'workday')", (gid,)).fetchone()[0] or ""
+        exist = rows_to_list(conn.execute(
+            "SELECT id, category_id, date, amount FROM expenses WHERE grant_id=?", (gid,)))
+        used, led_sum, first = set(), {}, {}
+        for sec in l["sections"]:
+            nn = _ledger_class(sec, code)
+            cid = _ledger_cat(conn, gid, nn)
+            for r in sec["rows"]:
+                if _ledger_is_budget(r):
+                    continue
+                if r["amount"] is None:
+                    item["unreadable"] += 1
+                    continue
+                if cid is None or not r["date"] or r["date"] > as_of:
+                    continue
+                name = names.get(r.get("name") or "", "") if nn in _LEDGER_PAYROLL else ""
+                pid = made.get(_name_key(name)) if name else None
+                if pid:
+                    paid.setdefault((pid, gid), []).append((nn, r))
+                led_sum[cid] = round(led_sum.get(cid, 0) + r["amount"], 2)
+                if not sec["label_row"]:
+                    first[cid] = min(first.get(cid, r["date"]), r["date"])
+                if after and r["date"] <= after:
+                    continue                 # an earlier import brought it in
+                dup = None
+                for e in exist:
+                    if e["id"] in used or e["category_id"] != cid or \
+                            abs(e["amount"] - r["amount"]) > 0.005:
+                        continue
+                    if abs((datetime.strptime(e["date"], "%Y-%m-%d") -
+                            datetime.strptime(r["date"], "%Y-%m-%d")).days) <= 10:
+                        dup = e              # already there (entered by hand, say)
+                        break
+                if dup:
+                    used.add(dup["id"])
+                    continue
+                conn.execute(
+                    "INSERT INTO expenses (grant_id, category_id, year, date, amount, "
+                    "description, person_id, source, wd_entry) VALUES (?,?,?,?,?,?,?,'dbr',?)",
+                    (gid, cid, budget_year_for(g, r["date"]), r["date"], r["amount"],
+                     _ledger_desc(nn, r, name), pid, "ledger %s" % as_of))
+                item["added"] += 1
+        if c["fresh"]:
+            # a ledger that starts part-way through the grant: what Workday
+            # shows as spent before its first line, as one dated row
+            for cid, d0 in first.items():
+                if cid not in c["bva_act"]:
+                    continue
+                gap = round(c["bva_act"][cid] - led_sum.get(cid, 0), 2)
+                if abs(gap) < 0.005:
+                    continue
+                d = day(d0, -1)
+                conn.execute(
+                    "INSERT INTO expenses (grant_id, category_id, year, date, amount, "
+                    "description, source) VALUES (?,?,?,?,?,?, 'dbr')",
+                    (gid, cid, budget_year_for(g, d), d, gap,
+                     "Spent before %s (Workday's total; this ledger starts then)" % d0))
+                item["added"] += 1
+        out["expenses_added"] += item["added"]
+        out["unreadable"] += item["unreadable"]
+        if not c["has_rep"]:
+            item["notes"].append("Its Budget vs Actual table couldn't be read, so only the "
+                                 "ledger's charges are in — not F&A or anything else only "
+                                 "Workday's totals show.")
+        seen_to[code] = max(seen_to.get(code, ""), as_of)
+
+    # --- 4. appointments: end the ones this import made whose pay stopped,
+    # and work out one for each person still paid from a grant
+    for code, c in ctx.items():
+        month1 = c["as_of"][:8] + "01"
+        for a in rows_to_list(conn.execute(
+                "SELECT a.*, p.name AS pname FROM appointments a JOIN people p ON "
+                "p.id=a.person_id WHERE a.grant_id=? AND a.notes LIKE 'Worked out from "
+                "the payroll%%' AND a.end_date>?", (c["gid"], c["as_of"]))):
+            last = conn.execute(
+                "SELECT MAX(e.date) FROM expenses e JOIN categories c ON c.id=e.category_id "
+                "WHERE e.person_id=? AND e.grant_id=? AND c.name='Personnel' AND e.amount>0",
+                (a["person_id"], a["grant_id"])).fetchone()[0] or ""
+            if last and last < month1:
+                end = _pdf_month_end(int(last[:4]), int(last[5:7]))
+                conn.execute("UPDATE appointments SET end_date=?, notes=notes || ? WHERE id=?",
+                             (end, " Pay from this grant stopped after %s (%s DBR)."
+                              % (last, c["as_of"][:7]), a["id"]))
+                out["appointments_ended"].append("%s → %s (ended %s)" % (
+                    a["pname"], c["g"]["name"], end))
+    for (pid, gid), rows in paid.items():
+        if conn.execute("SELECT 1 FROM appointments WHERE person_id=? AND grant_id=?",
+                        (pid, gid)).fetchone():
+            continue
+        c = next(x for x in ctx.values() if x["gid"] == gid)
+        as_of = c["as_of"]
+        sal = sorted((r for nn, r in rows if nn == "01" and r["amount"] > 0),
+                     key=lambda r: r["date"])
+        if not sal or sal[-1]["date"] < as_of[:8] + "01":
+            continue                         # not paid from this grant this month
+        last = sal[-1]
+        run = [last]
+        for r in reversed(sal[:-1]):
+            if (datetime.strptime(run[-1]["date"], "%Y-%m-%d")
+                    - datetime.strptime(r["date"], "%Y-%m-%d")).days > 45:
+                break
+            run.append(r)
+        per = {}
+        for r in sal:
+            per[r["date"][:7]] = per.get(r["date"][:7], 0) + 1
+        # UA pays twice a month; once a month only when every month says so
+        monthly_pay = len(per) >= 2 and max(per.values()) == 1
+        monthly = round(last["amount"] * (1 if monthly_pay else 2), 2)
+        fr = sorted((r for nn, r in rows if nn == "03" and r["amount"] > 0
+                     and r["date"][:7] == last["date"][:7]), key=lambda r: r["date"])
+        rate = round(fr[-1]["amount"] / last["amount"] * 100, 1) if fr else 0.0
+        tuition = round(sum(r["amount"] for nn, r in rows if nn == "06"
+                            and r["date"] > day(as_of, -365)), 2)
+        g = c["g"]
+        end = g["nce_end_date"] or g["end_date"] or day(as_of, 365)
+        conn.execute(
+            "INSERT INTO appointments (person_id, grant_id, monthly_salary, fringe_rate, "
+            "start_date, end_date, notes, annual_tuition, auto_charge, pct) "
+            "VALUES (?,?,?,?,?,?,?,?,0,100)",
+            (pid, gid, monthly, rate, run[-1]["date"][:8] + "01", end,
+             "Worked out from the payroll in the %s DBR: %s %s%s; tuition = the last "
+             "12 months' charges. The end date is the grant's end — change it if the "
+             "appointment ends sooner." % (
+                 as_of[:7], "${:,.2f}".format(last["amount"]),
+                 "per month" if monthly_pay else "per half-month",
+                 " + %.1f%% fringe" % rate if rate else ""),
+             tuition))
+        if tuition:
+            conn.execute("UPDATE people SET role='GA' WHERE id=? AND role=''", (pid,))
+        pname = conn.execute("SELECT name FROM people WHERE id=?", (pid,)).fetchone()[0]
+        out["appointments_added"].append("%s → %s" % (pname, g["name"]))
+    alias.update(made)
+    set_setting(conn, "wd_person_alias", alias, commit=False)
+    set_setting(conn, "wd_ledger_asof", seen_to, commit=False)
+    set_setting(conn, "wd_applied", applied, commit=False)
+    return out
+
+
 # ------------------------------------------- Budget-vs-Actual PDF import
 #
 # The "RPT - Departmental Grant Budget vs Actual" page, as a PDF — usually a
@@ -2577,6 +3463,68 @@ def _wd_pdf_class_for(known, nn, label):
         return WD_OC_PREFIX + WD_OC_DEFAULT[nn]
     clean = re.sub(r"[^A-Za-z &/-]", "", label or "").strip()
     return WD_OC_PREFIX + nn + "_" + (clean or "Other")
+
+
+_PDF_CLASS_ORDER = sorted(WD_OC_DEFAULT)
+
+
+def _pdf_crossfill(rep, led):
+    """Fill what the summary page's scan lost from the same grant's ledger:
+    the report month, and which category a row with no readable label is
+    (by its budget or actuals matching a ledger section, else by Workday's
+    fixed category order, where F&A always comes last)."""
+    if not rep.get("as_of") and led.get("as_of"):
+        rep["as_of"] = led["as_of"]
+    if rep.get("kind") != "grant":
+        return
+    secs = {}
+    for sec in led["sections"]:
+        nn = _ledger_class(sec, led["code"])
+        if not nn:
+            continue
+        d = secs.setdefault(nn, {"budget": 0.0, "spent": 0.0, "full": True})
+        if sec["opening"] is not None and (sec["opening_date"] or sec["label_row"]):
+            d["budget"] += sec["opening"]
+        else:
+            d["full"] = False         # budget unknown: opening unread or carried in
+        for r in sec["rows"]:
+            if r["amount"] is None:
+                continue
+            if _ledger_is_budget(r):
+                d["budget"] -= r["amount"]
+            elif r["date"] <= (rep.get("as_of") or "9999"):
+                d["spent"] += r["amount"]
+    rows = rep.get("rows") or []
+
+    def nn_of(r):
+        if r.get("nn"):
+            return r["nn"]
+        m = re.search(r":\s*(\d\d)_", r.get("object_class") or "")
+        return m.group(1) if m else ""
+    used = {nn_of(r) for r in rows} - {""}
+    for field, key in (("budget", "budget"), ("actuals", "spent")):
+        for r in rows:
+            if nn_of(r) or r.get(field) is None:
+                continue
+            c = [nn for nn, d in secs.items() if nn not in used and d["full"]
+                 and abs(r[field]) >= 0.005 and abs(round(d[key], 2) - r[field]) < 0.011]
+            if len(c) == 1:
+                r["nn"], r["inferred"] = c[0], True
+                used.add(c[0])
+    for j, r in enumerate(rows):
+        if nn_of(r):
+            continue
+        before = [nn_of(x) for x in rows[:j] if nn_of(x)]
+        after = [nn_of(x) for x in rows[j + 1:] if nn_of(x)]
+        lo, hi = (max(before) if before else "00"), (min(after) if after else "99")
+        c = [nn for nn in _PDF_CLASS_ORDER if lo < nn < hi and nn not in used
+             and not (nn in secs and secs[nn]["full"])]
+        inled = [nn for nn in c if nn in secs]       # the ledger has a section for it
+        pick = (c[0] if len(c) == 1 else inled[0] if len(inled) == 1
+                else "18" if not after and "18" in c else "")
+        if pick:
+            r["nn"], r["inferred"] = pick, True
+            used.add(pick)
 
 
 def wd_pdf_check(conn, rep):
@@ -2656,7 +3604,7 @@ def wd_pdf_check(conn, rep):
         elif miss:
             row["problems"].append("%d figures could not be read — type them "
                                    "in from the page." % len(miss))
-            bad("A row has figures that could not be read.")
+            row["skip"] = True
         if all(row[k] is not None for k in PDF_COLS):
             diff = round(sum(PDF_SIGN[j] * row[j] for j in PDF_COLS), 2)
             if abs(diff) > 0.011:
@@ -2671,13 +3619,25 @@ def wd_pdf_check(conn, rep):
                 bad("A row does not add up.", hard=False)
         if not row["object_class"]:
             row["problems"].append("Choose which spending category this row is.")
-            bad("A row has no spending category.")
+            row["skip"] = True
         elif row["object_class"] in seen:
             row["problems"].append("Same category as another row.")
             bad("Two rows are the same category.")
         seen[row["object_class"]] = True
     if not rows:
         bad("No rows were read from this page.")
+    skipped = [r for r in rows if r.get("skip")]
+    if skipped and len(skipped) == len(rows):
+        bad("No row of this table could be read in full.")
+    elif skipped:
+        # the rest of the table is fine: import it and leave these rows out
+        # (their categories keep what you already have) rather than nothing
+        warnings.append("%d row%s could not be read and will be left out "
+                        "unless you fill %s in: %s." % (
+                            len(skipped), "" if len(skipped) == 1 else "s",
+                            "it" if len(skipped) == 1 else "them",
+                            ", ".join((r["label"] or (r["object_class"] or "").split(":")[-1].strip()
+                                       or "a row with no category") for r in skipped)))
     # the report's own Total row, where the scan gave it
     tot = rep.get("total") or {}
     total_ok = False
@@ -2724,6 +3684,14 @@ def wd_pdf_stale(conn, code, as_of):
     floor = wd_month_floor()
     held = conn.execute("SELECT MAX(as_of) FROM workday_balances WHERE "
                         "grant_code=?", (code,)).fetchone()[0] or ""
+    if not held:
+        m = conn.execute("SELECT target_id FROM workday_map WHERE kind='grant' AND "
+                         "wd_key=?", (code,)).fetchone()
+        mine = conn.execute(
+            "SELECT 1 FROM expenses WHERE grant_id=? LIMIT 1", (m["target_id"],)
+        ).fetchone() if m else conn.execute("SELECT 1 FROM expenses LIMIT 1").fetchone()
+        if not mine:
+            return ""  # nothing of yours it could overwrite: an old report is how you start
     if as_of[:7] < floor:
         why = "It is a report for %s, more than a month ago" % as_of[:7]
     elif held and as_of < held:
@@ -2759,7 +3727,9 @@ def wd_pdf_plan(conn, rep):
         plan["note"] = ("This grant's figures come straight from Workday "
                         "reports, so importing just refreshes them.")
         return plan
-    rows = [r for r in rep["rows"] if all(r[k] is not None for k in PDF_COLS)]
+    rows = [r for r in rep["rows"] if all(r[k] is not None for k in PDF_COLS)
+            and not r.get("skip")]
+    left_out = any(r.get("skip") for r in rep["rows"])
     years = sorted({r[0] for r in conn.execute(
         "SELECT year FROM budget_lines WHERE grant_id=? UNION "
         "SELECT year FROM expenses WHERE grant_id=?", (gid, gid)) if r[0]})
@@ -2816,7 +3786,7 @@ def wd_pdf_plan(conn, rep):
         pdf_bud[cid] = round(pdf_bud.get(cid, 0) + r["budget"], 2)
     recon = []
     for cid in sorted(set(pdf_act) | ({c for c in ledger if c is not None}
-                                      if not unmapped else set())):
+                                      if not (unmapped or left_out) else set())):
         delta = round(pdf_act.get(cid, 0) - (ledger.get(cid) or 0), 2)
         if abs(delta) >= 0.005:
             recon.append({"category_id": cid, "category": names.get(cid, "?"),
@@ -2833,19 +3803,21 @@ def wd_pdf_plan(conn, rep):
                     "yours": round(bud_app.get(cid) or 0, 2), "delta": d}
             if d > 0.005:
                 up.append(item)
-            elif d < -0.005 and not unmapped:
+            elif d < -0.005 and not (unmapped or left_out):
                 down.append(item)
     released = None
     if (g.get("funded_to_date") or 0) > 0:
         # an award released in instalments: what Workday shows is what has been
         # released so far (kept in "Released so far"), not a change to the award
         up, down = [], []
-        if kind == "grant" and scope == "all" and rep.get("total_ok") and not unmapped:
+        if kind == "grant" and scope == "all" and rep.get("total_ok") and not (unmapped or left_out):
             released = {"yours": round(g["funded_to_date"], 2), "workday": pdf_total}
     year = scope if isinstance(scope, int) else budget_year_for(g, as_of)
     plan.update({"scope": scope, "years": years or [1], "year": year,
                  "reconcile": recon, "budget_up": up, "budget_down": down,
-                 "budget_default": bool(up) and not down,
+                 # a table with rows left out can't show a budget went down,
+                 # so it doesn't raise one on its own either
+                 "budget_default": bool(up) and not down and not (unmapped or left_out),
                  "released": released,
                  "unmapped": unmapped,
                  "committed": round(sum(r["obligation"] + r["commitment"]
@@ -2865,6 +3837,8 @@ def _wd_pdf_store(conn, rep):
     award = (prev["award"] if prev and prev["award"] else "") or rep["award"]
     _wd_note_grant(conn, name, award=award)
     for r in rep["rows"]:
+        if r.get("skip"):
+            continue
         conn.execute(
             "INSERT INTO workday_balances (grant_code, grant_name, award, "
             "object_class, budget, commitment, obligation, actuals, available, "
@@ -2876,17 +3850,35 @@ def _wd_pdf_store(conn, rep):
             "available=excluded.available, as_of=excluded.as_of",
             (code, name, award, r["object_class"], r["budget"], r["commitment"],
              r["obligation"], r["actuals"], r["available"], rep["as_of"]))
-    if rep["total_ok"]:     # a verified, complete table: drop categories it no longer lists
+    if rep["total_ok"] and not any(r.get("skip") for r in rep["rows"]):
+        # a verified, complete table: drop categories it no longer lists
         keep = [r["object_class"] for r in rep["rows"]]
         conn.execute("DELETE FROM workday_balances WHERE grant_code=? AND "
                      "object_class NOT IN (%s)" % ",".join("?" * len(keep)),
                      [code] + keep)
 
 
-def wd_pdf_apply(conn, reports, choices):
-    """Import the checked reports. Everything happens in one transaction; a
-    safety copy of the database is made first."""
+def _pdf_map_project_class(conn, accepted):
+    """The project report's single row follows its grant's main category."""
+    for c in accepted:
+        if c["kind"] != "project":
+            continue
+        m = conn.execute("SELECT target_id FROM workday_map WHERE kind='grant' AND "
+                         "wd_key=?", (c["code"],)).fetchone()
+        row = conn.execute("SELECT category_id FROM budget_lines WHERE grant_id=? "
+                           "GROUP BY category_id ORDER BY SUM(amount) DESC LIMIT 1",
+                           (m["target_id"],)).fetchone() if m and m["target_id"] else None
+        if row:
+            conn.execute("INSERT OR IGNORE INTO workday_map (kind, wd_key, target_id) "
+                         "VALUES ('category', ?, ?)", (PDF_PROJECT_CLASS, row["category_id"]))
+
+
+def wd_pdf_apply(conn, reports, choices, ledger_token=None, dry=False):
+    """Import the checked reports, and the packet's ledgers (line items,
+    people, appointments). Everything happens in one transaction; a safety
+    copy of the database is made first."""
     choices = choices or {}
+    ledgers = PDF_LEDGER_CACHE.get(str(ledger_token or "")) or {}
     res = {"reports": [], "skipped": [], "expenses_added": 0, "budget_added": 0.0}
     accepted = []
     for rep in reports or []:
@@ -2902,30 +3894,26 @@ def wd_pdf_apply(conn, reports, choices):
             res["skipped"].append({"code": label, "why": "Not confirmed: " + c["problems"][0]})
         else:
             accepted.append(c)
-    if not accepted:
+    if not accepted and not ledgers:
         return res
-    make_backup(force=True)
+    if not dry:
+        make_backup(force=True)
     for c in accepted:
         _wd_pdf_store(conn, c)
     wd_seed_category_maps(conn)
-    for c in accepted:     # the project report's single row follows its grant's main category
-        if c["kind"] != "project":
-            continue
-        m = conn.execute("SELECT target_id FROM workday_map WHERE kind='grant' AND "
-                         "wd_key=?", (c["code"],)).fetchone()
-        row = conn.execute("SELECT category_id FROM budget_lines WHERE grant_id=? "
-                           "GROUP BY category_id ORDER BY SUM(amount) DESC LIMIT 1",
-                           (m["target_id"],)).fetchone() if m and m["target_id"] else None
-        if row:
-            conn.execute("INSERT OR IGNORE INTO workday_map (kind, wd_key, target_id) "
-                         "VALUES ('category', ?, ?)", (PDF_PROJECT_CLASS, row["category_id"]))
+    _pdf_map_project_class(conn, accepted)
     link = wd_autolink_grants(conn)
     wd_apply_balances(conn)
+    res["ledger"] = wd_ledger_import(conn, ledgers, {c["code"]: c for c in accepted})
+    # again now: on a fresh install the project's grant only gets its budget
+    # from the ledger, so the first try had nothing to follow
+    _pdf_map_project_class(conn, accepted)
     scopes = get_setting(conn, "wd_scope", {}) or {}
     for c in accepted:
         plan = wd_pdf_plan(conn, c)
         item = {"code": c["code"], "grant": plan.get("grant_name") or c["code"],
-                "rows": len(c["rows"]), "reconciled": [], "budget": []}
+                "rows": len(c["rows"]), "reconciled": [], "budget": [],
+                "reconcile": plan.get("reconcile") or []}
         res["reports"].append(item)
         if not plan.get("mapped") or plan.get("driven"):
             continue
@@ -2978,12 +3966,31 @@ def wd_pdf_apply(conn, reports, choices):
     set_setting(conn, "workday_last_sync", {
         "date": date.today().isoformat(),
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "summary": "PDF report: %d grant%s updated · %d ledger adjustment%s" % (
+        "summary": "PDF report: %d grant%s updated · %d ledger adjustment%s · "
+                   "%d transaction%s from the ledgers" % (
             len(res["reports"]), "" if len(res["reports"]) == 1 else "s",
-            res["expenses_added"], "" if res["expenses_added"] == 1 else "s")},
+            res["expenses_added"], "" if res["expenses_added"] == 1 else "s",
+            res["ledger"]["expenses_added"],
+            "" if res["ledger"]["expenses_added"] == 1 else "s")},
         commit=False)
-    conn.commit()
+    if dry:
+        conn.rollback()
+    else:
+        conn.commit()
     return res
+
+
+def wd_pdf_dry(conn, reports, ledger_token):
+    """What Import would do with these reports as they stand (run, then
+    undone), so the review shows the ledger's lines and the adjustments that
+    remain after them — not adjustments the ledger is about to make moot."""
+    reps = [{k: v for k, v in r.items() if k != "jpeg"} for r in reports]
+    try:
+        return wd_pdf_apply(conn, reps, {r.get("code"): {"reconcile": True}
+                                         for r in reps}, ledger_token, dry=True)
+    except Exception:  # noqa: BLE001 — a preview must never fail on this
+        conn.rollback()
+        return None
 
 
 def wd_pdf_preview(conn, payload):
@@ -3005,6 +4012,12 @@ def wd_pdf_preview(conn, payload):
             "“%s” has no readable text — it's a picture of a page with no "
             "text layer. Re-scan it with “searchable PDF”/OCR switched on, or "
             "use Workday's “Export to Excel” button instead." % name)
+    try:
+        ledgers = pdf_ledgers(pages)
+    except Exception:  # noqa: BLE001 — the summary tables still import without them
+        ledgers = {}
+    asofs = [l["as_of"] for l in ledgers.values() if l["as_of"]]
+    pk_asof = max(set(asofs), key=asofs.count) if asofs else ""
     reports, skipped = [], 0
     for i, pg in enumerate(pages):
         rep = pdf_parse_page(pg)
@@ -3012,19 +4025,39 @@ def wd_pdf_preview(conn, payload):
             skipped += 1
             continue
         rep["page"] = i + 1
+        if rep.get("code") in ledgers:
+            _pdf_crossfill(rep, ledgers[rep["code"]])
+        if not rep.get("as_of") and pk_asof:
+            rep["as_of"] = pk_asof           # every page of a packet is the same month
         c = wd_pdf_check(conn, rep)
         if (c["problems"] or c["warnings"]) and len([r for r in reports if r.get("jpeg")]) < 12:
             j = pdf_page_jpeg(pdf, pg["num"])
             if j and len(j) < 6 * 1048576:
                 c["jpeg"] = "data:image/jpeg;base64," + base64.b64encode(j).decode()
         reports.append(c)
-    if not reports:
+    if not reports and not ledgers:
         raise ValueError(
             "No “Budget vs Actual” tables were found in “%s” (%d pages read). "
             "This importer reads Workday's RPT - Departmental Grant Budget vs "
             "Actual and Project Budget vs Actual reports." % (name, len(pages)))
+    token = uuid.uuid4().hex
+    while len(PDF_LEDGER_CACHE) >= 4:
+        PDF_LEDGER_CACHE.pop(next(iter(PDF_LEDGER_CACHE)))
+    PDF_LEDGER_CACHE[token] = ledgers
+    names = _ledger_people(ledgers)
+    led = []
+    for code, l in ledgers.items():
+        rows = [r for s in l["sections"] for r in s["rows"] if not _ledger_is_budget(r)]
+        m = conn.execute("SELECT g.name FROM workday_map w JOIN grants g ON g.id=w.target_id "
+                         "WHERE w.kind='grant' AND w.wd_key=?", (code,)).fetchone()
+        led.append({"code": code, "as_of": l["as_of"] or pk_asof,
+                    "grant": m["name"] if m else _ledger_grant_name(l["title"], code, _ledger_pi(ledgers)),
+                    "rows": len(rows), "unreadable": sum(1 for r in rows if r["amount"] is None),
+                    "people": sorted({names[r["name"]] for r in rows if r.get("name") in names}),
+                    "has_report": any(c["code"] == code for c in reports)})
     return {"file": name, "pages": len(pages), "skipped_pages": skipped,
-            "reports": reports}
+            "reports": reports, "ledger_token": token, "ledgers": led,
+            "dry": wd_pdf_dry(conn, reports, token)}
 
 
 # RaaS (Report-as-a-Service): pull the same two reports straight from Workday
@@ -5255,13 +6288,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(wd_pdf_preview(conn, data))
                 return
             if path == "/api/workday/pdf/check":
-                self.send_json({"reports": [wd_pdf_check(conn, r)
-                                            for r in (data.get("reports") or [])[:60]]})
+                reps = [wd_pdf_check(conn, r) for r in (data.get("reports") or [])[:60]]
+                self.send_json({"reports": reps, "dry": wd_pdf_dry(
+                    conn, reps, data.get("ledger_token")) if data.get("ledger_token") else None})
                 return
             if path == "/api/workday/pdf/apply":
                 try:
                     res = wd_pdf_apply(conn, (data.get("reports") or [])[:60],
-                                       data.get("choices") or {})
+                                       data.get("choices") or {},
+                                       data.get("ledger_token"))
                 except Exception:
                     conn.rollback()
                     raise
