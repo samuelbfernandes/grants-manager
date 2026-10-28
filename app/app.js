@@ -162,6 +162,12 @@ function grantSpent(gid) {
   if (grantHasBalances(gid)) return grantActuals(gid) + pendingManual(gid);
   return S.expenses.filter((e) => e.grant_id === gid).reduce((s, e) => s + e.amount, 0);
 }
+/* What can actually be spent today. Some awards are released in instalments
+   (FFAR: the total is promised, a slice is funded each year): "Released so
+   far" on the grant is that slice. Blank means the whole award is available. */
+function grantFunds(g) {
+  return g.funded_to_date > 0 ? g.funded_to_date : g.initial_amount;
+}
 function grantBudgeted(gid) {
   return S.budget_lines.filter((b) => b.grant_id === gid).reduce((s, b) => s + b.amount, 0);
 }
@@ -189,10 +195,26 @@ function grantCommitments(gid) {
     .filter((b) => codes.includes(b.grant_code))
     .reduce((s, b) => s + (b.obligation || 0) + (b.commitment || 0), 0);
 }
+/* The part of Workday's commitments/obligations that is payroll: salary,
+   fringe and tuition already encumbered for people on this grant. A projection
+   built from appointments pays the same people again, so it must not also
+   subtract these. */
+function grantPayrollCommitments(gid) {
+  const out = { Personnel: 0, Fringe: 0, Tuition: 0 };
+  if (!WD || !WD.balances || !WD.mappings) return out;
+  const codes = WD.mappings.filter((m) => m.kind === "grant" && m.target_id === gid).map((m) => m.wd_key);
+  for (const b of WD.balances) {
+    if (!codes.includes(b.grant_code)) continue;
+    const oc = String(b.object_class || "");
+    const k = /Personnel/i.test(oc) ? "Personnel" : /Fringe/i.test(oc) ? "Fringe" : /Tuition/i.test(oc) ? "Tuition" : null;
+    if (k) out[k] += (b.obligation || 0) + (b.commitment || 0);
+  }
+  return out;
+}
 function grantAvailable(gid) {
   const g = S.grants.find((x) => x.id === gid);
   if (!g) return 0;
-  return g.initial_amount - grantSpent(gid) - grantCommitments(gid);
+  return grantFunds(g) - grantSpent(gid) - grantCommitments(gid);
 }
 
 /* "18 of 36 months gone (50%) — 32% of the money spent" */
@@ -206,7 +228,7 @@ function grantPace(g) {
   return {
     total, gone,
     timePct: Math.round(gone / total * 100),
-    spentPct: g.initial_amount > 0 ? Math.round(spent / g.initial_amount * 100) : null,
+    spentPct: grantFunds(g) > 0 ? Math.round(spent / grantFunds(g) * 100) : null,
   };
 }
 
@@ -215,7 +237,10 @@ function grantBurn(g) {
   const nowKey = monthKey(S.today);
   const byMonth = {};
   for (const e of S.expenses) {
-    if (e.grant_id !== g.id || e.source === "adjust") continue;
+    // catch-up lumps ("adjust", and "dbr" rows tied to no person) are
+    // not one month's spending
+    if (e.grant_id !== g.id || e.source === "adjust" ||
+        (e.source === "dbr" && !e.person_id)) continue;
     const k = monthKey(e.date);
     if (k <= nowKey) byMonth[k] = (byMonth[k] || 0) + e.amount;
   }
@@ -224,7 +249,8 @@ function grantBurn(g) {
   const avg = recent.reduce((a, b) => a + b, 0) / recent.length;
   if (avg <= 0) return null;
   const end = effectiveEnd(g);
-  const left = grantAvailable(g.id);
+  // a grant funded in instalments will receive the rest of its award
+  const left = grantAvailable(g.id) + instalmentRest(g);
   const monthsToEnd = end ? Math.max(0, monthsBetween(nowKey, monthKey(end)) - 1) : null;
   const monthsOfMoney = left > 0 ? left / avg : 0;
   return {
@@ -261,45 +287,90 @@ function projectAppointment(a) {
   const charged = S.expenses
     .filter((e) => e.grant_id === a.grant_id && e.person_id === a.person_id &&
                    catName(e.category_id) === "Personnel" && e.amount > 0)
-    .map((e) => monthKey(e.date)).sort();
+    .map((e) => e.salary_month || monthKey(e.date)).sort();
   const last = charged[charged.length - 1];
   let startYM = monthKey(a.start_date || S.today);
   if (last) startYM = addMonths(last, 1) > startYM ? addMonths(last, 1) : startYM;
   else if (monthKey(S.today) > startYM) startYM = monthKey(S.today);
   const months = monthsBetween(startYM, endYM);
   if (months <= 0) return null;
-  const salary = a.monthly_salary * months;
-  const fringe = salary * (a.fringe_rate || 0) / 100;
-  const tuition = (a.annual_tuition || 0) / 12 * months;
+  // a fringe-only appointment carries just the fringe on a salary that
+  // another appointment pays (its tuition, if any, is not repeated here)
+  // a part-month at the appointment's own start or end is paid by the day
+  const dim = (ym) => new Date(+ym.slice(0, 4), +ym.slice(5, 7), 0).getDate();
+  let paid = months;
+  const sd = a.start_date, ed = a.end_date;
+  if (sd && startYM === monthKey(sd) && +sd.slice(8, 10) > 1) paid -= (+sd.slice(8, 10) - 1) / dim(startYM);
+  if (ed && endYM === monthKey(ed) && +ed.slice(8, 10) < dim(endYM)) paid -= (dim(endYM) - +ed.slice(8, 10)) / dim(endYM);
+  if (paid <= 0) return null;
+  const base = a.monthly_salary * paid;
+  const salary = a.fringe_only ? 0 : base;
+  const fringe = base * (a.fringe_rate || 0) / 100;
+  const tuition = a.fringe_only ? 0 : (a.annual_tuition || 0) / 12 * paid;
   return { grant_id: a.grant_id, person_id: a.person_id, months,
            from: startYM, to: endYM, salary, fringe, tuition,
            total: salary + fringe + tuition };
 }
 
-function grantProjection(gid) {
-  /* Sum of future commitments per grant + projected availability. */
+/* Overspent means above the FULL award. A grant funded in instalments
+   (funded_to_date > 0) is judged against its whole award, not just the money
+   released so far; the released-only figure is shown beside it. */
+function instalmentRest(g) {
+  return g && g.funded_to_date > 0 ? Math.max(0, g.initial_amount - g.funded_to_date) : 0;
+}
+function projectedBalance(g, p) { return p.availableProjected + instalmentRest(g); }
+
+function grantProjection(gid, extra = null, skipId = null) {
+  /* Sum of future commitments per grant + projected availability.
+     `extra` adds an appointment that isn't saved yet and `skipId` leaves one
+     out (the appointment being edited): used to warn before overspending. */
   const g = S.grants.find((g) => g.id === gid);
-  const parts = S.appointments.filter((a) => a.grant_id === gid)
-    .map(projectAppointment).filter(Boolean);
+  const list = S.appointments.filter((a) => a.grant_id === gid && a.id !== skipId);
+  if (extra && extra.grant_id === gid) list.push(extra);
+  const parts = list.map((a) => projectAppointment(a)).filter(Boolean);
   const proj = { salary: 0, fringe: 0, tuition: 0, total: 0, parts };
   for (const p of parts) {
     proj.salary += p.salary; proj.fringe += p.fringe;
     proj.tuition += p.tuition; proj.total += p.total;
   }
-  const personnelNow = catRemaining(g, ["Personnel"]).remaining;
-  const fringeNow = catRemaining(g, ["Fringe"]).remaining;
-  const tuitionNow = catRemaining(g, ["Tuition"]).remaining;
-  // fringe/tuition overruns eat into the salary pot
-  const fringeOver = Math.max(0, proj.fringe - Math.max(0, fringeNow));
-  const tuitionOver = Math.max(0, proj.tuition - Math.max(0, tuitionNow));
-  proj.salaryNow = personnelNow;
-  proj.salaryProjected = personnelNow - proj.salary - fringeOver - tuitionOver;
-  proj.fringeNow = fringeNow;
-  proj.fringeProjected = fringeNow - proj.fringe;
-  proj.tuitionNow = tuitionNow;
-  proj.tuitionProjected = tuitionNow - proj.tuition;
+  const pers = catRemaining(g, ["Personnel"]);
+  const frin = catRemaining(g, ["Fringe"]);
+  const tuit = catRemaining(g, ["Tuition"]);
+  const personnelNow = pers.remaining, fringeNow = frin.remaining, tuitionNow = tuit.remaining;
   proj.availableNow = grantAvailable(gid);
-  proj.availableProjected = proj.availableNow - proj.total;
+  /* The appointments on the People tab are the plan, and are treated as if
+     Workday already had them. Workday's payroll obligations on a grant that has
+     appointments are therefore replaced by the projection (`availableNow` has
+     them taken off, so they are given back before the projection is
+     subtracted): no pay is counted twice. A grant with obligations but no
+     appointments keeps them as spent. */
+  const cm = grantPayrollCommitments(gid);
+  const planned = parts.length > 0;
+  const back = planned ? { ...cm } : { Personnel: 0, Fringe: 0, Tuition: 0 };
+  const pay = planned
+    ? { Personnel: proj.salary, Fringe: proj.fringe, Tuition: proj.tuition }
+    : { Personnel: cm.Personnel, Fringe: cm.Fringe, Tuition: cm.Tuition };
+  proj.pay = pay;
+  proj.payrollReplaced = back.Personnel + back.Fringe + back.Tuition;
+  proj.availableProjected = proj.availableNow + proj.payrollReplaced - proj.total;
+  // Personnel pot: fringe and tuition that outrun their own budgets are paid
+  // out of it, including a deficit already there when the category has a
+  // budget. A category with no budget line at all has no deficit to speak of.
+  const fringeOver = Math.max(0, pay.Fringe - (frin.budget > 0 ? fringeNow : Math.max(0, fringeNow)));
+  const tuitionOver = Math.max(0, pay.Tuition - (tuit.budget > 0 ? tuitionNow : Math.max(0, tuitionNow)));
+  proj.salaryNow = personnelNow;
+  let pot = personnelNow - pay.Personnel - fringeOver - tuitionOver;
+  // fringe money left over can be used for salary without a rebudget: it
+  // covers a Personnel shortfall, but is never added to a positive pot
+  // (new hires need their own fringe)
+  const fringeSpare = Math.max(0, (frin.budget > 0 ? fringeNow : Math.max(0, fringeNow)) - pay.Fringe);
+  if (pot < 0) pot = Math.min(0, pot + fringeSpare);
+  proj.fringeSpare = fringeSpare;
+  proj.salaryProjected = pot;
+  proj.fringeNow = fringeNow;
+  proj.fringeProjected = fringeNow - pay.Fringe;
+  proj.tuitionNow = tuitionNow;
+  proj.tuitionProjected = tuitionNow - pay.Tuition;
   return proj;
 }
 /* Dashboard alerts you have already read.
@@ -341,8 +412,8 @@ function computeAlerts() {
     else if (dl !== null && dl <= 183)
       alerts.push({ id: `end:${g.id}`, level: dl <= 60 ? "red" : "amber", grantId: g.id, text: `${g.name} ends in ${dl} days (${g.end_date}).` });
     const spent = grantSpent(g.id);
-    if (g.initial_amount > 0 && spent / g.initial_amount >= 0.9)
-      alerts.push({ id: `spent:${g.id}`, level: "red", grantId: g.id, text: `${g.name}: ${Math.round(spent / g.initial_amount * 100)}% of the total award spent.` });
+    if (grantFunds(g) > 0 && spent / grantFunds(g) >= 0.9)
+      alerts.push({ id: `spent:${g.id}`, level: "red", grantId: g.id, text: `${g.name}: ${Math.round(spent / grantFunds(g) * 100)}% of the ${g.funded_to_date > 0 ? "money released so far" : "total award"} spent.` });
     // Running dry before the end date is the thing you can still act on, and
     // it was only visible as a sentence buried in the grant's own card.
     const burn = grantBurn(g);
@@ -352,7 +423,7 @@ function computeAlerts() {
       // "runs out 0 months before it ends" is just "it ends" — not news
       if (early >= 1) alerts.push({
         id: `runout:${g.id}`, level: early >= 6 ? "red" : "amber", grantId: g.id,
-        text: `${g.name}: at ${money(burn.avg)}/month the money runs out in about ${m} month${m === 1 ? "" : "s"} — ${early} month${early === 1 ? "" : "s"} before the grant ends (${effectiveEnd(g)}). Slow the burn or request a no-cost extension.`,
+        text: `${g.name}: at ${money(burn.avg)}/month the money runs out in about ${m} month${m === 1 ? "" : "s"} — ${early} month${early === 1 ? "" : "s"} before the grant ends (${effectiveEnd(g)}). Slow the burn or find more funding.`,
       });
     }
     // only the grant's current budget year — closed cycles are history
@@ -498,18 +569,18 @@ function grantCard(g) {
   const spent = grantSpent(g.id);
   const avail = grantAvailable(g.id);
   // gray grows from the left as money is spent; the rest stays green (available)
-  const spentPct = g.initial_amount > 0 ? Math.max(0, Math.min(100, spent / g.initial_amount * 100)) : 0;
+  const spentPct = grantFunds(g) > 0 ? Math.max(0, Math.min(100, spent / grantFunds(g) * 100)) : 0;
   const dl = daysLeft(g);
   let endBadge = "";
   if (g.status !== "active") endBadge = `<span class="badge gray">closed</span>`;
   else if (dl !== null && dl < 0) endBadge = `<span class="badge red">ended</span>`;
-  else if (dl !== null && dl <= 183) endBadge = `<span class="badge amber">${dl} days left</span>`;
   const committed = grantCommitments(g.id);
   const pace = grantPace(g);
   const burn = grantBurn(g);
   return `
     <div class="card grant-card" data-goto-grant="${g.id}">
       <div class="gname">${esc(g.name)} ${endBadge}</div>
+      ${wdCodesFor(g.id).length ? `<div class="agency" style="font-weight:600;letter-spacing:.2px">${esc(wdCodesFor(g.id).join(" · "))}</div>` : ""}
       <div class="agency">${esc(g.agency || "")}${effectiveEnd(g) ? ` · ends ${effectiveEnd(g)}` : ""}${g.nce_end_date ? " (NCE)" : ""}</div>
       <div class="big">${money(avail)} <small>available</small></div>
       <div class="bar availback"><div class="spentfill" style="width:${spentPct}%"></div></div>
@@ -560,10 +631,12 @@ function renderGrant() {
         <h1>${esc(g.name)}</h1>
         <p class="sub" style="margin-bottom:0">${esc(g.agency || "")}${wt ? ` · ${esc(wt)}` : ""}${g.start_date ? ` · ${g.start_date} → ${effectiveEnd(g)}` : effectiveEnd(g) ? ` · ends ${effectiveEnd(g)}` : ""}
           ${g.nce_end_date ? ` · <span class="badge blue">NCE from ${g.end_date}</span>` : ""}
-          ${g.status !== "active" ? ` · <span class="badge gray">closed</span>` : dl !== null && dl <= 183 ? ` · <span class="badge amber">${dl} days left</span>` : ""}</p>
+          ${g.status !== "active" ? ` · <span class="badge gray">closed</span>` : ""}</p>
       </div>
       <div class="toolbar no-print">
         <button class="btn secondary small" id="btn-edit-grant">Edit grant</button>
+        <button class="btn secondary small" id="btn-close-grant" title="${g.status === "closed" ? "Move this grant back to your active grants" : "Mark this grant finished — it moves to the closed list, even if it still has money left"}">${g.status === "closed" ? "↺ Reopen grant" : "✓ Close grant"}</button>
+        <button class="btn danger small" id="btn-delete-grant" title="Remove this grant and everything in it from your records">🗑 Delete grant</button>
         <a href="${`/api/export/grant/${g.id}.csv`}"><button class="btn secondary small">⬇ Export CSV</button></a>
         <button class="btn secondary small" onclick="window.print()">🖨 Print report</button>
         <button class="btn secondary small" id="btn-closeout">📄 Close-out report</button>
@@ -574,6 +647,7 @@ function renderGrant() {
       <div class="stat"><div class="label">Available now</div><div class="value" style="color:${avail < 0 ? "var(--red)" : "var(--green)"}">${money(avail)}</div></div>
       <div class="stat" title="Available now minus salary, fringe and tuition committed to current appointments through the grant's end"><div class="label">Projected available</div><div class="value" style="color:${gproj.availableProjected < 0 ? "var(--red)" : "var(--green)"}">${money(gproj.availableProjected)}</div></div>
       <div class="stat"><div class="label">Awarded (funded)</div><div class="value">${money(g.initial_amount)}</div></div>
+      ${g.funded_to_date > 0 ? `<div class="stat" title="The part of the award Workday has released so far — what Available is counted against"><div class="label">Released so far</div><div class="value">${money(g.funded_to_date)}</div></div>` : ""}
       <div class="stat"><div class="label">Spent</div><div class="value">${money(spent)}</div></div>
       <div class="stat"><div class="label">Budgeted in lines</div><div class="value">${money(budgeted)}</div></div>
     </div>
@@ -625,10 +699,26 @@ function renderGrant() {
       <div class="card"><h2>Spending burn-down</h2><div class="chart-wrap"><canvas id="burn-chart"></canvas></div></div>
       <div class="card">
         <h2>People on this grant</h2>
-        ${gApps.length ? gApps.map((a) => {
+        ${gApps.length ? gApps.slice().sort((x, y) => x.start_date.localeCompare(y.start_date)).map((a) => {
           const p = S.people.find((p) => p.id === a.person_id) || { name: "?" };
           const pct = a.pct || 100;
-          return `<div class="person-chip">👤 ${esc(p.name)} · ${money(a.monthly_salary * 12)}/yr${pct < 100 ? ` (${pct}% of ${money(a.monthly_salary * 12 / (pct / 100))})` : ""} + ${a.fringe_rate}% fringe · ${a.start_date} → ${a.end_date}</div>`;
+          const gn = (id) => id ? ((S.grants.find((x) => x.id === id) || {}).name || "?") : "Unassigned";
+          // where else this person's salary sits, so a move reads as a move
+          const others = S.appointments.filter((o) => o.person_id === a.person_id && o.id !== a.id &&
+            o.grant_id !== g.id && o.monthly_salary > 0 && !o.fringe_only && !a.fringe_only)
+            .sort((x, y) => x.start_date.localeCompare(y.start_date)).map((o) =>
+              o.end_date < a.start_date ? `before: ${esc(gn(o.grant_id))} until ${o.end_date}`
+              : o.start_date > a.end_date ? `after: ${esc(gn(o.grant_id))} from ${o.start_date}`
+              : `at the same time: ${esc(gn(o.grant_id))} (${o.pct || 100}%) ${o.start_date} → ${o.end_date}`);
+          const payer = a.fringe_only ? S.appointments.filter((o) => o.person_id === a.person_id && !o.fringe_only && o.monthly_salary > 0 &&
+            o.start_date <= a.end_date && o.end_date >= a.start_date).map((o) => gn(o.grant_id)) : [];
+          const fringeFrom = a.fringe_only || a.fringe_rate ? [] : S.appointments.filter((o) => o.person_id === a.person_id && o.fringe_only &&
+            o.start_date <= a.end_date && o.end_date >= a.start_date).map((o) => gn(o.grant_id));
+          const state = a.end_date < S.today ? '<span class="badge gray">ended</span>' : a.start_date > S.today ? '<span class="badge blue">starts soon</span>' : '<span class="badge green">active</span>';
+          return `<div class="person-chip" style="display:block;border-radius:12px">👤 <strong>${esc(p.name)}</strong> ${state} ${a.fringe_only ? '<span class="badge gray">fringe only</span>' : ""}
+            · ${a.fringe_only ? `${a.fringe_rate}% fringe on ${money(a.monthly_salary * 12)}/yr` : `${money(a.monthly_salary * 12)}/yr${pct < 100 ? ` (${pct}% of ${money(a.monthly_salary * 12 / (pct / 100))})` : ""} + ${a.fringe_rate ? a.fringe_rate + "% fringe" : (fringeFrom.length ? "fringe paid by " + esc([...new Set(fringeFrom)].join(" + ")) : "no fringe")}`} · ${a.start_date} → ${a.end_date}
+            ${a.fringe_only && payer.length ? `<div style="font-size:11.5px;color:var(--muted);margin-top:2px">salary paid by ${esc([...new Set(payer)].join(" + "))}</div>` : ""}
+            ${others.length ? `<div style="font-size:11.5px;color:var(--muted);margin-top:2px">${others.join(" · ")}</div>` : ""}</div>`;
         }).join("") : `<div class="empty">No one appointed yet — add appointments in the People tab.</div>`}
         ${g.notes ? `<h2 style="margin-top:16px">Notes</h2><div class="notes-block">${esc(g.notes)}</div>` : ""}
       </div>
@@ -659,7 +749,7 @@ function expRow(e) {
     <td>${e.date}</td>
     <td>${esc(catName(e.category_id))}</td>
     <td>Y${e.year || 1}</td>
-    <td>${esc(e.description)} ${e.source === "salary" ? '<span class="badge gray">auto</span>' : e.source === "adjust" ? '<span class="badge blue">rollover</span>' : e.source === "workday" ? '<span class="badge green">workday</span>' : ""}</td>
+    <td>${esc(e.description)} ${e.source === "salary" ? '<span class="badge gray">auto</span>' : ""}</td>
     <td>${esc(personName(e.person_id))}</td>
     <td class="num">${money2(e.amount)}</td>
     <td>${e.receipt_path ? `<a class="receipt-link" href="${receiptUrl(e.receipt_path)}" target="_blank">📎 view</a>` : ""}${docs.length ? ` <a href="#" data-edit-exp="${e.id}" title="${esc(docs.map((d) => d.name).join(", "))}" style="font-size:12px;white-space:nowrap">+${docs.length} doc${docs.length === 1 ? "" : "s"}</a>` : ""}</td>
@@ -674,13 +764,31 @@ function expRow(e) {
 /* -------------------------------------------------------------- summary */
 const HIRING_CATS = ["Personnel", "Fringe", "Tuition"];
 
+/* A category's budget as far as it can be spent today: the lines you
+   entered, but for a grant released in instalments no more than Workday has
+   released in that category so far. */
+function catBudgetNow(g, c) {
+  const planned = S.budget_lines.filter((b) => b.grant_id === g.id && b.category_id === c.id)
+    .reduce((s, b) => s + b.amount, 0);
+  if (!(g.funded_to_date > 0) || !WD || !WD.balances || !WD.mappings) return planned;
+  const codes = wdCodesFor(g.id);
+  if (!codes.length) return planned;
+  const cm = {};
+  WD.mappings.filter((m) => m.kind === "category").forEach((m) => { cm[m.wd_key] = m.target_id; });
+  const rows = WD.balances.filter((b) => codes.includes(b.grant_code) && cm[b.object_class] === c.id);
+  // Workday reports this grant but has nothing for this category: none of it is released yet
+  if (!rows.length) return WD.balances.some((b) => codes.includes(b.grant_code)) ? 0 : planned;
+  const wd = rows.reduce((s, b) => s + (b.budget || 0), 0);
+  // no line for it in the app (e.g. tuition on FFAR) but Workday holds a budget:
+  // that released money is real, so use it rather than treating the category as 0
+  return planned > 0 ? Math.min(planned, wd) : wd;
+}
 function catRemaining(g, names) {
   // remaining (budget - spent) for the given category names on one grant
   let budget = 0, spent = 0;
   for (const c of grantCats(g)) {
     if (!names.includes(c.name)) continue;
-    budget += S.budget_lines.filter((b) => b.grant_id === g.id && b.category_id === c.id)
-      .reduce((s, b) => s + b.amount, 0);
+    budget += catBudgetNow(g, c);
     spent += spentFor(g.id, c.id, null);
   }
   return { budget, spent, remaining: budget - spent };
@@ -692,8 +800,7 @@ function categoryTotals(includeClosed) {
   const gs = realGrants().filter((g) => includeClosed || g.status === "active");
   for (const g of gs) {
     for (const c of grantCats(g)) {
-      const b = S.budget_lines.filter((x) => x.grant_id === g.id && x.category_id === c.id)
-        .reduce((s, x) => s + x.amount, 0);
+      const b = catBudgetNow(g, c);
       const sp = spentFor(g.id, c.id, null);
       if (!b && !sp) continue;
       out[c.name] = out[c.name] || { budget: 0, spent: 0 };
@@ -702,6 +809,51 @@ function categoryTotals(includeClosed) {
     }
   }
   return out;
+}
+
+/* Two warnings at the top of the Summary: grants projected to overspend, and
+   people-months that no grant carries yet (with an Assign button). */
+/* Cards on the Summary that can be folded away; remembered between visits. */
+function cardFolded(key) {
+  try { return JSON.parse(store.getItem("gm-folded-cards") || "{}")[key] === 1; } catch { return false; }
+}
+function foldBtn(key) {
+  return `<button class="icon-btn no-print" data-fold-card="${key}" title="${cardFolded(key) ? "Show" : "Minimize"}" style="font-size:16px;line-height:1">${cardFolded(key) ? "+" : "−"}</button>`;
+}
+
+function summaryFundingCards(rows) {
+  const over = rows.filter((r) => projectedBalance(r.g, r.p) < -0.5 ||
+    (r.p.salaryProjected < -0.5 && !instalmentRest(r.g)));
+  const un = unassignedItems();
+  const unTotal = un.reduce((s, x) => s + x.cost, 0);
+  const span = (x) => x.from === x.to ? x.from : `${x.from} → ${x.to}`;
+  const overCard = over.length
+    ? `<div class="card" style="border-left:4px solid var(--red)">
+        <div class="section-head"><h2 style="margin:0">⚠ Projected overspend</h2>${foldBtn("over")}</div>
+        ${cardFolded("over") ? "" : `<p class="sub" style="margin:8px 0">After every current appointment is paid to its end. Saving is never blocked — these need a decision (move people, add money, or cut). <strong>Spare fringe is used for salary automatically:</strong> where a grant has fringe money left and Personnel runs short, the Personnel pot below already counts that fringe (no rebudget needed to see it).</p>
+        <table><thead><tr><th>Grant</th><th class="num">Projected balance</th><th class="num" title="Personnel money left after every appointment, after spare fringe has covered any shortfall">Personnel pot</th></tr></thead><tbody>
+        ${over.map((r) => {
+          const bal = projectedBalance(r.g, r.p), rest = instalmentRest(r.g);
+          return `<tr><td><a href="#" data-goto-grant="${r.g.id}" style="color:var(--accent);text-decoration:none;font-weight:600">${esc(r.g.name)}</a></td>
+          <td class="num" style="color:${bal < 0 ? "var(--red)" : "inherit"};font-weight:600">${money(bal)}${rest > 0 ? `<div style="font-size:11px;font-weight:400;color:var(--muted)">full award ${money(r.g.initial_amount)} · ${money(r.g.funded_to_date)} released so far</div>` : ""}</td>
+          <td class="num" style="color:${r.p.salaryProjected < 0 && !rest ? "var(--red)" : "inherit"}">${rest > 0 ? "—" : money(r.p.salaryProjected)}</td></tr>`;
+        }).join("")}
+        </tbody></table>`}</div>`
+    : `<div class="card" style="border-left:4px solid var(--green)"><strong style="color:var(--green)">No active grant is projected to overspend</strong> <span class="sub">(after every current appointment is paid to its end).</span></div>`;
+  const unCard = un.length
+    ? `<div class="card" style="border-left:4px solid var(--amber)">
+        <div class="section-head"><h2 style="margin:0">Unassigned / pending funding</h2><span style="display:flex;align-items:center;gap:10px"><strong style="font-size:16px;color:var(--amber)">${money(unTotal)}</strong>${foldBtn("unassigned")}</span></div>
+        ${cardFolded("unassigned") ? "" : `<p class="sub" style="margin:8px 0">People-months and costs no grant carries yet. They are not counted against any grant until you assign them.</p>
+        <table><thead><tr><th>Person</th><th>What</th><th>Period</th><th class="num">About</th><th></th></tr></thead><tbody>
+        ${un.map((x) => `<tr><td>${esc(x.p.name)}</td>
+          <td>${x.kind === "pending" ? `salary pending${x.share < 100 ? ` (${Math.round(x.share)}%)` : ""}` : "unassigned item"}</td>
+          <td>${span(x)}</td><td class="num">${money(x.cost)}</td>
+          <td>${x.kind === "pending"
+            ? `<button class="btn ghost small" data-assign-person="${x.p.id}" data-from="${x.from}" data-to="${x.to}" data-share="${x.share}" data-ref="${x.ref.id}">Assign…</button>`
+            : `<button class="btn ghost small" data-edit-appt="${x.appt.id}">Assign…</button>`}</td></tr>`).join("")}
+        </tbody></table>`}</div>`
+    : "";
+  return overCard + unCard;
 }
 
 function renderSummary() {
@@ -735,6 +887,8 @@ function renderSummary() {
       <div class="stat"><div class="label">Historic total awarded</div><div class="value">${money(historicTotal)}</div></div>
     </div>
 
+    ${summaryFundingCards(rows)}
+
     ${view.hireDetail ? `<div class="card hire-detail">
       <h2>Behind the hiring number</h2>
       <p class="sub" style="margin-bottom:10px">The headline is salary (Personnel) only. Fringe and tuition are still accounted for: each grant's projected fringe/tuition costs are charged to their own budgets first, and any overrun is subtracted from that grant's salary pot.</p>
@@ -764,19 +918,19 @@ function renderSummary() {
         <tbody>
           ${rows.map((r) => `<tr>
             <td><a href="#" data-goto-grant="${r.g.id}" style="color:var(--accent);text-decoration:none;font-weight:600">${esc(r.g.name)}</a>${r.g.nce_end_date ? ' <span class="badge blue">NCE</span>' : ""}</td>
-            <td>${effectiveEnd(r.g) || "—"} ${r.days !== null && r.days <= 365 ? `<span class="badge ${r.days <= 183 ? "red" : "amber"}">${r.days}d</span>` : ""}</td>
+            <td>${effectiveEnd(r.g) || "—"}</td>
             <td class="num">${money(r.p.salaryNow)}</td>
             <td class="num">${money(r.p.total)}</td>
             <td class="num" style="font-weight:700;color:${r.p.salaryProjected < 0 ? "var(--red)" : "var(--green)"}">${money(r.p.salaryProjected)}</td>
             <td class="num">${money(r.p.availableNow)}</td>
-            <td class="num" style="font-weight:600;color:${r.p.availableProjected < 0 ? "var(--red)" : "inherit"}">${money(r.p.availableProjected)}</td>
+            <td class="num" style="font-weight:600;color:${projectedBalance(r.g, r.p) < 0 ? "var(--red)" : "inherit"}">${money(projectedBalance(r.g, r.p))}${instalmentRest(r.g) ? `<div style="font-size:11px;font-weight:400;color:var(--muted)">full award · released only ${money(r.p.availableProjected)}</div>` : ""}</td>
           </tr>`).join("")}
           <tr style="font-weight:700"><td>Total</td><td></td>
             <td class="num">${money(salNow)}</td>
             <td class="num">${money(committed)}</td>
             <td class="num" style="color:var(--green)">${money(salProj)}</td>
             <td class="num">${money(rows.reduce((s, r) => s + r.p.availableNow, 0))}</td>
-            <td class="num">${money(rows.reduce((s, r) => s + r.p.availableProjected, 0))}</td></tr>
+            <td class="num">${money(rows.reduce((s, r) => s + projectedBalance(r.g, r.p), 0))}</td></tr>
         </tbody>
       </table>
       <p class="sub" style="margin:10px 0 0;font-size:12.5px">Projections come from appointments (People tab): monthly salary × months remaining + fringe % + annual tuition, starting after each person's last charged month. Red means over-committed.</p>
@@ -785,12 +939,14 @@ function renderSummary() {
     <div class="card">
       <div class="section-head">
         <h2>Historic total — all grants received</h2>
-        <strong style="font-size:18px;color:var(--accent)">${money(historicTotal)}</strong>
+        <span class="no-print" style="display:flex;align-items:center;gap:12px">
+          <a href="#" id="hist-edit" style="font-size:12.5px;color:var(--accent)">${view.histEdit ? "Done" : "Choose grants"}</a>
+          <strong style="font-size:18px;color:var(--accent)">${money(historicTotal)}</strong></span>
       </div>
       <table>
         <thead><tr><th class="no-print" style="width:34px">Count</th><th>Grant</th><th>Agency</th><th>Period</th><th class="num">Awarded (funded)</th></tr></thead>
         <tbody>
-          ${realGrants().map((g) => `<tr style="${g.exclude_from_history ? "opacity:.45" : ""}">
+          ${realGrants().filter((g) => view.histEdit || !g.exclude_from_history).map((g) => `<tr style="${g.exclude_from_history ? "opacity:.45" : ""}">
             <td class="no-print"><input type="checkbox" data-hist-toggle="${g.id}" ${g.exclude_from_history ? "" : "checked"} style="width:auto" title="Include in historic total"></td>
             <td style="font-weight:600">${esc(g.name)} ${g.status !== "active" ? '<span class="badge gray">closed</span>' : ""}</td>
             <td>${esc(g.agency || "")}</td>
@@ -845,7 +1001,7 @@ function drawDashboardChart() {
   if (!ctx) return;
   const byMonth = {};
   for (const e of S.expenses) {
-    if (e.source === "adjust") continue; // rollover forfeits aren't spending
+    if (e.source === "adjust") continue; // catch-up adjustments aren't spending
     const k = monthKey(e.date);
     byMonth[k] = (byMonth[k] || 0) + e.amount;
   }
@@ -951,7 +1107,7 @@ function drawSummaryCharts() {
   if (mc) {
     const byMonth = {};
     for (const e of S.expenses) {
-      if (e.source === "adjust") continue; // rollover forfeits aren't spending
+      if (e.source === "adjust") continue; // catch-up adjustments aren't spending
       const k = e.date.slice(0, 7);
       byMonth[k] = (byMonth[k] || 0) + e.amount;
     }
@@ -973,6 +1129,151 @@ function drawSummaryCharts() {
   }
 }
 
+/* Funding cover for one person, month by month from the first salary
+   appointment to the later of the last appointment end and "Needed until".
+
+   A month is covered by an appointment when the appointment, the grant and
+   the grant's own dates (incl. no-cost extension) all include it. A grant
+   that ends before the appointment leaves the rest "pending", as does any
+   gap and any share under 100%. Fringe-only appointments, tuition-only ones
+   and unassigned ones (grant_id 0) never cover salary. */
+function apptCoverPct(a, ym) {
+  if (a.fringe_only || !a.grant_id || !(a.monthly_salary > 0)) return 0;
+  if (!(monthKey(a.start_date) <= ym && ym <= monthKey(a.end_date))) return 0;
+  const g = S.grants.find((x) => x.id === a.grant_id);
+  if (!g || g.status !== "active") return 0;
+  if (!isExternal(g)) {
+    if (g.start_date && ym < monthKey(g.start_date)) return 0;
+    const ge = effectiveEnd(g);
+    if (ge && ym > monthKey(ge)) return 0;
+  }
+  return a.pct || 100;
+}
+
+function pendingCostPerMonth(ref, share, fringeFallback) {
+  const scale = share / (ref.pct || 100);
+  const fr = ref.fringe_rate || fringeFallback || 0;
+  return ref.monthly_salary * scale * (1 + fr / 100) + (ref.annual_tuition || 0) * scale / 12;
+}
+
+function personCover(p, apps) {
+  const sal = apps.filter((a) => a.start_date && a.end_date && !a.fringe_only && a.monthly_salary > 0);
+  if (!sal.length) return null;
+  const first = sal.map((a) => monthKey(a.start_date)).sort()[0];
+  const lastAppt = sal.map((a) => monthKey(a.end_date)).sort().pop();
+  const last = p.plan_end && monthKey(p.plan_end) > lastAppt ? monthKey(p.plan_end) : lastAppt;
+  const fringeOnly = Math.max(0, ...apps.filter((a) => a.fringe_only).map((a) => a.fringe_rate || 0));
+  const segs = [];
+  let months = 0, full = 0;
+  for (let m = first; m <= last; m = addMonths(m, 1)) {
+    const cov = Math.min(100, sal.reduce((s, a) => s + apptCoverPct(a, m), 0));
+    // which grants pay this month: a move from one grant to another splits the bar
+    const who = [...new Set(sal.filter((a) => apptCoverPct(a, m) > 0).map((a) => a.grant_id))].sort((x, y) => x - y);
+    const key = who.join(",");
+    const prev = segs[segs.length - 1];
+    if (prev && prev.cov === cov && prev.key === key) { prev.n++; prev.to = m; }
+    else segs.push({ cov, key, who, n: 1, from: m, to: m });
+    months++;
+    if (cov >= 100) full++;
+  }
+  // what each pending run needs: the appointment that is losing cover there
+  // (its grant ended first), else the latest-ending one
+  let estimate = 0;
+  const runs = [];
+  for (const s of segs) {
+    if (s.cov >= 100) continue;
+    const share = 100 - s.cov;
+    const lost = sal.filter((a) => monthKey(a.start_date) <= s.from && s.from <= monthKey(a.end_date) && !apptCoverPct(a, s.from));
+    const pool = lost.length ? lost : sal;
+    const ref = pool.slice().sort((a, b) => (b.end_date > a.end_date ? 1 : -1))[0];
+    const est = s.n * pendingCostPerMonth(ref, share, fringeOnly);
+    estimate += est;
+    runs.push({ ...s, share, ref, est });
+  }
+  return { segs, runs, months, covered: full, pending: months - full, first, last, estimate,
+           overlap: salaryOverlap(apps) };
+}
+
+/* Months in which a person's salary is spread over more than 100% — the same
+   salary on two grants at once (double counting). Fringe-only lines never
+   count; they carry no salary of their own. */
+function salaryOverlap(apps) {
+  const sal = apps.filter((a) => a.start_date && a.end_date && !a.fringe_only && a.monthly_salary > 0);
+  const out = [];
+  if (!sal.length) return out;
+  const first = sal.map((a) => monthKey(a.start_date)).sort()[0];
+  const last = sal.map((a) => monthKey(a.end_date)).sort().pop();
+  for (let m = first; m <= last; m = addMonths(m, 1)) {
+    const tot = sal.reduce((s, a) => s + (monthKey(a.start_date) <= m && m <= monthKey(a.end_date) ? (a.pct || 100) : 0), 0);
+    if (tot > 100.5) out.push({ month: m, pct: Math.round(tot) });
+  }
+  return out;
+}
+
+function monthEnd(ym) { // last calendar day of "YYYY-MM"
+  const [y, m] = ym.split("-").map(Number);
+  return `${ym}-${String(new Date(y, m, 0).getDate()).padStart(2, "0")}`;
+}
+
+function apptCost(a) { // what an unassigned appointment still needs, from this month on
+  const from = monthKey(a.start_date) > monthKey(S.today) ? monthKey(a.start_date) : monthKey(S.today);
+  const n = monthsBetween(from, monthKey(a.end_date));
+  if (n <= 0) return 0;
+  const base = (a.monthly_salary || 0) * n;
+  return (a.fringe_only ? 0 : base) + base * (a.fringe_rate || 0) / 100 +
+         (a.fringe_only ? 0 : (a.annual_tuition || 0) / 12 * n);
+}
+
+const COVER_SHADES = ["var(--green)", "color-mix(in srgb, var(--green) 62%, #fff)",
+  "color-mix(in srgb, var(--green) 72%, #000)", "color-mix(in srgb, var(--green) 40%, #fff)"];
+
+function personCoverHtml(p, apps) {
+  const c = personCover(p, apps);
+  if (!c) return "";
+  const span = (s) => s.from === s.to ? s.from : `${s.from} → ${s.to}`;
+  const gnames = (ids) => ids.map((id) => (S.grants.find((g) => g.id === id) || { name: "?" }).name).join(" + ");
+  // one shade per distinct set of paying grants, so a move shows as a split
+  const shadeOf = {};
+  const legend = [];
+  for (const s of c.segs) {
+    if (s.cov < 100 && !s.who.length) continue;
+    if (!(s.key in shadeOf)) shadeOf[s.key] = Object.keys(shadeOf).length;
+    legend.push(s);
+  }
+  const seg = (s) => s.cov >= 100
+    ? `<div style="flex:${s.n};background:${COVER_SHADES[shadeOf[s.key] % COVER_SHADES.length]}" title="${esc(gnames(s.who))} · ${span(s)} (${s.n} mo)"></div>`
+    : `<div class="cover-pending" style="flex:${s.n}" title="${100 - s.cov}% not covered by any grant · ${span(s)} (${s.n} mo)"></div>`;
+  const runs = c.runs.map((r) => {
+    const partial = r.share < 100 ? ` (${Math.round(r.share)}% of the salary)` : "";
+    return `<div class="cover-run">⚠ <strong>${span(r)}</strong> · ${r.n} month${r.n > 1 ? "s" : ""} pending${partial} · about ${money(r.est)}
+      <button class="btn ghost small" data-assign-person="${p.id}" data-from="${r.from}" data-to="${r.to}" data-share="${r.share}" data-ref="${r.ref.id}">Assign to a grant…</button></div>`;
+  }).join("");
+  const un = apps.filter((a) => !a.grant_id).map((a) =>
+    `<div class="cover-run">⚠ <strong>Unassigned</strong> · ${a.start_date} → ${a.end_date} · ${a.monthly_salary > 0 ? "salary " : ""}${a.annual_tuition > 0 ? "tuition " : ""}about ${money(apptCost(a))}
+      <button class="btn ghost small" data-edit-appt="${a.id}">Assign to a grant…</button></div>`).join("");
+  const dbl = c.overlap.length
+    ? `<div class="cover-run" style="color:var(--red)">⚠ Salary counted more than once: ${c.overlap.map((o) => `${o.month} (${o.pct}%)`).slice(0, 4).join(", ")}${c.overlap.length > 4 ? ` … ${c.overlap.length} months` : ""}. Shorten one appointment so the shares add up to 100%.</div>` : "";
+  return `<div class="cover" style="margin:4px 0 10px">
+    <div class="cover-bar">${c.segs.map(seg).join("")}</div>
+    <div class="cover-legend">${legend.map((s) => `<span><i style="background:${COVER_SHADES[shadeOf[s.key] % COVER_SHADES.length]}"></i>${esc(gnames(s.who))} <span style="opacity:.75">${span(s)}</span></span>`).join("")}${c.pending ? `<span><i class="cover-pending"></i>pending</span>` : ""}</div>
+    <div style="font-size:12px;color:var(--muted)">${c.covered} of ${c.months} months covered (${c.first} → ${c.last})${c.pending
+      ? ` · <strong style="color:var(--amber)">${c.pending} pending</strong>, about ${money(c.estimate)} at the current rate` : ""}</div>
+    ${dbl}${runs}${un}
+  </div>`;
+}
+
+/* Everything no grant carries yet, across all people (Summary card). */
+function unassignedItems() {
+  const out = [];
+  for (const p of S.people) {
+    const apps = S.appointments.filter((a) => a.person_id === p.id);
+    const c = personCover(p, apps);
+    if (c) for (const r of c.runs) out.push({ p, kind: "pending", from: r.from, to: r.to, share: r.share, ref: r.ref, cost: r.est, n: r.n });
+    for (const a of apps.filter((a) => !a.grant_id)) out.push({ p, kind: "unassigned", appt: a, from: monthKey(a.start_date), to: monthKey(a.end_date), cost: apptCost(a) });
+  }
+  return out;
+}
+
 /* -------------------------------------------------------------- people */
 function renderPeople() {
   return `
@@ -992,14 +1293,16 @@ function renderPeople() {
               <button class="icon-btn" data-del-person="${p.id}">🗑</button>
             </div>
           </div>
+          ${personCoverHtml(p, apps)}
           ${apps.length ? `<table><thead><tr><th>Grant</th><th class="num">%</th><th class="num">Salary/yr</th><th class="num">Fringe</th><th class="num">Tuition/yr</th><th>Period</th><th></th></tr></thead><tbody>
             ${apps.map((a) => {
               const g = S.grants.find((g) => g.id === a.grant_id) || { name: "?" };
-              const active = a.end_date >= S.today && a.start_date <= S.today;
+              const active = a.grant_id && a.end_date >= S.today && a.start_date <= S.today;
               const future = a.start_date > S.today;
               const pct = a.pct || 100;
               const annual = a.monthly_salary * 12;
-              return `<tr><td>${esc(g.name)} ${active ? '<span class="badge green">active</span>' : future ? '<span class="badge blue">starts soon</span>' : ""} ${a.auto_charge ? '<span class="badge amber" title="Monthly charges auto-generated">auto</span>' : ""}</td>
+              const gName = a.grant_id ? g.name : "Unassigned";
+              return `<tr><td>${esc(gName)} ${!a.grant_id ? '<span class="badge amber" title="No grant pays this yet">unassigned</span>' : ""} ${a.fringe_only ? '<span class="badge gray" title="Only the fringe on a salary paid by another appointment">fringe only</span>' : ""} ${g.status === "closed" ? '<span class="badge gray">closed grant</span>' : ""} ${active && g.status !== "closed" ? '<span class="badge green">active</span>' : future ? '<span class="badge blue">starts soon</span>' : ""} ${a.auto_charge ? '<span class="badge amber" title="Monthly charges auto-generated">auto</span>' : ""}</td>
                 <td class="num" style="font-weight:600">${Math.round(pct * 10) / 10}%</td>
                 <td class="num">${money(annual)}${pct < 100 ? `<div style="font-size:11px;color:var(--muted)">of ${money(annual / (pct / 100))} total</div>` : ""}</td>
                 <td class="num">${a.fringe_rate}%</td>
@@ -1013,6 +1316,7 @@ function renderPeople() {
     <div class="card" style="margin-top:6px">
       <h2>How appointments work</h2>
       <p class="sub" style="margin:0">Each appointment (grant, monthly salary, fringe %, annual tuition, start/end) drives the <strong>projections</strong> on the Summary tab: the app counts every month not yet charged, through the appointment or grant end, and shows what will be left. If you also tick <strong>auto-generate monthly charges</strong> on an appointment, the <strong>↻ Update salary charges</strong> button creates the actual monthly salary + fringe expenses (prorated, never duplicated) — leave it off if your actuals come from DBR imports.</p>
+      <p class="sub" style="margin:8px 0 0">The bar on each card is month by month: <strong style="color:var(--green)">green</strong> = a grant pays (the appointment and the grant's own dates both include that month), <strong style="color:var(--amber)">orange</strong> = pending: the grant ended before the appointment, there is a gap, or only part of the salary is covered. <strong>Needed until</strong> (✏️ on the person) extends the bar to when you actually need them. <strong>Assign to a grant…</strong> turns a pending stretch into a real appointment, and shows whether that grant would overspend (a warning only — you can still save). Choose <em>Unassigned</em> as the grant for a cost no grant carries yet, such as summer tuition. <strong>Fringe only</strong> marks an appointment that pays just the fringe on a salary paid elsewhere. <strong>Spare fringe rebates to salary by default:</strong> when Personnel runs short and the grant still has fringe left, the projections use that fringe to cover the shortfall (it is never added to a positive balance).</p>
     </div>`;
 }
 
@@ -1249,6 +1553,11 @@ async function wdSync(creds) {
   try {
     const r = await api("/api/workday/sync", "POST", creds || {});
     sstore.removeItem("wd-offline");
+    if ((r.stale || []).length) {
+      await wdRefresh();
+      wdStaleModal(r.stale, () => wdSync({ ...(creds || {}), allow_stale: true }));
+      return;
+    }
     toast(`Workday sync: ${r.new_lines} new transactions · ${r.matched} matched · ${r.created} added` +
           (r.pending ? ` · ${r.pending} awaiting mapping` : ""));
     await wdRefresh();
@@ -1264,6 +1573,37 @@ const EXAMPLE_LINK = `<a href="${"/api/workday/example.xlsx"}"><button class="bt
 /* A wrong export used to disappear into "1 file read · 0 new transactions",
    leaving the person to guess. Anything that failed now gets its own line
    saying what the file actually was and what to do about it. */
+/* Records more than a month back are never changed silently: the import
+   stopped, wrote nothing for that file, and says what it would have touched. */
+function wdStaleHtml(stale) {
+  if (!(stale || []).length) return "";
+  return `<div style="background:var(--amber-soft);border-left:3px solid #b97a08;padding:10px 12px;border-radius:8px;margin:12px 0 4px;font-size:13.5px">
+    <strong>⚠ Held back — this reaches more than a month into the past.</strong>
+    <ul style="margin:6px 0 6px;padding-left:20px">${stale.map((x) => `<li style="margin:3px 0"><span style="word-break:break-all">${esc(x.file)}</span>: ${esc(x.message)}</li>`).join("")}</ul>
+    <span class="sub">Nothing from ${stale.length === 1 ? "it was" : "them was"} imported. Importing anyway adds those older records and replaces newer figures with older ones; a backup is made first.</span></div>`;
+}
+function wdStaleModal(stale, again, discard) {
+  modal(`
+    <h2>Check before importing</h2>
+    ${wdStaleHtml(stale)}
+    <div class="actions">
+      ${discard ? `<button class="btn secondary" id="m-skip" style="margin-right:auto">Leave ${stale.length === 1 ? "it" : "them"} out</button>` : ""}
+      <button class="btn secondary" id="m-cancel">${discard ? "Decide later" : "Cancel"}</button>
+      <button class="btn danger" id="m-go">Import anyway</button>
+    </div>`, (el, close) => {
+    $("#m-cancel", el).onclick = close;
+    if (discard) $("#m-skip", el).onclick = async () => { close(); await discard(); };
+    $("#m-go", el).onclick = async () => { close(); await again(); };
+  });
+}
+async function wdStaleRetry(opts) {
+  try {
+    const r = await api("/api/workday/import", "POST", opts);
+    await wdRefresh();
+    wdReportImportResult(r);
+  } catch (e) { toast("Import failed: " + e.message); }
+}
+
 function wdReportImportResult(r) {
   const bad = [...r.files.filter((f) => f.kind === "error")
     .map((f) => ({ name: f.file, why: f.error })),
@@ -1272,6 +1612,7 @@ function wdReportImportResult(r) {
     return i > 0 ? { name: e.slice(0, i), why: e.slice(i + 2) } : { name: "", why: e };
   })];
   const good = r.files.filter((f) => f.kind === "detail" || f.kind === "summary");
+  const stale = r.stale || [];
   const balanceRows = r.balance_rows || 0;
   const nTxn = r.new_lines || 0, nMatched = r.matched || 0, nAdded = r.created || 0;
   const anythingNew = balanceRows + nTxn + nMatched + nAdded
@@ -1292,7 +1633,7 @@ function wdReportImportResult(r) {
   if (nAdded) wins.push(`${nAdded} added as new expense${nAdded === 1 ? "" : "s"}.`);
   const winsHtml = wins.length
     ? `<ul style="margin:0 0 4px 0;padding-left:20px">${wins.map((w) => `<li style="margin:3px 0">${w}</li>`).join("")}</ul>`
-    : (good.length && !bad.length
+    : (good.length && !bad.length && !stale.length
         ? `<p class="sub" style="margin:0 0 8px">These files held no new data — everything in them was already imported (or the sheet was empty). Nothing was lost.</p>`
         : "");
 
@@ -1304,7 +1645,7 @@ function wdReportImportResult(r) {
     ? `<div style="background:var(--amber-soft);border-left:3px solid #b97a08;padding:10px 12px;border-radius:8px;margin:12px 0 4px;font-size:13.5px">
         <strong>One more step:</strong> ${need.join(", ")} from Workday still need${(ug + uc + uw) === 1 ? "s" : ""} matching to this app.
         Close this and use the highlighted card at the top of the Dashboard.</div>`
-    : (good.length && !bad.length
+    : (good.length && !bad.length && !stale.length
         ? `<p class="sub" style="margin:12px 0 0">Everything matched up — nothing else to do.</p>` : "");
 
   const conflicts = r.budget_conflicts || [];
@@ -1326,7 +1667,7 @@ function wdReportImportResult(r) {
 
   const title = bad.length
     ? (anythingNew ? "Import finished — with some problems" : "Import couldn't read your file")
-    : "Import complete";
+    : (stale.length ? (anythingNew ? "Import finished — one file held back" : "Held back — needs your OK") : "Import complete");
 
   modal(`
     <h2>${anythingNew ? "✓ " : ""}${title}</h2>
@@ -1334,8 +1675,19 @@ function wdReportImportResult(r) {
     ${conflictHtml}
     ${needHtml}
     ${errHtml}
-    <div class="actions"><button class="btn" id="m-cancel">Done</button></div>`,
-    (el, close) => { $("#m-cancel", el).onclick = close; });
+    ${wdStaleHtml(stale)}
+    <div class="actions">
+      ${stale.length ? `<button class="btn secondary" id="m-skip" style="margin-right:auto">Leave ${stale.length === 1 ? "it" : "them"} out</button>
+        <button class="btn danger" id="m-go">Import anyway</button>` : ""}
+      <button class="btn ${stale.length ? "secondary" : ""}" id="m-cancel">${stale.length ? "Decide later" : "Done"}</button>
+    </div>`,
+    (el, close) => {
+      $("#m-cancel", el).onclick = close;
+      if (stale.length) {
+        $("#m-skip", el).onclick = () => { close(); wdStaleRetry({ discard_stale: true }); };
+        $("#m-go", el).onclick = () => { close(); wdStaleRetry({ allow_stale: true }); };
+      }
+    });
 }
 
 async function wdImportFiles() {
@@ -1348,6 +1700,11 @@ async function wdImportFiles() {
 
 async function wdUploadFiles(fileList) {
   const all = [...fileList];
+  const pdfs = all.filter((f) => /\.pdf$/i.test(f.name));
+  if (pdfs.length) {
+    if (pdfs.length > 1 || all.length > pdfs.length) toast("Reading the first PDF now — import the other files afterwards.");
+    return wdPdfFlow(pdfs[0]);
+  }
   // Say which file is wrong and why, rather than silently dropping it.
   const wrong = all.filter((f) => !/\.xlsx$/i.test(f.name));
   const files = all.filter((f) => /\.xlsx$/i.test(f.name));
@@ -1440,9 +1797,9 @@ function wdSettingsModal() {
     </div>
 
     <h2 style="font-size:14px">Import exported files</h2>
-    <p class="sub" style="margin-bottom:8px">Pick one or more <code>.xlsx</code> files exported from Workday — select as many at once as you like (one per grant is fine).</p>
-    <div class="dropzone" id="wd-pick-zone" style="width:100%;box-sizing:border-box">📁 Choose files or drop them here<br><span style="font-size:12px;opacity:.75">you can select several at once</span></div>
-    <input type="file" id="wd-file-input" accept=".xlsx" multiple hidden>
+    <p class="sub" style="margin-bottom:8px">Pick <code>.xlsx</code> files exported from Workday (as many at once as you like, one per grant is fine) — or a <strong>PDF</strong> of the <em>Budget vs Actual</em> reports, including a scan of the printed pages. A PDF is read here on your computer, shown to you to check, and only then imported.</p>
+    <div class="dropzone" id="wd-pick-zone" style="width:100%;box-sizing:border-box">📁 Choose files or drop them here<br><span style="font-size:12px;opacity:.75">.xlsx (several at once) or one .pdf</span></div>
+    <input type="file" id="wd-file-input" accept=".xlsx,.pdf" multiple hidden>
     <p class="sub" style="margin:10px 0 6px;font-size:12px">Not sure which export to run, or whether yours has the right columns? ${EXAMPLE_LINK} — fake data in the exact format expected.</p>
     <p class="sub" style="margin:6px 0 0;font-size:12px">Already saved files into <code>workday_imports/</code> yourself? <button class="btn ghost small" id="wd-import-btn" style="padding:2px 8px">⟳ Import from that folder instead</button></p>
 
@@ -1761,7 +2118,10 @@ function wdCrossCheckCard() {
   const cById = (id) => S.categories.find((c) => c.id === id);
   const gmap = {}, cmap = {};
   for (const m of WD.mappings) (m.kind === "grant" ? gmap : cmap)[m.wd_key] = m.target_id;
-  const rows = WD.balances.map((b) => {
+  const rows = WD.balances.filter((b) => {
+    const g0 = gById(gmap[b.grant_code]);
+    return !(g0 && g0.status !== "active");   // closed grants are out of the totals
+  }).map((b) => {
     const gid = gmap[b.grant_code], cid = cmap[b.object_class];
     const g = gid ? gById(gid) : null, c = cid ? cById(cid) : null;
     // "New expenses" = entered here and not yet showing in the official
@@ -2037,6 +2397,7 @@ function renderInstructions() {
       <p><strong>2. Enable it as a web service.</strong> Edit the custom report → <strong>Advanced</strong> tab → tick <strong>Enable As Web Service</strong> → OK. If the report has prompts (Grant, Organization…), give them default values so it can run unattended.</p>
       <p><strong>3. Copy the URL.</strong> On the report: related actions (…) → <strong>Web Service</strong> → <strong>View URLs</strong> → right-click the <strong>CSV</strong> link → Copy link. It looks like <code>https://….workday.com/ccx/service/customreport2/…</code></p>
       <p><strong>4. Paste it here.</strong> Click <strong>⚙ Settings</strong> → open <strong>Advanced</strong> → paste the URL under <em>Direct connection (RaaS)</em>, enter your Workday username, Save. Then <strong>⇅ Workday → ⇣ Sync from Workday now</strong> and type your password — held in memory for this session only, never written to disk. Once a URL is saved, and only then, the app will offer to connect when it opens.</p>
+      <p><strong>A PDF of the reports (even a scan).</strong> In <strong>⇅ Workday → Import exported files</strong> you can choose a PDF holding Workday's <em>Budget vs Actual</em> pages (<em>RPT - Departmental Grant Budget vs Actual</em>, or <em>Project Budget vs Actual</em>) — for example the printed pages run through a scanner. The app reads the scanner's text layer on your own computer (nothing is uploaded anywhere), finds each grant's table, and checks every row with the report's own arithmetic (Budget − Commitment − Obligation − Actuals = Available) and its Total row. You then see each table next to the scanned page: fix anything highlighted and press <em>Recheck</em>. Pages that aren't budget tables (transaction details, your own ledger sheets) are skipped. Grants that aren't in the PDF are never touched. For each grant you choose whether to <em>bring your expense ledger in line with Workday</em> (added as dated adjustment rows — your own entries are never changed) and, when Workday's budget is higher than yours, whether to <em>raise your budget</em>. A backup is saved before anything is written. If a scan's text layer is poor the app says so and asks you to type the missing figures; a PDF with no text layer at all needs re-scanning with OCR (“searchable PDF”) or Workday's Export to Excel.</p>
       <p><strong>Transactions too (optional):</strong> the copied report gives balances only. For the individual charges, create a second custom report (<em>Create Custom Report</em> → Advanced) on a journal-lines data source filtered to your grants, including the columns <em>Accounting Date, Budget Date, Operational Transaction, Award, Grant, Worker, Supplier, Ledger Account, Transaction Amount, Object Class, Spend Category</em>; enable it as a web service the same way and paste its URL in the second field.</p>
       <p><strong>If the sync says the login was rejected, or that it got a login page back:</strong> your account is SSO-only and this route is closed. That is the expected outcome for most people — use the import steps above instead.</p>
       ${demo('advanced-settings', 'Where the optional settings live — ⚙ Settings → Advanced: the RaaS URLs, saved addresses and grant worktags.')}
@@ -2052,6 +2413,7 @@ function renderInstructions() {
     ${sec("📄 Data, backups & undo", `
       <p>Everything lives in one file: <code>GrantsApp/data/grants.db</code>. Older actuals were imported from scanned Workday DBRs; new actuals come from the ⇅ Workday panel.</p>
       <p><strong>Automatic backups.</strong> Every time the app starts, it saves a dated copy of your data into <code>GrantsApp/data/backups/</code> (one per day, kept for 30 days). You don't have to do anything. Under <strong>⚙ Settings → Backups &amp; data safety</strong> you can also <em>Download backup now</em> — do that before anything risky, and keep the file somewhere other than OneDrive. The same panel restores from a backup file if you ever need to roll back.</p>
+      <p><strong>Closing or deleting a grant.</strong> Open a grant and use <em>✓ Close grant</em> (marks it finished and moves it to the closed list, even if money is left) or <em>🗑 Delete grant</em> (removes it, its expenses and its budget — handy for a one-off event account you don't want to keep). Neither needs the balance to be zero, and a deleted grant that was linked to a Workday number is not re-created by later imports.</p>
       <p><strong>Undo.</strong> Deleting a grant, person, appointment, or expense no longer loses it immediately — it goes to <strong>⚙ Settings → 🗑 Recently deleted</strong> for 30 days. Restoring a grant brings back its expenses, budget lines, and appointments too. After 30 days it's cleared for good, so if a deletion was a mistake, restore it sooner rather than later.</p>
       <p style="border-left:3px solid #b97a08;padding-left:10px"><strong>⚠️ Important — OneDrive and this app.</strong> This folder is synced by OneDrive, which is great for having your data on other devices, but there's one real risk to know about: <strong>never run Grants Manager on two computers at the same time</strong>, and let OneDrive finish syncing (its icon stops spinning) before you open the app on a different machine. Databases don't merge like documents — if two copies are open at once, OneDrive can't combine them and will either overwrite one or leave a file named something like <em>"grants-DESKTOP-ABC123.db"</em> next to the real one. If you ever see a "conflicted copy" file appear, don't delete it: it may hold work that's missing from the main file — check both, or restore from a backup in ⚙ Settings.</p>
       ${demo('backups-undo', '⚙ Settings holds the backup download and the 30-day Recently deleted list.')}
@@ -2165,14 +2527,14 @@ function computeNotifications() {
     if (g.status !== "active") continue;
     const spent = grantSpent(g.id);
     const avail = grantAvailable(g.id);
-    if (g.initial_amount > 0 && avail < 0) {
+    if (grantFunds(g) > 0 && avail < 0) {
       out.push({ id: `over:${g.id}:${Math.round(spent)}`, level: "red",
                  text: `${g.name} is overspent by ${money(Math.abs(avail))}.`,
                  go: () => { view = { name: "grant", grantId: g.id }; render(); } });
-    } else if (g.initial_amount > 0 && spent / g.initial_amount >= 0.9) {
-      out.push({ id: `near:${g.id}:${Math.round(spent / g.initial_amount * 100)}`,
+    } else if (grantFunds(g) > 0 && spent / grantFunds(g) >= 0.9) {
+      out.push({ id: `near:${g.id}:${Math.round(spent / grantFunds(g) * 100)}`,
                  level: "amber",
-                 text: `${g.name}: ${Math.round(spent / g.initial_amount * 100)}% of the award is spent.`,
+                 text: `${g.name}: ${Math.round(spent / grantFunds(g) * 100)}% of the ${g.funded_to_date > 0 ? "money released so far" : "award"} is spent.`,
                  go: () => { view = { name: "grant", grantId: g.id }; render(); } });
     }
     // category overruns in the grant's current budget year
@@ -2205,7 +2567,7 @@ function computeNotifications() {
   // last month's expense report not sent yet
   const sent = (WD && WD.reports_sent) || {};
   const prev = prevMonthKey();
-  const hasPrev = S.expenses.some((e) => e.date.slice(0, 7) === prev);
+  const hasPrev = S.expenses.some((e) => e.date.slice(0, 7) === prev && e.source !== "dbr" && e.source !== "adjust");
   if (hasPrev && !sent[prev]) {
     out.push({ id: `report:${prev}`, level: "blue",
                text: `Expense report for ${monthLabel(prev)} hasn't been sent yet.`,
@@ -2411,8 +2773,9 @@ function renderCloseout() {
           <tr><td style="color:var(--muted)">Period</td><td>${g.start_date || "?"} → ${effectiveEnd(g) || "?"}${g.nce_end_date ? " (includes no-cost extension)" : ""}</td></tr>
           <tr><td style="color:var(--muted)">Activity recorded</td><td>${first ? `${first} → ${last}` : "no expenses recorded"}</td></tr>
           <tr><td style="color:var(--muted)">Total awarded</td><td><strong>${money2(g.initial_amount)}</strong></td></tr>
+          ${g.funded_to_date > 0 ? `<tr><td style="color:var(--muted)">Released so far</td><td><strong>${money2(g.funded_to_date)}</strong></td></tr>` : ""}
           <tr><td style="color:var(--muted)">Total spent</td><td><strong>${money2(spent)}</strong></td></tr>
-          <tr><td style="color:var(--muted)">Remaining</td><td><strong style="color:${avail < 0 ? "var(--red)" : "var(--green)"}">${money2(avail)}</strong>${g.initial_amount > 0 ? ` (${Math.round(spent / g.initial_amount * 100)}% used)` : ""}</td></tr>
+          <tr><td style="color:var(--muted)">Remaining</td><td><strong style="color:${avail < 0 ? "var(--red)" : "var(--green)"}">${money2(avail)}</strong>${grantFunds(g) > 0 ? ` (${Math.round(spent / grantFunds(g) * 100)}% used)` : ""}</td></tr>
           <tr><td style="color:var(--muted)">Report generated</td><td>${S.today}</td></tr>
         </tbody>
       </table>
@@ -2631,6 +2994,7 @@ function wireUp(m) {
 
   // people view
   if ($("#btn-add-person", m)) wirePeopleView(m);
+  wireAssign(m);
 
   // workday bits (dashboard cards, summary cross-check)
   wireWorkdayBits(m);
@@ -2641,6 +3005,11 @@ function wireUp(m) {
     view.includeClosed = closedToggle.checked;
     render();
   };
+
+  wireAssign(m);
+
+  const histEdit = $("#hist-edit", m);
+  if (histEdit) histEdit.onclick = (e) => { e.preventDefault(); view.histEdit = !view.histEdit; render(); };
 
   // hiring detail expander
   const hireStat = $("#hire-stat", m);
@@ -2901,7 +3270,7 @@ function wdSendExpenses(ids) {
 function fileToPayload(f) {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
-    r.onload = () => resolve({ name: f.name, data: r.result.split(",")[1] });
+    r.onload = () => resolve({ name: f.name, data: r.result.split(",")[1], modified: f.lastModified });
     r.onerror = reject;
     r.readAsDataURL(f);
   });
@@ -3103,6 +3472,8 @@ function wireGrantView(m) {
   const g = S.grants.find((x) => x.id === view.grantId);
 
   $("#btn-edit-grant", m).onclick = () => grantModal(g);
+  $("#btn-close-grant", m).onclick = () => closeGrantFlow(g);
+  $("#btn-delete-grant", m).onclick = () => deleteGrantFlow(g);
   $("#btn-closeout", m).onclick = () => {
     view = { name: "closeout", grantId: g.id };
     render();
@@ -3256,7 +3627,7 @@ function drawBurnChart(g) {
     return Math.round(cum);
   });
   // ideal straight line to full award
-  const ideal = months.map((_, i) => Math.round(g.initial_amount * (i + 1) / months.length));
+  const ideal = months.map((_, i) => Math.round(grantFunds(g) * (i + 1) / months.length));
   // projection from avg burn of last 6 active months
   const past = actual.filter((v) => v !== null);
   const recent = Object.entries(byMonth).filter(([mo]) => mo <= nowKey).slice(-6).map(([, v]) => v);
@@ -3289,6 +3660,36 @@ function drawBurnChart(g) {
       },
     },
   }));
+}
+
+/* "Assign to a grant…" buttons (People cards and the Summary list). */
+function wireAssign(m) {
+  $$("[data-fold-card]", m).forEach((b) => b.onclick = () => {
+    let all = {};
+    try { all = JSON.parse(store.getItem("gm-folded-cards") || "{}"); } catch { all = {}; }
+    all[b.dataset.foldCard] = all[b.dataset.foldCard] === 1 ? 0 : 1;
+    try { store.setItem("gm-folded-cards", JSON.stringify(all)); } catch { /* not remembered */ }
+    render();
+  });
+  $$("[data-assign-person]", m).forEach((b) => b.onclick = () => {
+    const pid = +b.dataset.assignPerson;
+    const ref = S.appointments.find((a) => a.id === +b.dataset.ref);
+    const share = +b.dataset.share;
+    const scale = share / (ref.pct || 100);
+    const fringeOnly = Math.max(0, ...S.appointments
+      .filter((a) => a.person_id === pid && a.fringe_only).map((a) => a.fringe_rate || 0));
+    apptModal(null, pid, {
+      grant_id: 0, pct: share,
+      start_date: `${b.dataset.from}-01`, end_date: monthEnd(b.dataset.to),
+      monthly_salary: Math.round(ref.monthly_salary * scale * 100) / 100,
+      fringe_rate: ref.fringe_rate || fringeOnly,
+      annual_tuition: Math.round((ref.annual_tuition || 0) * scale * 100) / 100,
+    });
+  });
+  $$("[data-edit-appt]", m).forEach((b) => b.onclick = () => {
+    const a = S.appointments.find((a) => a.id === +b.dataset.editAppt);
+    if (a) apptModal(a, a.person_id);
+  });
 }
 
 function wirePeopleView(m) {
@@ -3385,6 +3786,196 @@ function modal(html, onMount) {
   onMount($(".modal", root), close);
 }
 
+/* Close or delete a grant — fine even when it still has money on it (a
+   one-off event account). Closing keeps it on record as finished;
+   deleting removes it, its expenses and its budget, and sits in Settings →
+   Recently deleted for 30 days. */
+async function closeGrantFlow(g) {
+  const reopen = g.status === "closed";
+  const left = grantAvailable(g.id);
+  const msg = reopen
+    ? `Reopen "${g.name}"? It goes back to your active grants.`
+    : `Close "${g.name}"?` + (Math.abs(left) >= 0.005
+      ? ` It still shows ${money(left)} ${left < 0 ? "overspent" : "available"}. Closing keeps that on record — the grant moves to the closed list and drops out of every total (tick it on the Summary page's historic total to count it there).`
+      : " It moves to the closed list.");
+  if (!confirm(msg)) return;
+  try {
+    await api(`/api/grants/${g.id}`, "POST", { status: reopen ? "active" : "closed" });
+    toast(reopen ? "Grant reopened" : "Grant closed");
+    await reload();
+  } catch (e) { toast("Couldn't update the grant: " + e.message); }
+}
+
+async function deleteGrantFlow(g) {
+  const nExp = S.expenses.filter((e) => e.grant_id === g.id).length;
+  const left = grantAvailable(g.id);
+  const msg = `Delete "${g.name}" from your records?\n\n` +
+    `This removes the grant, its budget lines, ${nExp} expense${nExp === 1 ? "" : "s"} and its appointments` +
+    (Math.abs(left) >= 0.005 ? `, even though it still shows ${money(left)} ${left < 0 ? "overspent" : "available"}` : "") +
+    `.\n\nYou can bring it back for 30 days from Settings → Recently deleted.`;
+  if (!confirm(msg)) return;
+  try {
+    await api(`/api/grants/${g.id}`, "DELETE");
+    view = { name: "dashboard" };
+    toast(`Deleted "${g.name}"`);
+    await wdRefresh();
+    await reload();
+  } catch (e) { toast("Couldn't delete the grant: " + e.message); }
+}
+
+/* ---- Budget-vs-Actual PDF (usually a scan of the Workday report) ---- */
+const m2 = (n) => (n < 0 ? "-" : "") + "$" + Math.abs(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const PDF_COLS = [["budget", "Budget"], ["commitment", "Commitment"], ["obligation", "Obligation"],
+  ["actuals", "Actuals"], ["available", "Available"]];
+
+async function wdPdfFlow(file) {
+  toast("Reading the PDF…");
+  let r;
+  try { r = await api("/api/workday/pdf/preview", "POST", await fileToPayload(file)); }
+  catch (e) {
+    modal(`<h2>Couldn't read that PDF</h2><p class="sub" style="margin-bottom:6px">${esc(e.message)}</p>
+      <div class="actions"><button class="btn" id="m-cancel">Close</button></div>`,
+      (el, close) => { $("#m-cancel", el).onclick = close; });
+    return;
+  }
+  wdPdfReview({ reports: r.reports, file: r.file, pages: r.pages, skipped: r.skipped_pages, rec: {}, bud: {}, conf: {}, stale: {} });
+}
+
+function wdPdfClasses() {
+  const set = new Set();
+  (WD?.balances || []).forEach((b) => set.add(b.object_class));
+  (WD?.mappings || []).filter((m) => m.kind === "category").forEach((m) => set.add(m.wd_key));
+  return [...set].filter((x) => x && !x.startsWith("Project")).sort();
+}
+
+function wdPdfReview(st) {
+  const classes = wdPdfClasses();
+  const short = (oc) => String(oc || "").split(":").pop().trim();
+  const card = (r, i) => {
+    const p = r.plan || {};
+    const bad = r.problems.length > 0, hard = (r.blocking || []).length > 0;
+    const rowHtml = r.rows.map((row, j) => `<tr style="${row.problems?.length ? "background:var(--amber-soft)" : ""}">
+        <td style="min-width:170px">${row.object_class
+          ? `<span style="font-size:12.5px">${esc(short(row.object_class))}</span>${row.inferred ? ` <span class="sub" title="Matched to your earlier import by its budget figure">(matched)</span>` : ""}`
+          : `<select data-oc="${i}:${j}" style="max-width:190px"><option value="">Choose…</option>${classes.map((c) => `<option>${esc(c)}</option>`).join("")}</select>`}</td>
+        ${PDF_COLS.map(([k]) => `<td><input type="number" step="0.01" data-f="${i}:${j}:${k}" value="${row[k] ?? ""}"
+            style="width:126px;text-align:right;${row[k] == null ? "border-color:#b3261e;" : ""}${(row.calc || []).includes(k) ? "background:var(--blue-soft,#e8f0fe);" : ""}"
+            ${(row.calc || []).includes(k) ? `title="Filled in from the other figures on this row"` : ""}></td>`).join("")}
+      </tr>${row.problems?.length ? `<tr><td colspan="6" style="font-size:12px;color:#b3261e;padding-top:0">${row.problems.map(esc).join(" ")}${row.fix ? ` To balance, one of these would have to be: ${PDF_COLS.map(([k, n]) => `${n} ${m2(row.fix[k])}`).join(" · ")}.` : ""}</td></tr>` : ""}`).join("");
+    const rec = (p.reconcile || []);
+    const up = (p.budget_up || []), down = (p.budget_down || []);
+    const planHtml = p.pending
+      ? `<p class="sub" style="margin:8px 0 0">Fill in the highlighted figures (the scanned page is below), press “Recheck my edits”, and I'll show what this will change${p.grant_name ? ` in ${esc(p.grant_name)}` : ""}.</p>`
+      : !p.mapped
+      ? `<p class="sub" style="margin:8px 0 0">${esc(p.note || "")}</p>`
+      : p.driven ? `<p class="sub" style="margin:8px 0 0">${esc(p.note)}</p>`
+      : `<div style="margin-top:10px;font-size:13px;border-top:1px solid var(--border,#ddd);padding-top:8px">
+          <div>Updates <strong>${esc(p.grant_name)}</strong>
+            · counts <select data-scope="${i}" style="font-size:12.5px;width:auto;display:inline-block"><option value="all" ${p.scope === "all" ? "selected" : ""}>all budget years</option>${(p.years || []).map((y) => `<option value="${y}" ${p.scope === y ? "selected" : ""}>budget year ${y} only</option>`).join("")}</select></div>
+          ${rec.length
+            ? `<label style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><input type="checkbox" data-rec="${i}" style="width:auto;margin-top:3px" ${st.rec[i] === false ? "" : "checked"}>
+                <span>Bring my expense ledger in line with Workday: ${rec.map((x) => `${esc(x.category)} <strong>${x.delta > 0 ? "+" : ""}${m2(x.delta)}</strong>`).join(" · ")}<br><span class="sub">added as dated adjustment rows (${esc(r.as_of)}); nothing you entered is changed.</span></span></label>`
+            : `<div class="sub" style="margin-top:6px">✓ Your ledger already matches Workday's actuals.</div>`}
+          ${up.length
+            ? `<label style="display:flex;gap:8px;align-items:flex-start;margin-top:6px"><input type="checkbox" data-bud="${i}" style="width:auto;margin-top:3px" ${(st.bud[i] === undefined ? p.budget_default : st.bud[i]) ? "checked" : ""}>
+                <span>Raise my budget to Workday's: ${up.map((x) => `${esc(x.category)} <strong>+${m2(x.delta)}</strong>`).join(" · ")}</span></label>` : ""}
+          ${p.released ? (p.released.workday > p.released.yours + 0.005
+            ? `<div style="margin-top:6px">Released so far: <strong>${m2(p.released.yours)} → ${m2(p.released.workday)}</strong> (a new instalment).</div>`
+            : p.released.workday < p.released.yours - 0.005
+              ? `<div class="sub" style="margin-top:6px;color:#b3261e">Released so far stays at ${m2(p.released.yours)} — this report shows only ${m2(p.released.workday)}. Edit the grant if that is right.</div>`
+              : `<div class="sub" style="margin-top:6px">✓ Released so far (${m2(p.released.yours)}) matches the report.</div>`) : ""}
+          ${down.length ? `<div class="sub" style="margin-top:6px">Workday's budget is lower than yours for ${down.map((x) => esc(x.category)).join(", ")} — your figures are left alone.</div>` : ""}
+          ${(p.unmapped || []).length ? `<div style="margin-top:6px;color:#b3261e;font-size:12.5px">Not linked to one of your categories yet: ${p.unmapped.map(esc).join(", ")} — those rows are skipped for the ledger.</div>` : ""}
+        </div>`;
+    return `<div class="card" style="margin-bottom:12px;padding:14px">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:baseline">
+        <div><strong style="font-size:15px">${esc(r.code || "(unreadable grant number)")}</strong>
+          <span class="sub"> · page ${esc(String(r.page ?? "?"))} · ${r.kind === "project" ? "project report" : "grant report"} · as of ${esc(r.as_of || "?")}</span></div>
+        <span class="badge ${bad ? "amber" : "green"}">${bad ? (hard ? "needs your input" : "please check") : "✓ checked"}</span></div>
+      ${r.stale ? `<div style="background:var(--amber-soft);border-left:3px solid #b97a08;padding:9px 12px;border-radius:8px;margin-top:8px;font-size:13px">
+        <strong>⚠ This reaches back more than a month.</strong> ${esc(r.stale)}
+        <label style="display:flex;gap:8px;margin-top:6px"><input type="checkbox" data-stale="${i}" style="width:auto" ${st.stale[i] ? "checked" : ""}> I know — import it anyway</label></div>` : ""}
+      <div style="overflow-x:auto;margin-top:8px"><table style="min-width:760px"><thead><tr><th style="text-align:left">Category</th>${PDF_COLS.map(([, n]) => `<th class="num">${n}</th>`).join("")}</tr></thead><tbody>${rowHtml}</tbody></table></div>
+      ${r.problems.filter((x) => !x.startsWith("A row")).map((x) => `<p style="margin:6px 0 0;font-size:12.5px;color:#b3261e">${esc(x)}</p>`).join("")}
+      ${(r.warnings || []).map((x) => `<p class="sub" style="margin:6px 0 0">${esc(x)}</p>`).join("")}
+      ${(!r.code || !r.as_of) ? `<div style="margin-top:6px;display:flex;gap:10px;flex-wrap:wrap">
+        <label class="field" style="margin:0"><span>Grant number</span><input data-code="${i}" value="${esc(r.code || "")}" style="width:130px"></label>
+        <label class="field" style="margin:0"><span>Report date</span><input data-asof="${i}" type="date" value="${esc(r.as_of || "")}"></label></div>` : ""}
+      ${r.jpeg ? `<details style="margin-top:8px" ${bad ? "open" : ""}><summary style="cursor:pointer;font-size:13px">Show the scanned page to compare</summary><img src="${r.jpeg}" style="max-width:100%;margin-top:6px;border:1px solid var(--border,#ddd);border-radius:6px"></details>` : ""}
+      ${planHtml}
+      ${bad && !hard ? `<label style="display:flex;gap:8px;margin-top:8px;font-size:13px"><input type="checkbox" data-conf="${i}" style="width:auto" ${st.conf[i] ? "checked" : ""}> I've compared this with the page — import it as shown</label>` : ""}
+    </div>`;
+  };
+  modal(`
+    <h2>Import from PDF</h2>
+    <p class="sub" style="margin:-8px 0 12px">${esc(st.file)} · ${st.pages} pages · ${st.reports.length} budget report${st.reports.length === 1 ? "" : "s"} found${st.skipped ? ` (${st.skipped} other pages — transaction details and ledgers — skipped)` : ""}.
+      Every row below was checked against the report's own arithmetic. Fix anything highlighted, then import. Grants that aren't in this PDF are left exactly as they are.</p>
+    ${st.reports.map(card).join("")}
+    <div class="actions">
+      <button class="btn secondary" id="pdf-recheck">Recheck my edits</button>
+      <button class="btn secondary" id="m-cancel">Cancel</button>
+      <button class="btn" id="pdf-apply">Import</button>
+    </div>`, (el, close) => {
+    el.style.maxWidth = "1040px";
+    const strip = () => st.reports.map((r) => { const c = { ...r }; delete c.jpeg; return c; });
+    const recheck = async () => {
+      try {
+        const r = await api("/api/workday/pdf/check", "POST", { reports: strip() });
+        st.reports = r.reports.map((n, i) => ({ ...n, jpeg: st.reports[i].jpeg }));
+        close(); wdPdfReview(st);
+      } catch (e) { toast("Recheck failed: " + e.message); }
+    };
+    $("#m-cancel", el).onclick = close;
+    $("#pdf-recheck", el).onclick = recheck;
+    el.querySelectorAll("[data-f]").forEach((inp) => inp.onchange = () => {
+      const [i, j, k] = inp.dataset.f.split(":");
+      st.reports[+i].rows[+j][k] = inp.value === "" ? null : parseFloat(inp.value);
+    });
+    el.querySelectorAll("[data-oc]").forEach((sel) => sel.onchange = () => {
+      const [i, j] = sel.dataset.oc.split(":");
+      st.reports[+i].rows[+j].object_class = sel.value; recheck();
+    });
+    el.querySelectorAll("[data-scope]").forEach((sel) => sel.onchange = () => {
+      st.reports[+sel.dataset.scope].scope = sel.value === "all" ? "all" : parseInt(sel.value, 10); recheck();
+    });
+    el.querySelectorAll("[data-code]").forEach((inp) => inp.onchange = () => { st.reports[+inp.dataset.code].code = inp.value.trim(); recheck(); });
+    el.querySelectorAll("[data-asof]").forEach((inp) => inp.onchange = () => { st.reports[+inp.dataset.asof].as_of = inp.value; recheck(); });
+    el.querySelectorAll("[data-rec]").forEach((c) => c.onchange = () => { st.rec[+c.dataset.rec] = c.checked; });
+    el.querySelectorAll("[data-bud]").forEach((c) => c.onchange = () => { st.bud[+c.dataset.bud] = c.checked; });
+    el.querySelectorAll("[data-conf]").forEach((c) => c.onchange = () => { st.conf[+c.dataset.conf] = c.checked; });
+    el.querySelectorAll("[data-stale]").forEach((c) => c.onchange = () => { st.stale[+c.dataset.stale] = c.checked; });
+    $("#pdf-apply", el).onclick = async () => {
+      const choices = {};
+      const reports = strip().map((r, i) => {
+        choices[r.code] = { reconcile: st.rec[i] !== false, allow_stale: !!st.stale[i] };
+        if (st.bud[i] !== undefined) choices[r.code].budget = st.bud[i];
+        return { ...r, confirmed: !!st.conf[i] };
+      });
+      $("#pdf-apply", el).disabled = true;
+      try {
+        const res = await api("/api/workday/pdf/apply", "POST", { reports, choices });
+        close();
+        await wdRefresh(); await reload();
+        wdPdfDone(res);
+      } catch (e) { $("#pdf-apply", el).disabled = false; toast("Import failed: " + e.message); }
+    };
+  });
+}
+
+function wdPdfDone(res) {
+  const done = res.reports || [], skipped = res.skipped || [];
+  modal(`
+    <h2>${done.length ? "Imported from PDF" : "Nothing was imported"}</h2>
+    ${done.length ? `<ul style="margin:0 0 8px;padding-left:20px">${done.map((r) => `<li style="margin:4px 0"><strong>${esc(r.grant)}</strong> <span class="sub">(${esc(r.code)}, ${r.rows} row${r.rows === 1 ? "" : "s"})</span>
+        ${r.reconciled.length ? `<br><span class="sub">Ledger: ${r.reconciled.map(esc).join(" · ")}</span>` : ""}
+        ${r.budget.length ? `<br><span class="sub">Budget raised: ${r.budget.map(esc).join(" · ")}</span>` : ""}
+        ${r.released ? `<br><span class="sub">${esc(r.released)}</span>` : ""}</li>`).join("")}</ul>
+      <p class="sub" style="margin:0 0 8px">A copy of your data was saved first (Settings → backups). Anything you want undone can be edited like any other expense.</p>` : ""}
+    ${skipped.length ? `<h3 style="font-size:14px;margin:12px 0 6px;color:#b3261e">Not imported</h3>${skipped.map((x) => `<div style="border-left:3px solid #b3261e;padding:4px 0 4px 10px;margin-bottom:6px"><strong>${esc(x.code)}</strong><div class="sub">${esc(x.why)}</div></div>`).join("")}` : ""}
+    <div class="actions"><button class="btn" id="m-cancel">Close</button></div>`,
+    (el, close) => { $("#m-cancel", el).onclick = close; });
+}
+
 function grantModal(g, opts) {
   opts = opts || {};
   const pf = opts.prefill || {};
@@ -3396,6 +3987,7 @@ function grantModal(g, opts) {
       <label class="field"><span>Agency</span><input id="m-agency" value="${esc(g?.agency || pf.agency || "")}" placeholder="USDA, NSF, FFAR…"></label>
       <label class="field"><span>Total award ($)</span><input id="m-amount" type="number" step="0.01" value="${g?.initial_amount || pf.initial_amount || ""}"></label>
     </div>
+    <label class="field"><span>Released so far ($) — only if the award comes in instalments</span><input id="m-funded" type="number" step="0.01" value="${g?.funded_to_date || ""}" placeholder="leave blank when the whole award is available" title="Available is counted against this figure instead of the total award. Update it each time more money is released."></label>
     <div class="form-row">
       <label class="field"><span>Start date</span><input id="m-start" type="date" value="${g?.start_date || pf.start_date || ""}"></label>
       <label class="field"><span>End date</span><input id="m-end" type="date" value="${g?.end_date || pf.end_date || ""}"></label>
@@ -3417,13 +4009,7 @@ function grantModal(g, opts) {
       <button class="btn" id="m-save">${g ? "Save" : "Create"}</button>
     </div>`, (el, close) => {
     $("#m-cancel", el).onclick = close;
-    if (g) $("#m-del", el).onclick = async () => {
-      if (!confirm(`Delete "${g.name}" and ALL its budget lines and expenses? This cannot be undone.`)) return;
-      await api(`/api/grants/${g.id}`, "DELETE");
-      close(); view = { name: "dashboard" };
-      toast("Grant deleted");
-      await reload();
-    };
+    if (g) $("#m-del", el).onclick = () => { close(); deleteGrantFlow(g); };
     $("#m-save", el).onclick = async () => {
       const body = {
         name: $("#m-name", el).value.trim(), agency: $("#m-agency", el).value.trim(),
@@ -3431,8 +4017,13 @@ function grantModal(g, opts) {
         start_date: $("#m-start", el).value, end_date: $("#m-end", el).value,
         status: $("#m-status", el).value, notes: $("#m-notes", el).value,
         nce_end_date: $("#m-nce", el).value,
+        funded_to_date: parseFloat($("#m-funded", el).value) || 0,
         exclude_from_history: $("#m-hist", el).checked ? 1 : 0,
       };
+      // closing a grant takes it out of the historic total (tick it back in on
+      // the Summary page); reopening puts it back
+      if (g && body.status !== g.status) body.exclude_from_history = body.status === "closed" ? 1 : 0;
+      if (!g && body.status === "closed") body.exclude_from_history = 1;
       if (!body.name) { toast("Name is required"); return; }
       if (g) await api(`/api/grants/${g.id}`, "POST", body);
       else {
@@ -3579,8 +4170,9 @@ function personModal(p) {
     <h2>${p ? "Edit person" : "Add person"}</h2>
     <label class="field"><span>Name</span><input id="m-name" value="${esc(p?.name || "")}"></label>
     <label class="field"><span>Role</span><select id="m-role">
-      ${["GA", "Postdoc", "Program Associate", "Visiting Researcher", "Undergrad", "Technician", "Other"].map((r) =>
+      ${["GA", "Postdoc", "Program Associate", "Visiting Researcher", "UA", "Undergrad", "Technician", "Other"].map((r) =>
         `<option ${p?.role === r ? "selected" : ""}>${r}</option>`).join("")}</select></label>
+    <label class="field"><span>Needed until (optional) — shows funding still to be found after the last appointment ends</span><input id="m-planend" type="date" value="${p?.plan_end || ""}"></label>
     ${!p ? `
     <h2 style="margin-top:16px;font-size:14px">Funding (optional — creates the appointment${activeGrants.length > 1 ? "s" : ""})</h2>
     <div class="form-row">
@@ -3607,7 +4199,8 @@ function personModal(p) {
     </div>`, (el, close) => {
     $("#m-cancel", el).onclick = close;
     $("#m-save", el).onclick = async () => {
-      const body = { name: $("#m-name", el).value.trim(), role: $("#m-role", el).value };
+      const body = { name: $("#m-name", el).value.trim(), role: $("#m-role", el).value,
+                     plan_end: $("#m-planend", el).value };
       if (!body.name) { toast("Name is required"); return; }
       if (p) {
         await api(`/api/people/${p.id}`, "POST", body);
@@ -3648,22 +4241,28 @@ function personModal(p) {
   });
 }
 
-function apptModal(a, personId) {
+function apptModal(a, personId, prefill = null) {
   const p = S.people.find((x) => x.id === personId);
+  const d = a || prefill || {};   // `prefill` seeds a new appointment (assign flow)
+  const personName = p ? p.name : "This person";
   modal(`
     <h2>${a ? "Edit" : "New"} appointment — ${esc(p.name)}</h2>
-    <label class="field"><span>Grant</span><select id="m-grant">${S.grants.map((g) =>
-      `<option value="${g.id}" ${a?.grant_id === g.id ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select></label>
+    <label class="field"><span>Grant</span><select id="m-grant"><option value="0" ${d.grant_id === 0 ? "selected" : ""}>Unassigned — no grant yet</option>${S.grants.map((g) =>
+      `<option value="${g.id}" ${d.grant_id === g.id ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select></label>
     <div class="form-row">
-      <label class="field"><span>Annual salary charged to this grant ($/yr)</span><input id="m-sal" type="number" step="0.01" value="${a ? Math.round(a.monthly_salary * 12 * 100) / 100 : ""}" placeholder="e.g. 55000"></label>
-      <label class="field"><span>Fringe rate (%)</span><input id="m-fringe" type="number" step="0.01" value="${a?.fringe_rate ?? ""}" placeholder="e.g. 27.6"></label>
+      <label class="field"><span>Annual salary charged to this grant ($/yr)</span><input id="m-sal" type="number" step="0.01" value="${d.monthly_salary != null ? Math.round(d.monthly_salary * 12 * 100) / 100 : ""}" placeholder="e.g. 55000"></label>
+      <label class="field"><span>Fringe rate (%)</span><input id="m-fringe" type="number" step="0.01" value="${d.fringe_rate ?? ""}" placeholder="e.g. 27.6"></label>
     </div>
-    <label class="field"><span>Share of the person's total salary (%) — under 100 marks a split (e.g., rest paid by another source)</span><input id="m-pct" type="number" min="1" max="100" step="0.1" value="${a?.pct ?? 100}"></label>
+    <label class="field"><span>Share of the person's total salary (%) — under 100 marks a split (e.g., rest paid by another source)</span><input id="m-pct" type="number" min="1" max="100" step="0.1" value="${d.pct ?? 100}"></label>
     <div class="form-row">
-      <label class="field"><span>Start (length of appointment)</span><input id="m-start" type="date" value="${a?.start_date || ""}"></label>
-      <label class="field"><span>End</span><input id="m-end" type="date" value="${a?.end_date || ""}"></label>
+      <label class="field"><span>Start (length of appointment)</span><input id="m-start" type="date" value="${d.start_date || ""}"></label>
+      <label class="field"><span>End</span><input id="m-end" type="date" value="${d.end_date || ""}"></label>
     </div>
-    <label class="field"><span>Annual tuition ($/yr, used in projections)</span><input id="m-tuition" type="number" step="0.01" value="${a?.annual_tuition ?? ""}" placeholder="e.g. 8550 — leave 0 if covered elsewhere"></label>
+    <label class="field"><span>Annual tuition ($/yr, used in projections)</span><input id="m-tuition" type="number" step="0.01" value="${d.annual_tuition ?? ""}" placeholder="e.g. 8550 — leave 0 if covered elsewhere"></label>
+    <label class="field" style="display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="m-fonly" style="width:auto" ${d.fringe_only ? "checked" : ""}>
+      <span style="margin:0">Fringe only — this grant pays just the fringe on the salary entered above; another appointment pays the salary itself</span>
+    </label>
     <label class="field" style="display:flex;align-items:center;gap:8px">
       <input type="checkbox" id="m-auto" style="width:auto" ${a?.auto_charge ? "checked" : ""}>
       <span style="margin:0">Auto-generate monthly salary charges (leave off if actuals come from DBR imports)</span>
@@ -3686,14 +4285,33 @@ function apptModal(a, personId) {
         fringe_rate: parseFloat($("#m-fringe", el).value) || 0,
         annual_tuition: parseFloat($("#m-tuition", el).value) || 0,
         start_date: $("#m-start", el).value, end_date: $("#m-end", el).value,
+        fringe_only: $("#m-fonly", el).checked ? 1 : 0,
       };
       const p = fake.start_date && fake.end_date ? projectAppointment(fake) : null;
-      $("#m-proj", el).textContent = p
-        ? `Projection: ${p.months} months (${p.from} → ${p.to}, clamped to the grant's end) · ` +
-          `salary ${money(p.salary)} + fringe ${money(p.fringe)} + tuition ${money(p.tuition)} = ${money(p.total)} committed`
-        : "Projection: nothing left to project (already charged through the end, or dates missing).";
+      const g = S.grants.find((x) => x.id === fake.grant_id);
+      let msg = !fake.grant_id
+        ? "Unassigned: not counted against any grant until you pick one."
+        : p
+          ? `Projection: ${p.months} months (${p.from} → ${p.to}, clamped to the grant's end) · ` +
+            `salary ${money(p.salary)} + fringe ${money(p.fringe)} + tuition ${money(p.tuition)} = ${money(p.total)} committed`
+          : "Projection: nothing left to project (already charged through the end, or dates missing).";
+      let warn = "";
+      if (g && g.status === "active" && !isExternal(g)) {
+        // overspend check: the grant's projected balance with this appointment in
+        const after = grantProjection(g.id, fake, a ? a.id : null);
+        const short = [];
+        const bal = projectedBalance(g, after);
+        if (bal < -0.5) short.push(`the grant ends ${money(-bal)} over ${instalmentRest(g) ? "its full award" : "budget"}`);
+        else if (after.salaryProjected < -0.5 && !instalmentRest(g)) short.push(`the Personnel pot ends ${money(-after.salaryProjected)} short`);
+        if (short.length) warn = `<div style="color:var(--red);font-weight:600;margin-top:6px">⚠ With this, ${esc(g.name)}: ${short.join("; ")}. You can still save.</div>` +
+          `<div style="font-size:12px;color:var(--muted)">Projected balance ${money(bal)}.</div>`;
+        else warn = `<div style="color:var(--green);margin-top:6px;font-size:12.5px">${esc(g.name)} stays within budget: projected balance ${money(bal)}.</div>`;
+      }
+      const dbl = salaryOverlap(S.appointments.filter((x) => x.person_id === personId && x.id !== (a ? a.id : null)).concat([{ ...fake, pct: Math.min(100, Math.max(1, parseFloat($("#m-pct", el).value) || 100)) }]));
+      if (dbl.length) warn += `<div style="color:var(--red);font-weight:600;margin-top:6px">⚠ ${esc(personName)}'s salary would be counted more than once in ${dbl.map((o) => `${o.month} (${o.pct}%)`).slice(0, 3).join(", ")}. Shorten the other appointment (or lower this share) so they add up to 100%.</div>`;
+      $("#m-proj", el).innerHTML = esc(msg) + warn;
     };
-    ["m-grant", "m-sal", "m-fringe", "m-tuition", "m-start", "m-end"].forEach((id) => {
+    ["m-grant", "m-sal", "m-fringe", "m-tuition", "m-start", "m-end", "m-fonly", "m-pct"].forEach((id) => {
       $("#" + id, el).oninput = preview;
       $("#" + id, el).onchange = preview;
     });
@@ -3706,6 +4324,7 @@ function apptModal(a, personId) {
         fringe_rate: parseFloat($("#m-fringe", el).value) || 0,
         annual_tuition: parseFloat($("#m-tuition", el).value) || 0,
         auto_charge: $("#m-auto", el).checked ? 1 : 0,
+        fringe_only: $("#m-fonly", el).checked ? 1 : 0,
         pct: Math.min(100, Math.max(1, parseFloat($("#m-pct", el).value) || 100)),
         start_date: $("#m-start", el).value, end_date: $("#m-end", el).value,
       };
@@ -3848,7 +4467,7 @@ reload().then(async () => {
     // there is actually something to report.
     const prev = prevMonthKey();
     const due = !(WD.reports_sent || {})[prev] &&
-                S.expenses.some((e) => e.date.slice(0, 7) === prev);
+                S.expenses.some((e) => e.date.slice(0, 7) === prev && e.source !== "dbr" && e.source !== "adjust");
     if (due && !sstore.getItem("report-prompted-" + prev)) {
       sstore.setItem("report-prompted-" + prev, "1");
       setTimeout(() => {

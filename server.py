@@ -7,6 +7,7 @@ Run:  python3 server.py            (starts server, prints URL)
 If the server is already running, --launch just opens the browser.
 """
 import base64
+import difflib
 import ipaddress
 import json
 import math
@@ -21,6 +22,7 @@ import threading
 import time
 import uuid
 import webbrowser
+import zlib
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote
@@ -178,8 +180,21 @@ def db():
 MIGRATIONS = [  # (table, column, DDL type/default)
     ("grants", "exclude_from_history", "INTEGER DEFAULT 0"),
     ("grants", "nce_end_date", "TEXT DEFAULT ''"),
+    # money actually released so far on a grant that is funded in instalments
+    # (the award total stays the full figure); 0 = the whole award is available
+    ("grants", "funded_to_date", "REAL DEFAULT 0"),
+    # 1 = the People-tab appointments are the plan: payroll Workday still holds
+    # beyond them (people moved or leaving, not yet redistributed there) is
+    # treated as released in the projections
+    ("grants", "plan_basis", "INTEGER DEFAULT 0"),
+    # last day the person is expected to stay; months after the last
+    # appointment up to here show as "pending" funding on the People tab
+    ("people", "plan_end", "TEXT DEFAULT ''"),
     ("appointments", "annual_tuition", "REAL DEFAULT 0"),
     ("appointments", "auto_charge", "INTEGER DEFAULT 0"),
+    # 1 = this appointment carries only the fringe on a salary paid by another
+    # appointment (e.g. salary on one grant, its fringe on "Other")
+    ("appointments", "fringe_only", "INTEGER DEFAULT 0"),
     # share of the person's total salary carried by this appointment (%)
     ("appointments", "pct", "REAL DEFAULT 100"),
     # pay-period date of a Workday journal line (payroll month bucketing)
@@ -601,6 +616,8 @@ def generate_salaries(conn, through=None):
         if not grant:
             continue
         grant = dict(grant)
+        if grant.get("status") != "active":     # never book salary on a closed grant
+            continue
         for (y, m) in month_range(a_start, gen_end):
             mkey = f"{y:04d}-{m:02d}"
             first = date(y, m, 1)
@@ -619,7 +636,7 @@ def generate_salaries(conn, through=None):
             for cat_id, amt, label in (
                     (personnel_id, sal, "Salary"),
                     (fringe_id, fri, "Fringe")):
-                if amt <= 0:
+                if amt <= 0 or (a.get("fringe_only") and label == "Salary"):
                     continue
                 exists = conn.execute(
                     "SELECT 1 FROM expenses WHERE appointment_id=? AND "
@@ -1201,13 +1218,48 @@ def wd_example_workbook(path):
         ("Transactions", WD_DETAIL_COLUMNS, WD_EXAMPLE_DETAIL_ROWS)])
 
 
-def wd_ingest_file(conn, path):
+# An import may add to or correct the current month and the one before it
+# (a report for last month is normal). Anything older is history: it is held
+# back and shown to the person first, because a stale or wrongly picked report
+# would otherwise quietly rewrite figures that were settled long ago.
+STALE_MONTHS = 1
+
+
+def wd_month_floor(today=None):
+    """'YYYY-MM' of the oldest month an import may touch without asking."""
+    t = today or date.today()
+    n = t.year * 12 + (t.month - 1) - STALE_MONTHS
+    return "%04d-%02d" % (n // 12, n % 12 + 1)
+
+
+class WDStale(Exception):
+    """An import would change records more than a month back. `info` says what
+    and how many; nothing has been written."""
+
+    def __init__(self, info):
+        super().__init__(info.get("message", "stale import"))
+        self.info = info
+
+
+def _wd_has_history(conn):
+    return conn.execute(
+        "SELECT 1 WHERE EXISTS (SELECT 1 FROM workday_lines) OR EXISTS "
+        "(SELECT 1 FROM workday_balances) OR EXISTS (SELECT 1 FROM expenses "
+        "WHERE source IN ('workday','dbr'))").fetchone() is not None
+
+
+def wd_ingest_file(conn, path, allow_stale=False):
     """Parse one .xlsx export; returns ('detail'|'summary'|'unknown', rows)."""
     headers, rows = parse_xlsx(path)
-    return wd_ingest_rows(conn, headers, rows)
+    try:
+        file_date = date.fromtimestamp(os.path.getmtime(path)).isoformat()
+    except (OSError, ValueError, OverflowError):
+        file_date = None
+    return wd_ingest_rows(conn, headers, rows, allow_stale=allow_stale,
+                          file_date=file_date)
 
 
-def wd_ingest_csv(conn, text):
+def wd_ingest_csv(conn, text, allow_stale=False):
     """Parse a RaaS CSV response; returns ('detail'|'summary'|'unknown', rows)."""
     import csv
     import io
@@ -1217,7 +1269,24 @@ def wd_ingest_csv(conn, text):
     headers = [h.strip() for h in rdr[0]]
     rows = [{headers[i]: (r[i] if i < len(r) else "")
              for i in range(len(headers)) if headers[i]} for r in rdr[1:]]
-    return wd_ingest_rows(conn, headers, rows)
+    return wd_ingest_rows(conn, headers, rows, allow_stale=allow_stale,
+                          file_date=_wd_report_date(headers, rows))
+
+
+WD_REPORT_DATE_COLUMNS = ("as of date", "as of", "through date", "report date")
+
+
+def _wd_report_date(headers, rows):
+    """The date a balances report says it is as of, if it carries one (a
+    report built with a fixed 'As Of Date' prompt). A live report has no such
+    column and returns None: it is today's snapshot by construction."""
+    for h in headers:
+        if h.strip().lower() in WD_REPORT_DATE_COLUMNS:
+            days = [excel_date(r.get(h)) for r in rows]
+            days = [d for d in days if d]
+            if days:
+                return max(days)
+    return None
 
 
 def _wd_note_grant(conn, grant_full, award="", start="", end=""):
@@ -1246,12 +1315,19 @@ def _wd_note_grant(conn, grant_full, award="", start="", end=""):
         set_setting(conn, "wd_grant_info", info, commit=False)
 
 
-def wd_ingest_rows(conn, headers, rows):
-    """Ingest parsed report rows; returns ('detail'|'summary'|'unknown', count)."""
+def wd_ingest_rows(conn, headers, rows, allow_stale=False, file_date=None):
+    """Ingest parsed report rows; returns ('detail'|'summary'|'unknown', count).
+
+    Raises WDStale (having written nothing the caller can't roll back) when the
+    report would add transactions dated more than a month back, or replace
+    balances with an older snapshot than the one already held — unless
+    `allow_stale`. `file_date` is when the file was produced, if known."""
     import hashlib
     hset = set(headers)
+    floor = wd_month_floor()
+    history = _wd_has_history(conn)
     if {"Accounting Date", "Transaction Amount"} <= hset:
-        seen, new = {}, 0
+        seen, new, stale = {}, 0, []
         for r in rows:
             d = excel_date(r.get("Accounting Date"))
             bd = excel_date(r.get("Budget Date"))
@@ -1288,8 +1364,30 @@ def wd_ingest_rows(conn, headers, rows):
                  amount, str(r.get("Operational Transaction", "")).strip(),
                  datetime.now().isoformat(timespec="seconds")))
             new += cur.rowcount
+            if cur.rowcount and d[:7] < floor:
+                stale.append(d)
+        if stale and history and not allow_stale:
+            raise WDStale({
+                "kind": "detail", "count": len(stale),
+                "oldest": min(stale), "newest": max(stale), "floor": floor,
+                "message": "%d new transaction%s dated %s to %s — more than a "
+                           "month back." % (len(stale),
+                                            "" if len(stale) == 1 else "s",
+                                            min(stale), max(stale))})
         return "detail", new
     if {"Object Class", "Budget", "Available Balance"} <= hset:
+        if file_date and history and not allow_stale:
+            held = conn.execute("SELECT MAX(as_of) FROM workday_balances"
+                                ).fetchone()[0] or ""
+            if file_date < held or file_date[:7] < floor:
+                raise WDStale({
+                    "kind": "summary", "count": 0, "oldest": file_date,
+                    "newest": held, "floor": floor,
+                    "message": "this balances report was produced on %s%s — "
+                               "older than a month or than the figures you "
+                               "already have." % (
+                                   file_date, (" (you hold figures as of %s)"
+                                               % held) if held else "")})
         n = 0
         seen = {}   # grant code -> object classes this report carries
         for r in rows:
@@ -1316,7 +1414,8 @@ def wd_ingest_rows(conn, headers, rows):
                  str(r.get("Object Class", "")).strip(),
                  num("Budget"), num("Commitment"), num("Obligation"),
                  num("Actuals"), num("Available Balance"),
-                 date.today().isoformat()))
+                 min(file_date, date.today().isoformat()) if file_date
+                 else date.today().isoformat()))
             seen.setdefault(_wd_grant_code(grant_full), set()).add(
                 str(r.get("Object Class", "")).strip())
             n += 1
@@ -1444,6 +1543,18 @@ def wd_apply_balances(conn):
         if not g:
             continue
         total_budget = round(sum(b["budget"] or 0 for b in brows), 2)
+        if (g["funded_to_date"] or 0) > 0:
+            # released in instalments: the report's budget is what has been
+            # released so far; the award total and budget lines stay yours
+            if total_budget > g["funded_to_date"] + 0.005:
+                conn.execute("UPDATE grants SET funded_to_date=? WHERE id=?",
+                             (total_budget, gid))
+                out["updated"] += 1
+            elif total_budget < g["funded_to_date"] - 0.005:
+                out["conflicts"].append({"grant": g["name"] + " (released so far)",
+                                         "yours": g["funded_to_date"],
+                                         "workday": total_budget})
+            continue
         mine = g["initial_amount"] or 0
         has_lines = conn.execute("SELECT 1 FROM budget_lines WHERE grant_id=? "
                                  "LIMIT 1", (gid,)).fetchone() is not None
@@ -1646,12 +1757,26 @@ def wd_save_uploaded(payload):
     path = os.path.join(WD_IMPORT_DIR, f"{stamp}_{fname}")
     with open(path, "wb") as f:
         f.write(raw)
+    # Keep the file's own date: how old a report is matters to the import's
+    # "more than a month back" check, not when it was uploaded.
+    try:
+        t = float(payload.get("modified")) / 1000.0
+        if 946684800 < t <= time.time():
+            os.utime(path, (t, t))
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
     return path
 
 
-def wd_import(conn):
-    """Scan the workday_imports folder, ingest every .xlsx, reconcile."""
+def wd_import(conn, allow_stale=False, discard_stale=False):
+    """Scan the workday_imports folder, ingest every .xlsx, reconcile.
+
+    A file that would change records more than a month back is left in the
+    folder and reported under "stale"; the caller re-runs with allow_stale to
+    take it anyway, or discard_stale to set it aside."""
     os.makedirs(WD_IMPORT_DIR, exist_ok=True)
+    if allow_stale:
+        make_backup(force=True)     # the person chose to reach into the past
     files, new_lines, balance_rows = [], 0, 0
     for name in sorted(os.listdir(WD_IMPORT_DIR)):
         if not name.lower().endswith(".xlsx") or name.startswith("~"):
@@ -1659,8 +1784,22 @@ def wd_import(conn):
         path = os.path.join(WD_IMPORT_DIR, name)
         conn.execute("SAVEPOINT wd_file")
         try:
-            kind, n = wd_ingest_file(conn, path)
+            kind, n = wd_ingest_file(conn, path, allow_stale=allow_stale)
             conn.execute("RELEASE wd_file")
+        except WDStale as e:
+            conn.execute("ROLLBACK TO wd_file")
+            conn.execute("RELEASE wd_file")
+            item = {"file": name, "kind": "stale", "rows": 0, "stale": e.info}
+            if discard_stale:
+                try:
+                    skip = os.path.join(WD_IMPORT_DIR, "skipped")
+                    os.makedirs(skip, exist_ok=True)
+                    os.replace(path, os.path.join(skip, name))
+                    item["kind"] = "skipped"
+                except OSError:
+                    pass
+            files.append(item)
+            continue
         except Exception as e:  # noqa: BLE001 — one bad file shouldn't stop the rest
             conn.execute("ROLLBACK TO wd_file")   # drop whatever it half-added
             conn.execute("RELEASE wd_file")
@@ -1678,6 +1817,14 @@ def wd_import(conn):
                 pass
             continue
         files.append({"file": name, "kind": kind, "rows": n})
+        # Done with it: set it aside so a later import can't read this older
+        # snapshot again and overwrite newer figures (e.g. from a PDF report).
+        try:
+            done = os.path.join(WD_IMPORT_DIR, "imported")
+            os.makedirs(done, exist_ok=True)
+            os.replace(path, os.path.join(done, name))
+        except OSError:
+            pass
         if kind == "detail":
             new_lines += n
         elif kind == "summary":
@@ -1691,8 +1838,1182 @@ def wd_import(conn):
                 "balance_rows": balance_rows,
                 "grants_created": link["created"],
                 "grants_matched": link["matched"],
-                "budget_conflicts": bal["conflicts"]})
+                "budget_conflicts": bal["conflicts"],
+                "stale": [{"file": f["file"], **f["stale"]}
+                          for f in files if f["kind"] == "stale"]})
     return res
+
+
+# ------------------------------------------------------ PDF text-layer reader
+#
+# Just enough PDF to read the text a scanner's OCR (or Workday itself) put in:
+# plain/Flate content streams, simple fonts and ToUnicode maps. Standard
+# library only; anything it cannot decode comes back as "no text" and the
+# importer says so plainly.
+
+PDF_MAX_BYTES = 60 * 1024 * 1024
+PDF_MAX_STREAM = 40 * 1024 * 1024
+
+# Helvetica advance widths (1/1000 em) for the characters that matter here;
+# anything else falls back to the digit width. Only used to find where a word
+# ENDS, so right-aligned number columns can be told apart.
+_PDF_HELV = {" ": 278, ".": 278, ",": 278, ":": 278, ";": 278, "/": 278, "\\": 278,
+         "|": 260, "!": 278, "'": 191, "i": 222, "j": 222, "l": 222, "I": 278,
+         "f": 278, "t": 278, "r": 333, "(": 333, ")": 333, "-": 333, "_": 556,
+         "m": 833, "w": 722, "M": 833, "W": 944, "$": 556, "%": 889}
+
+
+def _pdf_char_w(c):
+    if c in _PDF_HELV:
+        return _PDF_HELV[c]
+    if c.isupper():
+        return 667
+    return 556 if (c.isdigit() or c.islower()) else 556
+
+
+# ------------------------------------------------------------ PDF objects
+
+class _PdfFile:
+    def __init__(self, raw):
+        self.raw = raw
+        self.pos = {}
+        for m in re.finditer(rb"(?<![0-9])(\d+)[ \t\r\n]+(\d+)[ \t\r\n]+obj\b", raw):
+            self.pos[int(m.group(1))] = m.end()
+        self._cache = {}
+
+    def body(self, num):
+        """Raw bytes of object `num` up to (not including) its stream."""
+        if num in self._cache:
+            return self._cache[num]
+        start = self.pos.get(num)
+        if start is None:
+            return b""
+        end_obj = self.raw.find(b"endobj", start)
+        s = self.raw.find(b"stream", start, end_obj if end_obj > 0 else None)
+        end = s if s >= 0 else (end_obj if end_obj >= 0 else start)
+        out = self.raw[start:end]
+        self._cache[num] = out
+        return out
+
+    def stream(self, num):
+        start = self.pos.get(num)
+        if start is None:
+            return b""
+        d = self.body(num)
+        s = self.raw.find(b"stream", start + len(d))
+        if s < 0:
+            return b""
+        s += 6
+        if self.raw[s:s + 2] == b"\r\n":
+            s += 2
+        elif self.raw[s:s + 1] in (b"\n", b"\r"):
+            s += 1
+        e = self.raw.find(b"endstream", s)
+        data = self.raw[s:e] if e >= 0 else b""
+        if re.search(rb"/FlateDecode|/Fl\b", d):
+            try:
+                dobj = zlib.decompressobj()
+                data = dobj.decompress(data, PDF_MAX_STREAM)
+            except zlib.error:
+                return b""
+        elif re.search(rb"/(DCT|CCITT|JBIG2|JPX|LZW|ASCII85|RunLength)", d):
+            return b""
+        return data
+
+    def refs(self, blob):
+        return [int(x) for x in re.findall(rb"(\d+)\s+\d+\s+R", blob)]
+
+
+def _pdf_kids(pdf, num, out, seen):
+    if num in seen:
+        return
+    seen.add(num)
+    d = pdf.body(num)
+    if re.search(rb"/Type\s*/Pages\b", d) or (b"/Kids" in d and not re.search(rb"/Type\s*/Page\b", d)):
+        m = re.search(rb"/Kids\s*\[(.*?)\]", d, re.S)
+        for k in (pdf.refs(m.group(1)) if m else []):
+            _pdf_kids(pdf, k, out, seen)
+    else:
+        out.append(num)
+
+
+def _pdf_inherited(pdf, num, key, depth=0):
+    d = pdf.body(num)
+    m = re.search(key + rb"\s*(\[[^\]]*\]|\d+\s+\d+\s+R)", d)
+    if m:
+        return m.group(1), num
+    p = re.search(rb"/Parent\s+(\d+)\s+\d+\s+R", d)
+    if p and depth < 12:
+        return _pdf_inherited(pdf, int(p.group(1)), key, depth + 1)
+    return None, num
+
+
+def _pdf_res_blob(pdf, num, depth=0):
+    """Bytes holding the page's /Resources dictionary (own, referenced, or inherited)."""
+    d = pdf.body(num)
+    m = re.search(rb"/Resources\s*(\d+)\s+\d+\s+R", d)
+    if m:
+        return pdf.body(int(m.group(1)))
+    if re.search(rb"/Resources\s*<<", d):
+        return d
+    p = re.search(rb"/Parent\s+(\d+)\s+\d+\s+R", d)
+    if p and depth < 12:
+        return _pdf_res_blob(pdf, int(p.group(1)), depth + 1)
+    return b""
+
+
+def _pdf_fonts(pdf, page_num):
+    """name -> {'uni': dict|None, 'wide': bool} for the page's fonts."""
+    blob = _pdf_res_blob(pdf, page_num)
+    m = re.search(rb"/Font\s*(<<.*?>>|\d+\s+\d+\s+R)", blob, re.S)
+    if m:
+        blob = pdf.body(int(m.group(1).split()[0])) if m.group(1).endswith(b"R") else m.group(1)
+    out = {}
+    for name, ref in re.findall(rb"/([A-Za-z0-9_.+-]+)\s+(\d+)\s+\d+\s+R", blob):
+        fd = pdf.body(int(ref))
+        if b"/Font" not in fd and b"/Subtype" not in fd:
+            continue
+        info = {"uni": None, "wide": bool(re.search(rb"/Subtype\s*/Type0", fd))}
+        m = re.search(rb"/ToUnicode\s+(\d+)\s+\d+\s+R", fd)
+        if m:
+            info["uni"] = _pdf_tounicode(pdf.stream(int(m.group(1))))
+        out[name.decode("latin-1")] = info
+    return out
+
+
+def _pdf_tounicode(data):
+    cmap = {}
+    txt = data.decode("latin-1", "replace")
+
+    def u(h):
+        try:
+            return bytes.fromhex(h).decode("utf-16-be", "replace")
+        except ValueError:
+            return ""
+    for blk in re.findall(r"beginbfchar(.*?)endbfchar", txt, re.S):
+        for a, b in re.findall(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", blk):
+            cmap[int(a, 16)] = u(b)
+    for blk in re.findall(r"beginbfrange(.*?)endbfrange", txt, re.S):
+        for a, b, c in re.findall(
+                r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", blk):
+            base = u(c)
+            for i in range(int(a, 16), int(b, 16) + 1):
+                if base:
+                    cmap[i] = base[:-1] + chr(ord(base[-1]) + i - int(a, 16))
+    return cmap
+
+
+# ------------------------------------------------------ content streams
+
+_PDF_TOK = re.compile(
+    rb"\s*(?:(%[^\r\n]*)|(\()|(<<)|(>>)|<([0-9A-Fa-f\s]*)>|(\[)|(\])|"
+    rb"(/[^\s/\[\]()<>]*)|([+-]?(?:\d+\.?\d*|\.\d+))|([A-Za-z'\"*][A-Za-z0-9'\"*]*))")
+
+
+def _pdf_read_string(s, i):
+    depth, out = 1, bytearray()
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == 0x5C:  # backslash
+            i += 1
+            if i >= n:
+                break
+            e = s[i]
+            if e in b"nrtbf":
+                out.append({110: 10, 114: 13, 116: 9, 98: 8, 102: 12}[e])
+            elif 48 <= e <= 55:
+                j, v = i, 0
+                while j < n and j < i + 3 and 48 <= s[j] <= 55:
+                    v = v * 8 + s[j] - 48
+                    j += 1
+                out.append(v & 255)
+                i = j - 1
+            elif e in (10, 13):
+                if e == 13 and s[i + 1:i + 2] == b"\n":
+                    i += 1
+            else:
+                out.append(e)
+        elif c == 0x28:
+            depth += 1
+            out.append(c)
+        elif c == 0x29:
+            depth -= 1
+            if depth == 0:
+                return bytes(out), i + 1
+            out.append(c)
+        else:
+            out.append(c)
+        i += 1
+    return bytes(out), n
+
+
+def _pdf_mul(a, b):
+    return [a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3],
+            a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3],
+            a[4] * b[0] + a[5] * b[2] + b[4], a[4] * b[1] + a[5] * b[3] + b[5]]
+
+
+def _pdf_decode(bs, font):
+    if font and font["wide"]:
+        step = 2
+        codes = [int.from_bytes(bs[i:i + step], "big") for i in range(0, len(bs) - step + 1, step)]
+    else:
+        codes = list(bs)
+    uni = font["uni"] if font else None
+    if uni:
+        return "".join(uni.get(c, "") for c in codes)
+    if font and font["wide"]:
+        return ""           # two-byte font with no map: unreadable
+    return bytes(codes).decode("cp1252", "replace")
+
+
+def pdf_page_runs(pdf, page_num):
+    """[(x, y, text, size)] for one page, in PDF points (origin bottom-left)."""
+    fonts = _pdf_fonts(pdf, page_num)
+    d = pdf.body(page_num)
+    m = re.search(rb"/Contents\s*(\[[^\]]*\]|\d+\s+\d+\s+R)", d)
+    streams = pdf.refs(m.group(1)) if m else []
+    data = b"\n".join(pdf.stream(n) for n in streams)
+    runs, stack, ops = [], [], []
+    ctm, tm, tlm = [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0]
+    font, size, tc, tw, tz, tl, unreadable = None, 10.0, 0.0, 0.0, 1.0, 0.0, 0
+
+    def show(bs):
+        nonlocal tm
+        txt = _pdf_decode(bs, font)
+        if not txt:
+            return ""
+        t = _pdf_mul(tm, ctm)
+        runs.append((t[4], t[5], txt, size * abs(t[3] if t[3] else t[0])))
+        w = sum(_pdf_char_w(ch) for ch in txt) / 1000.0 * size + tc * len(txt) + tw * txt.count(" ")
+        tm = _pdf_mul([1, 0, 0, 1, w * tz, 0], tm)
+        return txt
+
+    i, n = 0, len(data)
+    while i < n:
+        m = _PDF_TOK.match(data, i)
+        if not m:
+            i += 1
+            continue
+        i = m.end()
+        g = m.groups()
+        if g[0] is not None:
+            continue
+        if g[1] is not None:
+            s, i = _pdf_read_string(data, i)
+            ops.append(s)
+        elif g[2] is not None or g[3] is not None:
+            continue
+        elif g[4] is not None:
+            h = re.sub(rb"\s", b"", g[4])
+            if len(h) % 2:
+                h += b"0"
+            ops.append(bytes.fromhex(h.decode()))
+        elif g[5] is not None:
+            ops.append("[")
+        elif g[6] is not None:
+            j = len(ops) - 1
+            while j >= 0 and ops[j] != "[":
+                j -= 1
+            arr = ops[j + 1:]
+            del ops[j:]
+            ops.append(("ARR", arr))
+        elif g[7] is not None:
+            ops.append(("NAME", g[7][1:].decode("latin-1")))
+        elif g[8] is not None:
+            ops.append(float(g[8]))
+        else:
+            op = g[9].decode()
+            try:
+                if op == "q":
+                    stack.append(list(ctm))
+                elif op == "Q" and stack:
+                    ctm = stack.pop()
+                elif op == "cm" and len(ops) >= 6:
+                    ctm = _pdf_mul([float(x) for x in ops[-6:]], ctm)
+                elif op == "BT":
+                    tm, tlm = [1, 0, 0, 1, 0, 0], [1, 0, 0, 1, 0, 0]
+                elif op == "Tf" and len(ops) >= 2:
+                    font = fonts.get(ops[-2][1]) if isinstance(ops[-2], tuple) else None
+                    size = float(ops[-1])
+                elif op == "Tc":
+                    tc = float(ops[-1])
+                elif op == "Tw":
+                    tw = float(ops[-1])
+                elif op == "Tz":
+                    tz = float(ops[-1]) / 100.0
+                elif op == "TL":
+                    tl = float(ops[-1])
+                elif op == "Tm" and len(ops) >= 6:
+                    tm = [float(x) for x in ops[-6:]]
+                    tlm = list(tm)
+                elif op in ("Td", "TD") and len(ops) >= 2:
+                    if op == "TD":
+                        tl = -float(ops[-1])
+                    tlm = _pdf_mul([1, 0, 0, 1, float(ops[-2]), float(ops[-1])], tlm)
+                    tm = list(tlm)
+                elif op == "T*":
+                    tlm = _pdf_mul([1, 0, 0, 1, 0, -tl], tlm)
+                    tm = list(tlm)
+                elif op == "Tj" and ops and isinstance(ops[-1], bytes):
+                    show(ops[-1])
+                elif op in ("'", '"') and ops and isinstance(ops[-1], bytes):
+                    tlm = _pdf_mul([1, 0, 0, 1, 0, -tl], tlm)
+                    tm = list(tlm)
+                    show(ops[-1])
+                elif op == "TJ" and ops and isinstance(ops[-1], tuple):
+                    buf = []
+                    t0 = _pdf_mul(tm, ctm)
+                    n0 = len(runs)
+                    for el in ops[-1][1]:
+                        if isinstance(el, bytes):
+                            buf.append(show(el))
+                        elif isinstance(el, float):
+                            tm = _pdf_mul([1, 0, 0, 1, -el / 1000.0 * size * tz, 0], tm)
+                            if el < -250:
+                                buf.append(" ")
+                    del runs[n0:]
+                    joined = "".join(buf)
+                    if joined.strip():
+                        runs.append((t0[4], t0[5], joined, size * abs(t0[3] if t0[3] else t0[0])))
+            except (ValueError, IndexError):
+                pass
+            ops = []
+    return runs
+
+
+def pdf_read_pages(raw):
+    """[{'w','h','runs'}] in reading order, or raises ValueError."""
+    if raw[:4] != b"%PDF":
+        raise ValueError("not a PDF")
+    pdf = _PdfFile(raw)
+    root = re.search(rb"/Root\s+(\d+)\s+\d+\s+R", raw)
+    pages_ref = None
+    if root:
+        m = re.search(rb"/Pages\s+(\d+)\s+\d+\s+R", pdf.body(int(root.group(1))))
+        pages_ref = int(m.group(1)) if m else None
+    leaves = []
+    if pages_ref:
+        _pdf_kids(pdf, pages_ref, leaves, set())
+    if not leaves:
+        leaves = [n for n in sorted(pdf.pos)
+                  if re.search(rb"/Type\s*/Page\b", pdf.body(n))]
+    out = []
+    for n in leaves:
+        mb, _ = _pdf_inherited(pdf, n, rb"/MediaBox")
+        w = h = 0
+        if mb:
+            v = [float(x) for x in re.findall(rb"[-\d.]+", mb)[:4]]
+            if len(v) == 4:
+                w, h = v[2] - v[0], v[3] - v[1]
+        out.append({"w": w, "h": h, "num": n, "runs": pdf_page_runs(pdf, n)})
+    return pdf, out
+
+
+def pdf_page_jpeg(pdf, page_num):
+    """Raw JPEG bytes of the scan drawn on a page, or None."""
+    blob = _pdf_res_blob(pdf, page_num)
+    m = re.search(rb"/XObject\s*(<<.*?>>|\d+\s+\d+\s+R)", blob, re.S)
+    if not m:
+        return None
+    x = m.group(1)
+    if x.endswith(b"R"):
+        x = pdf.body(int(x.split()[0]))
+    for ref in pdf.refs(x):
+        d = pdf.body(ref)
+        if b"/DCTDecode" in d and b"/Image" in d:
+            start = pdf.pos[ref]
+            s0 = pdf.raw.find(b"stream", start + len(d))
+            if s0 < 0:
+                continue
+            s0 += 6
+            if pdf.raw[s0:s0 + 2] == b"\r\n":
+                s0 += 2
+            elif pdf.raw[s0:s0 + 1] in (b"\n", b"\r"):
+                s0 += 1
+            e = pdf.raw.find(b"endstream", s0)
+            data = pdf.raw[s0:e].rstrip(b"\r\n")
+            if data[:2] == b"\xff\xd8":
+                return data
+    return None
+
+
+# ------------------------------------------------------------ the report
+
+PDF_COLS = ["budget", "commitment", "obligation", "actuals", "available"]
+_PDF_DIGITFIX = str.maketrans({"O": "0", "o": "0", "D": "0", "Q": "0", "l": "1", "I": "1",
+                           "|": "1", "i": "1", "S": "5", "s": "5", "B": "8", "Z": "2"})
+
+
+def _pdf_words(runs):
+    """Runs -> [dict(x0,x1,y,size,t)] one per whitespace-separated word."""
+    out = []
+    for x, y, txt, sz in runs:
+        pos = 0.0
+        for m in re.finditer(r"\S+", txt):
+            pre = sum(_pdf_char_w(c) for c in txt[:m.start()]) / 1000.0 * sz
+            w = sum(_pdf_char_w(c) for c in m.group()) / 1000.0 * sz
+            out.append({"x0": x + pre, "x1": x + pre + w, "y": y, "size": sz,
+                        "t": m.group()})
+    return out
+
+
+def _pdf_money(t):
+    """'3.000.00' / "'10,515.68" / '(1,969.40)' / '0_00' -> float, else None."""
+    s = t.strip().replace("'", "").replace("`", "").replace("’", "")
+    neg = s.startswith("(") or s.startswith("-") or s.endswith(")")
+    s = s.strip("()-$ ")
+    if not s or not re.fullmatch(r"[0-9OolIDSB|][0-9OolIDSB|,._ ]*", s):
+        return None
+    s = s.translate(_PDF_DIGITFIX)
+    m = re.fullmatch(r"(\d[\d,._ ]*)[.,_](\d\d)", s)
+    if m:
+        whole = re.sub(r"\D", "", m.group(1))
+        v = int(whole or "0") + int(m.group(2)) / 100.0
+    elif s == "0":          # a bare digit other than 0 is a clipped number, not a figure
+        v = 0.0
+    else:
+        return None
+    return -v if neg else v
+
+
+def _pdf_fuzzy(word, target, cut=0.72):
+    return difflib.SequenceMatcher(None, re.sub(r"[^a-z]", "", word.lower()), target).ratio() >= cut
+
+
+def _pdf_lines(words, tol=3.5):
+    """Group words into text lines by y."""
+    rows = []
+    for w in sorted(words, key=lambda w: -w["y"]):
+        for r in rows:
+            if abs(r["y"] - w["y"]) <= tol:
+                r["w"].append(w)
+                break
+        else:
+            rows.append({"y": w["y"], "w": [w]})
+    for r in rows:
+        r["w"].sort(key=lambda w: w["x0"])
+        r["text"] = " ".join(w["t"] for w in r["w"])
+    return rows
+
+
+def _pdf_month_end(y, m):
+    nxt = date(y + (m == 12), m % 12 + 1, 1)
+    return (nxt - timedelta(days=1)).isoformat()
+
+
+_PDF_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+
+
+def _pdf_period(text):
+    """'FY 2026-2027 -Sep' (UA fiscal year runs Jul-Jun) -> '2026-09-30'."""
+    m = re.search(r"FY\s*(\d{4})\s*[-–]\s*(\d{4})\s*[-–]?\s*([A-Za-z]{3})", text)
+    if not m:
+        return ""
+    mon = m.group(3).lower()
+    best = difflib.get_close_matches(mon, _PDF_MONTHS, n=1, cutoff=0.6)
+    if not best:
+        return ""
+    mi = _PDF_MONTHS.index(best[0]) + 1
+    y1, y2 = int(m.group(1)), int(m.group(2))
+    return _pdf_month_end(y1 if mi >= 7 else y2, mi)
+
+
+def _pdf_norm_code(t, prefix):
+    s = re.sub(r"[^0-9A-Za-z]", "", t)
+    if len(s) < 7:
+        return ""
+    head, tail = s[:2].upper(), s[2:].translate(_PDF_DIGITFIX)
+    if head == prefix and re.fullmatch(r"\d{5,6}", tail):
+        return head + tail
+    return ""
+
+
+def pdf_parse_page(page):
+    """One page -> report dict, or None if it is not a budget-vs-actual summary."""
+    words = _pdf_words(page["runs"])
+    if not words:
+        return None
+    lines = _pdf_lines(words)
+    alltext = " ".join(l["text"] for l in lines)
+    low = alltext.lower()
+    is_proj = "funding" in low and "project" in low
+    heads = [w for w in words if _pdf_fuzzy(w["t"], "budget") or _pdf_fuzzy(w["t"], "commitment")
+             or _pdf_fuzzy(w["t"], "obligation") or _pdf_fuzzy(w["t"], "actuals")
+             or _pdf_fuzzy(w["t"], "available")]
+    hit = {h for w in heads for h in PDF_COLS if _pdf_fuzzy(w["t"], h)}
+    detail = ("details" in low and "view" in low) or ("transaction" in low and "journal" in low)
+    grantish = ("departmental" in low or "grant budget" in low or "budget vs actual" in low
+                or "budget vs" in low)
+    if detail or not (is_proj or (grantish and len(hit) >= 3)):
+        return None
+    rep = {"kind": "project" if is_proj else "grant", "problems": [], "rows": [],
+           "total": None, "code": "", "award": "", "grant_name": "", "as_of": _pdf_period(alltext)}
+    if not rep["as_of"]:
+        rep["problems"].append("Could not read the report period (FY … - Month).")
+    # --- grant / project code: majority vote over every token that looks like one
+    votes = {}
+    for w in words:
+        c = _pdf_norm_code(w["t"], "PR" if is_proj else "GR")
+        if c:
+            votes[c] = votes.get(c, 0) + 1
+    if votes:
+        rep["code"] = max(votes, key=votes.get)
+    else:
+        rep["problems"].append("Could not read the grant number.")
+    for w in words:
+        m = re.fullmatch(r"AWD[-_ ]?([0-9OolI]{6})\W*", w["t"])
+        if m:
+            rep["award"] = "AWD-" + m.group(1).translate(_PDF_DIGITFIX)
+            break
+    # friendly name = the "Grant:" line after the code
+    for l in lines:
+        if rep["code"] and rep["code"] in l["text"].replace("O", "0") and ":" in l["text"][:12]:
+            rep["grant_name"] = re.sub(r"\s+", " ", l["text"].split(":")[-1]).strip()
+            break
+    if is_proj:
+        return _pdf_parse_project(rep, lines)
+    # --- column positions from the header words
+    hdr = {}
+    for h in PDF_COLS:
+        c = [w for w in heads if _pdf_fuzzy(w["t"], h)]
+        if c:
+            hdr[h] = c
+    ys = sorted(w["y"] for ws in hdr.values() for w in ws)
+    ymed = ys[len(ys) // 2]
+    colx = {}
+    for h, ws in hdr.items():
+        w = min(ws, key=lambda w: abs(w["y"] - ymed))
+        if abs(w["y"] - ymed) < 14:
+            colx[h] = (w["x0"] + w["x1"]) / 2
+    top = ymed - 8
+    # --- money tokens inside the table
+    cand = [w for w in words if w["y"] < top and w["y"] > 60]
+    cand.sort(key=lambda w: (-round(w["y"]), w["x0"]))
+    merged = []
+    for w in sorted(cand, key=lambda w: (-w["y"], w["x0"])):
+        if merged and abs(merged[-1]["y"] - w["y"]) < 2.0 and w["x0"] - merged[-1]["x1"] < 3.0 \
+                and _pdf_money(merged[-1]["t"] + w["t"]) is not None \
+                and re.search(r"\d", w["t"]) and re.fullmatch(r"[\d.,_'OolI|]+", w["t"]):
+            p = merged[-1]
+            merged[-1] = {"x0": p["x0"], "x1": w["x1"], "y": p["y"], "size": p["size"],
+                          "t": p["t"] + w["t"]}
+        else:
+            merged.append(dict(w))
+    xmin = min(colx.values()) - 60 if colx else 0
+    money = [(w, _pdf_money(w["t"])) for w in merged if w["x1"] > xmin]
+    money = [(w, v) for w, v in money if v is not None]
+    # --- labels
+    labels = []
+    objx = [w["x0"] for w in words if _pdf_fuzzy(w["t"], "object")]
+    lx0 = (min(objx) - 15) if objx else (xmin - 140)
+    lx1 = (min(colx.values()) - 20) if colx else xmin
+    lw = [w for w in words if lx0 <= w["x0"] <= lx1 and top > w["y"] > 60]
+    lw.sort(key=lambda w: (-w["y"], w["x0"]))
+    i = 0
+    while i < len(lw):
+        w = lw[i]
+        t = w["t"]
+        if re.fullmatch(r"[0-9OolI]", t) and i + 1 < len(lw) and abs(lw[i + 1]["y"] - w["y"]) < 2 \
+                and lw[i + 1]["x0"] - w["x1"] < 4:
+            t = t + lw[i + 1]["t"]
+            i += 1
+        m = re.fullmatch(r"([0-9OolI]{2})[_\-.]?([A-Za-z].*)?", t)
+        if m and (m.group(2) or re.fullmatch(r"\d\d", m.group(1))) and len(t) >= 2 and not re.fullmatch(r"\d\d", t):
+            nn = m.group(1).translate(_PDF_DIGITFIX)
+            labels.append({"nn": nn, "y": w["y"], "x0": w["x0"], "text": m.group(2) or ""})
+        i += 1
+    for lb in labels:   # add the words of the same / following lines up to the next label
+        ext = [w["t"] for w in lw if lb["x0"] - 2 <= w["x0"] and 0 <= lb["y"] - w["y"] < 18
+               and w["x0"] > lb["x0"]]
+        lb["text"] = (lb["text"] + " " + " ".join(ext)).strip()
+    # --- rows = y-clusters of money
+    clus = []
+    for w, v in sorted(money, key=lambda t: -t[0]["y"]):
+        for c in clus:
+            if abs(c["y"] - w["y"]) <= 3.5:
+                c["m"].append((w, v))
+                break
+        else:
+            clus.append({"y": w["y"], "m": [(w, v)]})
+
+    # Numbers are right-aligned under centred headings: find the one offset that
+    # best lines the page's numbers up with the five heading centres.
+    def assign(off):
+        cost, m = 0.0, {}
+        for w, v in money:
+            k, d = min(((h, abs(cx + off - w["x1"])) for h, cx in colx.items()),
+                       key=lambda kv: kv[1])
+            cost += d
+            m[id(w)] = k
+        return cost, m
+    colmap = {}
+    if len(colx) >= 4 and money:
+        best = min((assign(o) for o in range(0, 60)), key=lambda t: t[0])
+        colmap = best[1]
+
+    def colof2(w):
+        return colmap.get(id(w))
+    totw = [w for w in words if _pdf_fuzzy(w["t"], "total", 0.6) and w["x0"] < xmin and w["y"] < top]
+    rows = []
+    for c in clus:
+        vals = {}
+        for w, v in c["m"]:
+            k = colof2(w)
+            if k and k not in vals:
+                vals[k] = v
+        is_total = any(abs(t["y"] - c["y"]) < 6 for t in totw)
+        rows.append({"y": c["y"], "vals": vals, "total": is_total})
+    # attach labels
+    used = set()
+    for lb in labels:
+        best = None
+        for idx, r in enumerate(rows):
+            if r["total"] or idx in used:
+                continue
+            d = r["y"] - lb["y"]
+            if -4 <= d <= 60 and (best is None or d < best[0]):
+                best = (d, idx)
+        if best:
+            rows[best[1]]["label"] = lb
+            used.add(best[1])
+        else:
+            rows.append({"y": lb["y"], "vals": {}, "total": False, "label": lb})
+    rows.sort(key=lambda r: -r["y"])
+    for r in rows:
+        if r["total"]:
+            rep["total"] = {k: r["vals"].get(k) for k in PDF_COLS}
+            continue
+        lb = r.get("label")
+        rep["rows"].append({"nn": lb["nn"] if lb else "", "label": lb["text"] if lb else "",
+                            **{k: r["vals"].get(k) for k in PDF_COLS}})
+    return rep
+
+
+def _pdf_parse_project(rep, lines):
+    """'Project Budget vs Actual with Funding Sources': the 'Expense' line holds
+    Budget, Commitment, Obligation, Actuals, Remaining in that order."""
+    for want in ("expense", "total expenses"):
+        for l in lines:
+            first = " ".join(w["t"] for w in l["w"][:2]).lower()
+            if want == "expense" and not _pdf_fuzzy(l["w"][0]["t"], "expense", 0.8):
+                continue
+            if want == "total expenses" and not re.search(r"total\s*expenses", l["text"], re.I):
+                continue
+            nums = [_pdf_money(w["t"]) for w in l["w"][1:]]
+            nums = [v for v in nums if v is not None]
+            if len(nums) == 5:
+                rep["rows"].append({"nn": "", "label": "Expenses",
+                                    **dict(zip(PDF_COLS, nums))})
+                return rep
+    rep["rows"].append({"nn": "", "label": "Expenses", **{k: None for k in PDF_COLS}})
+    return rep
+
+
+# ------------------------------------------- Budget-vs-Actual PDF import
+#
+# The "RPT - Departmental Grant Budget vs Actual" page, as a PDF — usually a
+# paper copy run through a scanner. The scanner's text layer is read directly
+# (no OCR engine, nothing installed): words come with positions, rows and
+# columns are rebuilt from those, and every row is then checked with the
+# report's own arithmetic. Anything that does not add up is shown next to the
+# scanned page for the person to fix before anything is written.
+
+WD_OC_PREFIX = "UA System Sponsored Programs: "
+WD_OC_DEFAULT = {
+    "01": "01_Personnel", "03": "03_Fringe Benefits", "06": "06_Tuition",
+    "07": "07_Foreign Travel", "08": "08_Domestic Travel", "09": "09_Equipment",
+    "10": "10_Materials and Supplies", "12": "12_Publication Costs",
+    "17": "17_Other Direct Costs", "18": "18_Facilities and Administration"}
+PDF_PROJECT_CLASS = "Project: Expenses"
+PDF_SIGN = {"budget": 1, "commitment": -1, "obligation": -1, "actuals": -1,
+            "available": -1}
+PDF_MAX_PAGES = 400
+
+
+def _pdf_num(v):
+    if v is None or v == "":
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(x) or math.isinf(x) or abs(x) > 1e10:
+        return None
+    return round(x, 2)
+
+
+def wd_pdf_known_classes(conn):
+    """Two-digit object-class number -> the full key this install already uses
+    (e.g. '03' -> 'UA System Sponsored Programs: 03_Fringe Benefits')."""
+    keys = {r[0] for r in conn.execute(
+        "SELECT object_class FROM workday_balances UNION "
+        "SELECT wd_key FROM workday_map WHERE kind='category' UNION "
+        "SELECT object_class FROM workday_lines")}
+    out = {}
+    for k in sorted(x for x in keys if x):
+        m = re.search(r":\s*(\d\d)_", k)
+        if m:
+            out.setdefault(m.group(1), k)
+    return out
+
+
+def _wd_pdf_class_for(known, nn, label):
+    if nn in known:
+        return known[nn]
+    if nn in WD_OC_DEFAULT:
+        return WD_OC_PREFIX + WD_OC_DEFAULT[nn]
+    clean = re.sub(r"[^A-Za-z &/-]", "", label or "").strip()
+    return WD_OC_PREFIX + nn + "_" + (clean or "Other")
+
+
+def wd_pdf_check(conn, rep):
+    """Validate one parsed (or hand-corrected) report. Never writes.
+
+    Returns the report with: rows normalised, blanks solved where the row's own
+    arithmetic allows, `problems` (anything that needs a person), `blocking`
+    (the subset that must be fixed before import), `warnings`, `ok`, and the
+    `plan` of what an import would change."""
+    kind = "project" if rep.get("kind") == "project" else "grant"
+    code = re.sub(r"[^A-Za-z0-9]", "", str(rep.get("code") or "")).upper()
+    as_of = str(rep.get("as_of") or "")
+    # the page number and the scan picture come back from the browser: keep
+    # only an integer and a JPEG data URL, nothing else is ever echoed
+    page_no = rep.get("page")
+    page_no = page_no if isinstance(page_no, int) and not isinstance(page_no, bool) else None
+    jpeg = rep.get("jpeg")
+    if not (isinstance(jpeg, str) and re.fullmatch(r"data:image/jpeg;base64,[A-Za-z0-9+/=]*", jpeg)):
+        jpeg = None
+    out = {"page": page_no, "kind": kind, "code": code,
+           "award": str(rep.get("award") or "")[:40],
+           "grant_name": str(rep.get("grant_name") or "")[:200],
+           "as_of": as_of, "scope": rep.get("scope") if rep.get("scope") == "all" or (
+               isinstance(rep.get("scope"), int) and not isinstance(rep.get("scope"), bool)) else None,
+           "jpeg": jpeg,
+           "confirmed": bool(rep.get("confirmed"))}
+    problems, blocking, warnings = [], [], []
+
+    def bad(msg, hard=True):
+        problems.append(msg)
+        if hard:
+            blocking.append(msg)
+
+    if not re.fullmatch(r"(?:GR|PR)\d{5,6}", code):
+        bad("The grant number is missing or unreadable — type it in "
+            "(like GR012345).")
+    try:
+        datetime.strptime(as_of, "%Y-%m-%d")
+    except ValueError:
+        bad("The report date is missing — enter the last day of the report "
+            "month (YYYY-MM-DD).")
+    known = wd_pdf_known_classes(conn)
+    existing = {r["object_class"]: r for r in conn.execute(
+        "SELECT * FROM workday_balances WHERE grant_code=?", (code,))}
+    rows = []
+    for r in (rep.get("rows") or [])[:60]:
+        row = {"nn": re.sub(r"\D", "", str(r.get("nn") or ""))[:2],
+               "label": str(r.get("label") or "")[:60],
+               "object_class": str(r.get("object_class") or "").strip()[:120],
+               "inferred": bool(r.get("inferred"))}
+        for k in PDF_COLS:
+            row[k] = _pdf_num(r.get(k))
+        rows.append(row)
+    for row in rows:
+        if kind == "project":
+            row["object_class"] = PDF_PROJECT_CLASS
+        elif not row["object_class"] and row["nn"]:
+            row["object_class"] = _wd_pdf_class_for(known, row["nn"], row["label"])
+    taken = {x["object_class"] for x in rows if x["object_class"]}
+    for row in rows:      # a row with no readable label: match by its budget
+        if not row["object_class"] and row["budget"] is not None:
+            cand = [oc for oc, b in existing.items()
+                    if oc not in taken and abs((b["budget"] or 0) - row["budget"]) < 0.005]
+            if len(cand) == 1:
+                row["object_class"] = cand[0]
+                row["inferred"] = True
+                taken.add(cand[0])
+    seen = {}
+    for row in rows:
+        row["problems"], row["calc"] = [], []
+        miss = [k for k in PDF_COLS if row[k] is None]
+        if len(miss) == 1:     # one blank cell: the row's own arithmetic gives it
+            k = miss[0]
+            s = sum(PDF_SIGN[j] * row[j] for j in PDF_COLS if j != k)
+            row[k] = round(-s / PDF_SIGN[k], 2)
+            row["calc"].append(k)
+        elif miss:
+            row["problems"].append("%d figures could not be read — type them "
+                                   "in from the page." % len(miss))
+            bad("A row has figures that could not be read.")
+        if all(row[k] is not None for k in PDF_COLS):
+            diff = round(sum(PDF_SIGN[j] * row[j] for j in PDF_COLS), 2)
+            if abs(diff) > 0.011:
+                fix = {}
+                for k in PDF_COLS:
+                    s = sum(PDF_SIGN[j] * row[j] for j in PDF_COLS if j != k)
+                    fix[k] = round(-s / PDF_SIGN[k], 2)
+                row["fix"] = fix
+                row["problems"].append(
+                    "Doesn't add up (Budget − Commitment − Obligation − Actuals "
+                    "should equal Available; off by %.2f)." % abs(diff))
+                bad("A row does not add up.", hard=False)
+        if not row["object_class"]:
+            row["problems"].append("Choose which spending category this row is.")
+            bad("A row has no spending category.")
+        elif row["object_class"] in seen:
+            row["problems"].append("Same category as another row.")
+            bad("Two rows are the same category.")
+        seen[row["object_class"]] = True
+    if not rows:
+        bad("No rows were read from this page.")
+    # the report's own Total row, where the scan gave it
+    tot = rep.get("total") or {}
+    total_ok = False
+    if kind == "grant" and rows:
+        checked = 0
+        for k in PDF_COLS:
+            tv = _pdf_num(tot.get(k))
+            vals = [r[k] for r in rows]
+            if tv is None or any(v is None for v in vals):
+                continue
+            checked += 1
+            if abs(round(sum(vals), 2) - tv) > 0.011:
+                bad("The %s column adds up to %.2f here but the report's Total "
+                    "says %.2f — a row may be missing or misread."
+                    % (k, sum(vals), tv), hard=False)
+        total_ok = checked >= 3 and not any("Total" in p for p in problems)
+        if not checked:
+            warnings.append("The Total row could not be read from the scan, so "
+                            "rows were checked one by one only.")
+    if kind == "grant" and existing and rows:
+        gone = sorted(oc for oc in existing if oc not in seen)
+        if gone and not total_ok:
+            warnings.append("Your records list %d categor%s this page doesn't: "
+                            "%s. They are kept as they are." % (
+                                len(gone), "y" if len(gone) == 1 else "ies",
+                                ", ".join(g.split(":")[-1].strip() for g in gone)))
+    out.update({"rows": rows, "total": {k: _pdf_num(tot.get(k)) for k in PDF_COLS}
+                if tot else None, "problems": problems, "blocking": blocking,
+                "warnings": warnings, "total_ok": total_ok,
+                "ok": not problems})
+    out["stale"] = wd_pdf_stale(conn, code, as_of)
+    out["plan"] = wd_pdf_plan(conn, out)
+    if blocking:   # a half-read table would give a misleading "what changes" list
+        out["plan"] = {k: v for k, v in out["plan"].items()
+                       if k in ("mapped", "grant_id", "grant_name", "driven", "note")}
+        out["plan"]["pending"] = True
+    return out
+
+
+def wd_pdf_stale(conn, code, as_of):
+    """Why importing this report would reach more than a month back, or ''."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of or ""):
+        return ""
+    floor = wd_month_floor()
+    held = conn.execute("SELECT MAX(as_of) FROM workday_balances WHERE "
+                        "grant_code=?", (code,)).fetchone()[0] or ""
+    if as_of[:7] < floor:
+        why = "It is a report for %s, more than a month ago" % as_of[:7]
+    elif held and as_of < held:
+        why = "It is older than the figures you already have"
+    else:
+        return ""
+    if held and as_of < held:
+        why += " (you hold figures as of %s)" % held
+    return why + ". Importing it would overwrite newer figures and add ledger corrections dated in the past."
+
+
+def wd_pdf_plan(conn, rep):
+    """What importing this report would change in the ledger and budget."""
+    code, kind, as_of = rep["code"], rep["kind"], rep["as_of"]
+    plan = {"mapped": False}
+    if not re.fullmatch(r"(?:GR|PR)\d{5,6}", code or ""):
+        return plan
+    m = conn.execute("SELECT target_id FROM workday_map WHERE kind='grant' AND "
+                     "wd_key=?", (code,)).fetchone()
+    g = conn.execute("SELECT * FROM grants WHERE id=?", (m["target_id"],)
+                     ).fetchone() if m and m["target_id"] else None
+    if not g:
+        plan["note"] = ("No grant in the app is linked to %s yet. Importing will "
+                        "link it to a grant with the same name, or create one "
+                        "from this report." % code)
+        return plan
+    g = dict(g)
+    gid = g["id"]
+    plan.update({"mapped": True, "grant_id": gid, "grant_name": g["name"]})
+    applied = get_setting(conn, "wd_applied", {}) or {}
+    if str(gid) in applied:
+        plan["driven"] = True
+        plan["note"] = ("This grant's figures come straight from Workday "
+                        "reports, so importing just refreshes them.")
+        return plan
+    rows = [r for r in rep["rows"] if all(r[k] is not None for k in PDF_COLS)]
+    years = sorted({r[0] for r in conn.execute(
+        "SELECT year FROM budget_lines WHERE grant_id=? UNION "
+        "SELECT year FROM expenses WHERE grant_id=?", (gid, gid)) if r[0]})
+    byears = sorted({r[0] for r in conn.execute(
+        "SELECT year FROM budget_lines WHERE grant_id=?", (gid,))})
+    pdf_total = round(sum(r["budget"] for r in rows), 2)
+    scope = rep.get("scope")
+    if scope in (None, ""):
+        scope = (get_setting(conn, "wd_scope", {}) or {}).get(code)
+    if scope in (None, ""):
+        scope = "all"
+        if len(byears) > 1:        # a one-year cycle of a multi-year program?
+            tot_all = conn.execute("SELECT COALESCE(SUM(amount),0) FROM "
+                                   "budget_lines WHERE grant_id=?", (gid,)).fetchone()[0]
+            for y in byears:
+                ty = conn.execute("SELECT COALESCE(SUM(amount),0) FROM budget_lines "
+                                  "WHERE grant_id=? AND year=?", (gid, y)).fetchone()[0]
+                if abs(ty - pdf_total) < 1.0 and abs(tot_all - pdf_total) >= 1.0:
+                    scope = y
+                    break
+    scope = "all" if str(scope).lower() == "all" else (
+        int(scope) if str(scope).isdigit() else "all")
+    yc, ya = ("", ()) if scope == "all" else (" AND year=?", (scope,))
+    # Workday's actuals stop at the report date: what you entered after it is
+    # not in them, so it must not be "reconciled" away.
+    dc, da = (" AND date<=?", (as_of,)) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", as_of or "") else ("", ())
+    ledger = {r[0]: r[1] or 0 for r in conn.execute(
+        "SELECT category_id, SUM(amount) FROM expenses WHERE grant_id=?" + yc + dc
+        + " GROUP BY category_id", (gid,) + ya + da)}
+    bud_app = {r[0]: r[1] or 0 for r in conn.execute(
+        "SELECT category_id, SUM(amount) FROM budget_lines WHERE grant_id=?" + yc
+        + " GROUP BY category_id", (gid,) + ya)}
+    cmap = {r["wd_key"]: r["target_id"] for r in conn.execute(
+        "SELECT wd_key, target_id FROM workday_map WHERE kind='category'")}
+    names = {r["id"]: r["name"] for r in conn.execute("SELECT id, name FROM categories")}
+    pdf_act, pdf_bud, unmapped = {}, {}, []
+    for r in rows:
+        if kind == "project":
+            if len(bud_app) == 1:
+                cid = next(iter(bud_app))
+            else:
+                p = conn.execute("SELECT id FROM categories WHERE name='Personnel' "
+                                 "AND grant_id IS NULL").fetchone()
+                cid = p["id"] if p else None
+        else:
+            oc = r["object_class"]
+            cid = cmap[oc] if oc in cmap else _wd_guess_category(conn, oc)
+            if cid is not None:
+                cid = _wd_category_on_grant(conn, cid, gid)
+        if cid is None:
+            unmapped.append(r["object_class"].split(":")[-1].strip())
+            continue
+        pdf_act[cid] = round(pdf_act.get(cid, 0) + r["actuals"], 2)
+        pdf_bud[cid] = round(pdf_bud.get(cid, 0) + r["budget"], 2)
+    recon = []
+    for cid in sorted(set(pdf_act) | ({c for c in ledger if c is not None}
+                                      if not unmapped else set())):
+        delta = round(pdf_act.get(cid, 0) - (ledger.get(cid) or 0), 2)
+        if abs(delta) >= 0.005:
+            recon.append({"category_id": cid, "category": names.get(cid, "?"),
+                          "workday": pdf_act.get(cid, 0),
+                          "yours": round(ledger.get(cid) or 0, 2), "delta": delta})
+    up, down = [], []
+    if kind == "grant":
+        for cid in sorted(set(pdf_bud) | set(bud_app)):
+            if cid is None:
+                continue
+            d = round(pdf_bud.get(cid, 0) - (bud_app.get(cid) or 0), 2)
+            item = {"category_id": cid, "category": names.get(cid, "?"),
+                    "workday": pdf_bud.get(cid, 0),
+                    "yours": round(bud_app.get(cid) or 0, 2), "delta": d}
+            if d > 0.005:
+                up.append(item)
+            elif d < -0.005 and not unmapped:
+                down.append(item)
+    released = None
+    if (g.get("funded_to_date") or 0) > 0:
+        # an award released in instalments: what Workday shows is what has been
+        # released so far (kept in "Released so far"), not a change to the award
+        up, down = [], []
+        if kind == "grant" and scope == "all" and rep.get("total_ok") and not unmapped:
+            released = {"yours": round(g["funded_to_date"], 2), "workday": pdf_total}
+    year = scope if isinstance(scope, int) else budget_year_for(g, as_of)
+    plan.update({"scope": scope, "years": years or [1], "year": year,
+                 "reconcile": recon, "budget_up": up, "budget_down": down,
+                 "budget_default": bool(up) and not down,
+                 "released": released,
+                 "unmapped": unmapped,
+                 "committed": round(sum(r["obligation"] + r["commitment"]
+                                        for r in rows), 2)})
+    return plan
+
+
+def _wd_pdf_store(conn, rep):
+    """Write one validated report's rows into workday_balances."""
+    code = rep["code"]
+    prev = conn.execute("SELECT grant_name, award FROM workday_balances WHERE "
+                        "grant_code=? LIMIT 1", (code,)).fetchone()
+    info = (get_setting(conn, "wd_grant_info", {}) or {}).get(code, {})
+    name = (prev["grant_name"] if prev and prev["grant_name"] else
+            info.get("grant_name") or
+            (code + " " + re.sub(r"\s+I\s+", " | ", rep["grant_name"])).strip())
+    award = (prev["award"] if prev and prev["award"] else "") or rep["award"]
+    _wd_note_grant(conn, name, award=award)
+    for r in rep["rows"]:
+        conn.execute(
+            "INSERT INTO workday_balances (grant_code, grant_name, award, "
+            "object_class, budget, commitment, obligation, actuals, available, "
+            "as_of) VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(grant_code, object_class) DO UPDATE SET "
+            "grant_name=excluded.grant_name, award=excluded.award, "
+            "budget=excluded.budget, commitment=excluded.commitment, "
+            "obligation=excluded.obligation, actuals=excluded.actuals, "
+            "available=excluded.available, as_of=excluded.as_of",
+            (code, name, award, r["object_class"], r["budget"], r["commitment"],
+             r["obligation"], r["actuals"], r["available"], rep["as_of"]))
+    if rep["total_ok"]:     # a verified, complete table: drop categories it no longer lists
+        keep = [r["object_class"] for r in rep["rows"]]
+        conn.execute("DELETE FROM workday_balances WHERE grant_code=? AND "
+                     "object_class NOT IN (%s)" % ",".join("?" * len(keep)),
+                     [code] + keep)
+
+
+def wd_pdf_apply(conn, reports, choices):
+    """Import the checked reports. Everything happens in one transaction; a
+    safety copy of the database is made first."""
+    choices = choices or {}
+    res = {"reports": [], "skipped": [], "expenses_added": 0, "budget_added": 0.0}
+    accepted = []
+    for rep in reports or []:
+        c = wd_pdf_check(conn, rep)
+        label = c["code"] or "page %s" % c.get("page")
+        if c["blocking"]:
+            res["skipped"].append({"code": label, "why": c["blocking"][0]})
+        elif c.get("stale") and not ((choices.get(c["code"]) or {}).get("allow_stale")
+                                     or choices.get("allow_stale")):
+            res["skipped"].append({"code": label, "why": "Held back: " + c["stale"],
+                                   "stale": True})
+        elif c["problems"] and not c["confirmed"]:
+            res["skipped"].append({"code": label, "why": "Not confirmed: " + c["problems"][0]})
+        else:
+            accepted.append(c)
+    if not accepted:
+        return res
+    make_backup(force=True)
+    for c in accepted:
+        _wd_pdf_store(conn, c)
+    wd_seed_category_maps(conn)
+    for c in accepted:     # the project report's single row follows its grant's main category
+        if c["kind"] != "project":
+            continue
+        m = conn.execute("SELECT target_id FROM workday_map WHERE kind='grant' AND "
+                         "wd_key=?", (c["code"],)).fetchone()
+        row = conn.execute("SELECT category_id FROM budget_lines WHERE grant_id=? "
+                           "GROUP BY category_id ORDER BY SUM(amount) DESC LIMIT 1",
+                           (m["target_id"],)).fetchone() if m and m["target_id"] else None
+        if row:
+            conn.execute("INSERT OR IGNORE INTO workday_map (kind, wd_key, target_id) "
+                         "VALUES ('category', ?, ?)", (PDF_PROJECT_CLASS, row["category_id"]))
+    link = wd_autolink_grants(conn)
+    wd_apply_balances(conn)
+    scopes = get_setting(conn, "wd_scope", {}) or {}
+    for c in accepted:
+        plan = wd_pdf_plan(conn, c)
+        item = {"code": c["code"], "grant": plan.get("grant_name") or c["code"],
+                "rows": len(c["rows"]), "reconciled": [], "budget": []}
+        res["reports"].append(item)
+        if not plan.get("mapped") or plan.get("driven"):
+            continue
+        ch = choices.get(c["code"]) or {}
+        scopes[c["code"]] = plan["scope"]
+        gid = plan["grant_id"]
+        rel = plan.get("released")
+        if rel:
+            # an award released in instalments: a bigger budget in the report is
+            # a new instalment and is taken; a smaller one is never applied
+            # silently (it would shrink what you can spend)
+            if rel["workday"] > rel["yours"] + 0.005:
+                conn.execute("UPDATE grants SET funded_to_date=? WHERE id=?",
+                             (rel["workday"], gid))
+                item["released"] = "Released so far %.2f → %.2f" % (rel["yours"], rel["workday"])
+            elif rel["workday"] < rel["yours"] - 0.005:
+                item["released"] = ("Released so far left at %.2f (the report shows "
+                                    "%.2f — edit the grant if that is right)"
+                                    % (rel["yours"], rel["workday"]))
+        if ch.get("reconcile", True):
+            for r in plan["reconcile"]:
+                conn.execute(
+                    "INSERT INTO expenses (grant_id, category_id, year, date, "
+                    "amount, description, source) VALUES (?,?,?,?,?,?, 'dbr')",
+                    (gid, r["category_id"], plan["year"], c["as_of"], r["delta"],
+                     "Workday report of %s — %s (brings your ledger in line with "
+                     "Workday)" % (c["as_of"], r["category"])))
+                res["expenses_added"] += 1
+                item["reconciled"].append("%s %+.2f" % (r["category"], r["delta"]))
+        if ch.get("budget", plan["budget_default"]) and plan["budget_up"]:
+            added = 0.0
+            for b in plan["budget_up"]:
+                cur = conn.execute("SELECT id, amount FROM budget_lines WHERE "
+                                   "grant_id=? AND category_id=? AND year=?",
+                                   (gid, b["category_id"], plan["year"])).fetchone()
+                if cur:
+                    conn.execute("UPDATE budget_lines SET amount=? WHERE id=?",
+                                 (round(cur["amount"] + b["delta"], 2), cur["id"]))
+                else:
+                    conn.execute("INSERT INTO budget_lines (grant_id, category_id, "
+                                 "year, amount) VALUES (?,?,?,?)",
+                                 (gid, b["category_id"], plan["year"], b["delta"]))
+                added += b["delta"]
+                item["budget"].append("%s %+.2f" % (b["category"], b["delta"]))
+            conn.execute("UPDATE grants SET initial_amount=ROUND(COALESCE("
+                         "initial_amount,0)+?,2) WHERE id=?", (added, gid))
+            res["budget_added"] = round(res["budget_added"] + added, 2)
+    set_setting(conn, "wd_scope", scopes, commit=False)
+    res["grants_created"] = link["created"]
+    set_setting(conn, "workday_last_sync", {
+        "date": date.today().isoformat(),
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "summary": "PDF report: %d grant%s updated · %d ledger adjustment%s" % (
+            len(res["reports"]), "" if len(res["reports"]) == 1 else "s",
+            res["expenses_added"], "" if res["expenses_added"] == 1 else "s")},
+        commit=False)
+    conn.commit()
+    return res
+
+
+def wd_pdf_preview(conn, payload):
+    """Upload -> parsed, checked reports (+ the scanned page where a person
+    needs to look at it)."""
+    raw = base64.b64decode(payload.get("data") or "")
+    name = os.path.basename(str(payload.get("name") or "report.pdf"))
+    if len(raw) > PDF_MAX_BYTES:
+        raise ValueError("%s is too large (max %d MB)." % (name, PDF_MAX_BYTES // 1048576))
+    try:
+        pdf, pages = pdf_read_pages(raw)
+    except Exception as e:  # noqa: BLE001 — a damaged PDF must not become a traceback
+        raise ValueError("“%s” couldn't be opened as a PDF (%s)." % (name, e))
+    if len(pages) > PDF_MAX_PAGES:
+        raise ValueError("That PDF has %d pages — too many to be a grant report."
+                         % len(pages))
+    if not any(p["runs"] for p in pages):
+        raise ValueError(
+            "“%s” has no readable text — it's a picture of a page with no "
+            "text layer. Re-scan it with “searchable PDF”/OCR switched on, or "
+            "use Workday's “Export to Excel” button instead." % name)
+    reports, skipped = [], 0
+    for i, pg in enumerate(pages):
+        rep = pdf_parse_page(pg)
+        if rep is None:
+            skipped += 1
+            continue
+        rep["page"] = i + 1
+        c = wd_pdf_check(conn, rep)
+        if (c["problems"] or c["warnings"]) and len([r for r in reports if r.get("jpeg")]) < 12:
+            j = pdf_page_jpeg(pdf, pg["num"])
+            if j and len(j) < 6 * 1048576:
+                c["jpeg"] = "data:image/jpeg;base64," + base64.b64encode(j).decode()
+        reports.append(c)
+    if not reports:
+        raise ValueError(
+            "No “Budget vs Actual” tables were found in “%s” (%d pages read). "
+            "This importer reads Workday's RPT - Departmental Grant Budget vs "
+            "Actual and Project Budget vs Actual reports." % (name, len(pages)))
+    return {"file": name, "pages": len(pages), "skipped_pages": skipped,
+            "reports": reports}
 
 
 # RaaS (Report-as-a-Service): pull the same two reports straight from Workday
@@ -1724,7 +3045,7 @@ def wd_check_raas_url(url):
     return ""
 
 
-def wd_fetch_raas(conn, password):
+def wd_fetch_raas(conn, password, allow_stale=False):
     """Fetch the configured RaaS URLs as CSV, ingest, reconcile."""
     import urllib.error
     import urllib.request
@@ -1739,6 +3060,8 @@ def wd_fetch_raas(conn, password):
         raise RuntimeError("No RaaS URLs saved — fill in the "
                            "Direct connection card first.")
     cred = base64.b64encode(("%s:%s" % (user, password)).encode()).decode()
+    if allow_stale:
+        make_backup(force=True)
     files = []
     for label, url in pairs:
         url = (url or "").strip()
@@ -1786,7 +3109,16 @@ def wd_fetch_raas(conn, password):
                 "Workday answered with a login page instead of the %s report "
                 "— the account is probably SSO-only, so RaaS basic "
                 "authentication is blocked." % label)
-        kind, n = wd_ingest_csv(conn, text)
+        conn.execute("SAVEPOINT wd_raas")
+        try:
+            kind, n = wd_ingest_csv(conn, text, allow_stale=allow_stale)
+            conn.execute("RELEASE wd_raas")
+        except WDStale as e:
+            conn.execute("ROLLBACK TO wd_raas")
+            conn.execute("RELEASE wd_raas")
+            files.append({"file": "RaaS %s" % label, "kind": "stale", "rows": 0,
+                          "stale": e.info})
+            continue
         files.append({"file": "RaaS %s" % label, "kind": kind, "rows": n})
         if kind == "unknown":
             files[-1]["error"] = ("Response didn't look like the expected "
@@ -1797,6 +3129,8 @@ def wd_fetch_raas(conn, password):
     conn.commit()
     res = wd_match(conn)
     res["files"] = files
+    res["stale"] = [{"file": f["file"], **f["stale"]} for f in files
+                    if f["kind"] == "stale"]
     res["budget_conflicts"] = bal["conflicts"]
     res["grants_created"] = link["created"]
     res["grants_matched"] = link["matched"]
@@ -2188,10 +3522,12 @@ REPORT_SELECT = (
 
 
 def report_rows(conn, month):
-    """Every expense dated inside `month`, shaped for an accountant."""
+    """Every expense dated inside `month` (bar imported actuals), shaped for an accountant."""
     start, end = month_bounds(month)
     return _shape_report_rows(conn, conn.execute(
-        REPORT_SELECT + "WHERE e.date>=? AND e.date<=? ORDER BY g.name, e.date",
+        REPORT_SELECT + "WHERE e.date>=? AND e.date<=? "
+        # imported actuals and ledger adjustments are already in Workday
+        "AND e.source NOT IN ('dbr','adjust') ORDER BY g.name, e.date",
         (start, end)))
 
 
@@ -2644,7 +3980,7 @@ def wd_state(conn):
 
 # ---------------------------------------------------------------- API state
 
-APP_VERSION = "1.4.8"
+APP_VERSION = "1.5.0"
 UPDATE_REPO = "samuelbfernandes/grants-manager"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_CACHE_PATH = os.path.join(DATA_DIR, "update_check.json")
@@ -3225,12 +4561,13 @@ def save_receipt(grant, payload):
 
 TABLES = {
     "grants": ["name", "agency", "initial_amount", "start_date", "end_date",
-               "status", "notes", "exclude_from_history", "nce_end_date"],
+               "status", "notes", "exclude_from_history", "nce_end_date",
+               "funded_to_date", "plan_basis"],
     "categories": ["name", "grant_id", "sort"],
-    "people": ["name", "role"],
+    "people": ["name", "role", "plan_end"],
     "appointments": ["person_id", "grant_id", "monthly_salary", "fringe_rate",
                      "start_date", "end_date", "notes", "annual_tuition",
-                     "auto_charge", "pct"],
+                     "auto_charge", "pct", "fringe_only"],
     "expenses": ["grant_id", "category_id", "year", "date", "amount",
                  "description", "person_id", "receipt_path", "source",
                  "wd_entry", "wd_worktag", "pcard", "pcard_buyer",
@@ -3238,12 +4575,25 @@ TABLES = {
 }
 
 
-DATE_FIELDS = ("date", "start_date", "end_date", "nce_end_date")
+DATE_FIELDS = ("date", "start_date", "end_date", "nce_end_date", "plan_end")
 MONEY_FIELDS = ("amount", "initial_amount", "monthly_salary", "fringe_rate",
-                "annual_tuition", "pct")
+                "annual_tuition", "pct", "funded_to_date")
 # a dollar figure no grant will ever legitimately reach; past this the number
 # is a typo or a paste accident, and letting it in wrecks every chart's scale
 MONEY_LIMIT = 1e12
+
+
+def grant_status_rule(conn, rid, data):
+    """A closed grant drops out of every total, the historic one included,
+    until the person ticks it there again; reopening puts it back. Applies only
+    when the status actually changes and the request didn't say otherwise."""
+    if data.get("status") in ("active", "closed") \
+            and "exclude_from_history" not in data:
+        cur = conn.execute("SELECT status FROM grants WHERE id=?",
+                           (rid,)).fetchone()
+        if cur is not None and cur["status"] != data["status"]:
+            data["exclude_from_history"] = 1 if data["status"] == "closed" else 0
+    return data
 
 
 def validate_row(table, data, creating):
@@ -3287,6 +4637,10 @@ def validate_row(table, data, creating):
         s, e = data.get("start_date"), data.get("end_date")
         if s and e and e < s:
             raise ValueError("The end date is before the start date.")
+        if "funded_to_date" in data and data["funded_to_date"] in ("", None):
+            data["funded_to_date"] = 0
+        if data.get("funded_to_date", 0) < 0:
+            raise ValueError("“Released so far” can't be negative.")
     return data
 
 
@@ -3632,7 +4986,10 @@ class Handler(BaseHTTPRequestHandler):
                 table = m.group(1)
                 validate_row(table, data, creating=True)
                 data.pop("receipt_path", None)   # only the server sets this
-                if table in ("expenses", "appointments"):
+                # grant_id 0 on an appointment = "unassigned": costs no grant
+                # carries yet (assigned to a grant later from the People tab)
+                if table in ("expenses", "appointments") and not (
+                        table == "appointments" and data.get("grant_id") == 0):
                     grant = conn.execute("SELECT * FROM grants WHERE id=?",
                                          (data.get("grant_id"),)).fetchone()
                     if grant is None:
@@ -3756,6 +5113,8 @@ class Handler(BaseHTTPRequestHandler):
                                          "reload the page and try again.")
                     data["receipt_path"] = save_receipt(dict(grant),
                                                         data.pop("receipt"))
+                if table == "grants":
+                    grant_status_rule(conn, rid, data)
                 cols = [c for c in TABLES[table] if c in data]
                 if cols:
                     before = (conn.execute("SELECT * FROM expenses WHERE id=?",
@@ -3864,7 +5223,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"created": n})
                 return
             if path == "/api/workday/import":
-                self.send_json(wd_import(conn))
+                self.send_json(wd_import(conn, bool(data.get("allow_stale")),
+                                         bool(data.get("discard_stale"))))
                 return
             if path == "/api/workday/upload_import":
                 errors = []
@@ -3873,9 +5233,27 @@ class Handler(BaseHTTPRequestHandler):
                         wd_save_uploaded(f)
                     except Exception as e:  # noqa: BLE001
                         errors.append("%s: %s" % (f.get("name", "?"), e))
-                res = wd_import(conn)  # rescans the whole folder, incl. these
+                # rescans the whole folder, incl. these
+                res = wd_import(conn, bool(data.get("allow_stale")),
+                                bool(data.get("discard_stale")))
                 if errors:
                     res["upload_errors"] = errors
+                self.send_json(res)
+                return
+            if path == "/api/workday/pdf/preview":
+                self.send_json(wd_pdf_preview(conn, data))
+                return
+            if path == "/api/workday/pdf/check":
+                self.send_json({"reports": [wd_pdf_check(conn, r)
+                                            for r in (data.get("reports") or [])[:60]]})
+                return
+            if path == "/api/workday/pdf/apply":
+                try:
+                    res = wd_pdf_apply(conn, (data.get("reports") or [])[:60],
+                                       data.get("choices") or {})
+                except Exception:
+                    conn.rollback()
+                    raise
                 self.send_json(res)
                 return
             if path == "/api/workday/push_config":
@@ -4080,7 +5458,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "password_required"}, 401)
                     return
                 try:
-                    res = wd_fetch_raas(conn, pw)
+                    res = wd_fetch_raas(conn, pw, bool(data.get("allow_stale")))
                 except WDAuthError as e:
                     WD_SESSION["password"] = None
                     self.send_json({"error": str(e)}, 401)
@@ -4260,6 +5638,18 @@ class Handler(BaseHTTPRequestHandler):
                         trash_capture(conn, batch, summary, "delete",
                                      child_table, crow["id"], row=crow)
                     conn.execute(f"DELETE FROM {child_table} WHERE {col}=?", (rid,))
+                # A Workday code that pointed at this grant must not bring it
+                # back at the next import (the auto-linker would re-create it):
+                # keep the code, but mark it "ignored". Restoring from the
+                # trash re-links it.
+                for mrow in conn.execute(
+                        "SELECT id, target_id FROM workday_map WHERE "
+                        "kind='grant' AND target_id=?", (rid,)).fetchall():
+                    trash_capture(conn, batch, summary, "unlink", "workday_map",
+                                  mrow["id"], column="target_id",
+                                  old_value=mrow["target_id"])
+                conn.execute("UPDATE workday_map SET target_id=NULL WHERE "
+                             "kind='grant' AND target_id=?", (rid,))
 
             elif table == "people":
                 summary = f"Person \"{row['name']}\""

@@ -9,3 +9,6 @@ backups/
 data/
 receipts/
 workday_imports/
+# working notes that name people and pay
+SPEC-*.md
+WDconnection_instructions.md
