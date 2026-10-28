@@ -713,7 +713,11 @@ def sniff_spreadsheet(path):
     import zipfile
     try:
         z = zipfile.ZipFile(path)
-        names = z.namelist()
+        try:
+            names = z.namelist()
+            unpacked = sum(i.file_size for i in z.infolist())
+        finally:
+            z.close()      # Windows can't move or delete a file that is still open
     except zipfile.BadZipFile:
         return "The file is damaged — try exporting it from Workday again."
     if not any(n.startswith("xl/") for n in names):
@@ -726,7 +730,7 @@ def sniff_spreadsheet(path):
                     "Export To → Excel, then upload the .xlsx.")
         return ("That isn't an Excel workbook — it's a different kind of zip "
                 "file.")
-    if sum(i.file_size for i in z.infolist()) > XLSX_MAX_UNPACKED:
+    if unpacked > XLSX_MAX_UNPACKED:
         return ("That workbook is far too large to be a grant report — "
                 "check you exported the right thing.")
     if not any(n.startswith("xl/worksheets/") for n in names):
@@ -863,6 +867,13 @@ def parse_xlsx(path):
     if bad:
         raise ValueError(bad)
     z = zipfile.ZipFile(path)
+    try:
+        return _parse_xlsx_open(z)
+    finally:
+        z.close()    # Windows can't move or delete a file that is still open
+
+
+def _parse_xlsx_open(z):
     shared = _xlsx_shared_strings(z)
     sheets, d1904 = _xlsx_sheets(z)
     visible = [x for x in sheets if x[2]] or sheets
